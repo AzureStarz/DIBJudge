@@ -1,0 +1,91 @@
+# model config
+judge_encoder: model/Qwen3-Embedding-0.6B
+lm: model/Qwen3-4B-Base
+z_latent_dim: 128
+z_prompt_len: 16
+prompt_mlp_hidden: 0
+prompt_mlp_layers: 0
+prompt_mlp_dropout: 0.05
+bottleneck_noise_alpha: 8.0
+bottleneck_noise_warmup_ratio: 0.2
+z_prompt_prefix_len: 1
+z_prompt_postfix_len: 1
+encoder_trainable: last
+bias_proxy_hidden: 0
+bias_proxy_layers: 0
+bias_proxy_dropout: 0.05
+low_recon_layer: 2
+compact_prior: 0.5
+compact_mu_token_id: -1
+compact_head_hidden: 0
+compact_head_layers: 0
+compact_head_dropout: 0.05
+
+# data config
+data_path: data/m_preference_collection_50k_qwen3-4b_no_ref_no_criteria.jsonl
+per_device_train_batch_size: 1
+num_workers: 0
+max_bias_len: 1024
+max_ref_len: 1024
+max_lm_len: 4096
+shuffle_ratio_min: 0.1
+shuffle_ratio_max: 0.5
+shuffle_ratio_step: 0.0
+shuffle_ratio_schedule_ratio: 0.3
+
+# runtime config
+epochs: 1
+deepspeed_config: configs/deepspeed/ds_z2_config.json
+output_dir: outputs/deepspeed/debug
+log_dir: logs/deepspeed/debug
+save_every_steps: 0
+save_at_end: true
+bf16: true
+gradient_checkpointing: false
+torch_autocast: false
+debug_data: false
+debug_aux_checks: false
+debug_aux_checks_interval: 10
+use_swanlab: true
+swanlab_project: dibjudge
+swanlab_run_name: null
+swanlab_tags: null
+swanlab_log_steps: 1
+
+# LoRA config
+use_lora: true
+freeze_lm_when_no_lora: true
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_targets: q_proj,k_proj,v_proj,o_proj
+
+# optimizer config
+encoder_lr: 2.0e-5
+lm_lr: 2.0e-5
+lora_lr: 2.0e-4
+head_lr: 2.0e-4
+weight_decay: 0.01
+head_weight_decay: 0
+max_grad_norm: 1.0
+grad_accum_steps: 16
+
+# scheduler config
+warmup_steps: 0
+warmup_ratio: 0.03
+scheduler_type: cosine
+
+# loss config
+lambda_compression: 0.5
+lambda_compression_warmup_ratio: 0.5
+mask_loss_weight: 1.0
+consistency_loss_weight: 1.0
+lambda_bias: 0.5
+grl_lambda: 1.0
+grl_start_ratio: 0.3
+grl_gamma: 10.0
+bias_decoder_steps: 2
+eng_domain_weight: 1.0
+low_recon_weight: 1.0
+shuffle_weight: 1.0
+z_l2_weight: 1.0

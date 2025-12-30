@@ -1,0 +1,45 @@
+# model config
+lm: model/Qwen3-4B-Base
+
+# data config
+data_path: data/m_preference_collection_50k_no_ref.jsonl
+per_device_train_batch_size: 1
+num_workers: 0
+max_lm_len: 4096
+append_eos: true
+
+# runtime config
+epochs: 1
+deepspeed_config: configs/deepspeed/ds_z2_config.json
+output_dir: outputs/deepspeed/sft_baseline
+log_dir: logs/deepspeed/sft_baseline
+save_every_steps: 0
+save_at_end: true
+bf16: true
+gradient_checkpointing: false
+torch_autocast: false
+use_swanlab: true
+swanlab_project: dibjudge
+swanlab_run_name: Qwen3-4B-Base_vanilla_SFT
+swanlab_tags: null
+swanlab_log_steps: 1
+
+# optimizer config
+lm_lr: 2.0e-5
+lora_lr: 2.0e-4
+weight_decay: 0.01
+lora_weight_decay: 0.0
+max_grad_norm: 1.0
+grad_accum_steps: 32
+
+# LoRA config
+use_lora: false
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_targets: q_proj,k_proj,v_proj,o_proj
+
+# scheduler config
+warmup_steps: 0
+warmup_ratio: 0.0
+scheduler_type: cosine

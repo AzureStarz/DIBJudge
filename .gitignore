@@ -1,0 +1,10 @@
+data/*
+logs/*
+outputs/*
+results/*
+swanlog/*
+vibe/*
+scripts/rm_r1_dataset/*
+scripts/__pycache__/*
+dibjudge/__pycache__/*
+model/*

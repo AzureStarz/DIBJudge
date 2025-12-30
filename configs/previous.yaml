@@ -1,0 +1,53 @@
+### model
+enc_name_or_path: /path/to/workspace/online1/LangBridge/pretrained-models/mt5-xl-lm-adapt
+lm_name_or_path: /path/to/workspace/online1/data/pretrained-models/Llama-2-7b
+alignments: ffn
+enc_hidden_size: 2048
+lm_hidden_size: 4096
+add_new_lines_to_enc: True
+exp_run_name: freeze_llm_1st-stage_mt_gsm8k_mindmerger_reasoning_mgsm8k_mindmerger_data
+
+### method
+stage: lb
+do_train: true
+finetuning_type: full
+print_param_status: True
+deepspeed: /path/to/workspace/online1/AlignSFT/LLaMA-Factory/examples/deepspeed/ds_z2_config.json
+
+### dataset
+dataset: AlignSFT_1st-stage_mt_gsm8k_mindmerger_reasoning_mgsm8k_mindmerger_data
+remove_unused_columns: False
+template: empty
+cutoff_len: 1280
+max_length_enc: 1024
+overwrite_cache: true
+preprocessing_num_workers: 16
+
+### output
+output_dir: /path/to/workspace/online1/AlignSFT/LLaMA-Factory/saves/llama2-7b/full/lb/math/freeze_llm_1st-stage_mt_gsm8k_mindmerger_reasoning_mgsm8k_mindmerger_data
+logging_steps: 10
+save_steps: 4000
+save_total_limit: 1
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+freeze_language_model: True
+freeze_encoder: True
+freeze_alignment: False
+use_lb_custom_optimizer: True
+learning_rate_alignment: 6.0e-4
+learning_rate_enc: 2.0e-5
+learning_rate_lm: 2.0e-5
+w_decay_alignment: 0.0
+w_decay_enc: 0.1
+w_decay_lm: 0.01
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 8
+num_train_epochs: 1.0
+lr_scheduler_type: constant
+warmup_steps: 0
+# lr_scheduler_type: cosine
+# warmup_ratio: 0.03
+bf16: true
+ddp_timeout: 180000000
