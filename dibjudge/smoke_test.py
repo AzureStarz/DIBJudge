@@ -43,15 +43,20 @@ def run_smoke(args: argparse.Namespace) -> None:
     expected = [
         "original_input_ids",
         "original_attention_mask",
-        "shuffle_input_ids",
-        "shuffle_attention_mask",
-        "original_shuffle_labels",
-        "shuffle_labels",
+        "proxy_length_label",
+        "proxy_length_target",
+        "proxy_nll_label",
+        "proxy_nll_target",
+        "proxy_ttr_label",
+        "proxy_ttr_target",
+        "proxy_position_label",
         "english_input_ids",
         "english_attention_mask",
         "lm_input_ids",
         "lm_attention_mask",
         "lm_labels",
+        "lm_response_types",
+        "response_mask",
     ]
     for key in expected:
         if key not in batch:

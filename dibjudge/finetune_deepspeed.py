@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 from .data import DIBJudgeCollator, DIBJudgeDataset
 from .modeling import DIBJudgeConfig, DIBJudgeModel
+from .proxy_tasks import ProxyTaskConfig, compute_proxy_losses
 from .swanlab_utils import finish_swanlab, init_swanlab, log_swanlab
 
 
@@ -76,70 +77,8 @@ def _warmup_steps_from_ratio(
 def _compute_bias_terms(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = outputs["lm_loss"].device
-    shuffle_loss = torch.zeros((), device=device)
-    shuffle_logits = outputs.get("shuffle_logits")
-    if shuffle_logits is not None:
-        token_logits = shuffle_logits
-        half = token_logits.size(0) // 2
-        token_labels = torch.cat(
-            [
-                torch.ones(half, device=token_logits.device, dtype=torch.long),
-                torch.zeros(token_logits.size(0) - half, device=token_logits.device, dtype=torch.long),
-            ],
-            dim=0,
-        )
-        weight = None
-        valid = token_labels != -100
-        if valid.any():
-            counts = torch.bincount(token_labels[valid], minlength=2).float()
-            if torch.all(counts > 0):
-                weight = (counts.sum() / (2.0 * counts)).clamp(max=5.0)
-                weight = weight.to(token_logits.device)
-        if token_logits.dim() == 2:
-            shuffle_loss = torch.nn.functional.cross_entropy(
-                token_logits.float(),
-                token_labels.view(-1),
-                ignore_index=-100,
-                weight=weight,
-            )
-        else:
-            shuffle_loss = torch.nn.functional.cross_entropy(
-                token_logits.float().view(-1, token_logits.size(-1)),
-                token_labels.view(-1),
-                ignore_index=-100,
-                weight=weight,
-            )
-    domain_logits = outputs.get("domain_logits")
-    if domain_logits is None:
-        domain_loss = outputs["lm_loss"].new_tensor(0.0)
-    else:
-        half = domain_logits.size(0) // 2
-        domain_labels = torch.cat(
-            [
-                torch.zeros(half, device=domain_logits.device, dtype=torch.long),
-                torch.ones(domain_logits.size(0) - half, device=domain_logits.device, dtype=torch.long),
-            ],
-            dim=0,
-        )
-        weight = None
-        counts = torch.bincount(domain_labels, minlength=2).float()
-        if torch.all(counts > 0):
-            weight = (counts.sum() / (2.0 * counts)).clamp(max=5.0)
-            weight = weight.to(domain_logits.device)
-        domain_loss = torch.nn.functional.cross_entropy(
-            domain_logits.float(), domain_labels, weight=weight
-        )
-    low_recon_pred = outputs.get("low_recon_pred")
-    low_recon_target = outputs.get("low_recon_target")
-    if low_recon_pred is None or low_recon_target is None:
-        low_recon_loss = outputs["lm_loss"].new_tensor(0.0)
-    else:
-        diff = (low_recon_pred.float() - low_recon_target.float()).pow(2).mean(dim=-1)
-        low_recon_loss = diff.mean()
-    z_l2_loss = outputs.get("z_l2_loss", outputs["lm_loss"].new_tensor(0.0))
-    return domain_loss, shuffle_loss, low_recon_loss, z_l2_loss
+) -> Dict[str, torch.Tensor]:
+    return compute_proxy_losses(outputs, batch)
 
 
 def _maybe_resize_embeddings(
@@ -221,6 +160,87 @@ def _save_yaml_config(args: argparse.Namespace, path: str) -> None:
         os.makedirs(dir_path, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(vars(args), handle, sort_keys=True)
+
+
+def _parse_bins(text: str, cast=float) -> List:
+    if text is None:
+        return []
+    if isinstance(text, (list, tuple)):
+        return [cast(val) for val in text]
+    parts = []
+    for raw in str(text).split(","):
+        raw = raw.strip().strip("[]")
+        if not raw:
+            continue
+        parts.append(cast(raw))
+    return parts
+
+
+def _encode_ids(tokenizer, text: str, max_length: Optional[int]) -> List[int]:
+    kwargs = {"add_special_tokens": False, "truncation": True}
+    if max_length is not None:
+        kwargs["max_length"] = max_length
+    return tokenizer(text, **kwargs)["input_ids"]
+
+
+def _has_response(text: Optional[str]) -> bool:
+    return bool(text and text.strip())
+
+
+def _compute_length_quantile_bins(
+    dataset: DIBJudgeDataset,
+    tokenizer,
+    max_length: Optional[int],
+    bins: int = 10,
+) -> List[int]:
+    lengths: List[int] = []
+    for ex in dataset:
+        lengths.append(len(_encode_ids(tokenizer, ex.response_a or "", max_length)))
+        if _has_response(ex.response_b):
+            lengths.append(len(_encode_ids(tokenizer, ex.response_b or "", max_length)))
+    if not lengths or bins < 2:
+        return list(ProxyTaskConfig().length_bins)
+    lengths.sort()
+    n = len(lengths)
+    cuts: List[int] = []
+    for idx in range(1, bins):
+        q = idx / float(bins)
+        pos = int(math.ceil(q * n)) - 1
+        pos = min(max(pos, 0), n - 1)
+        cuts.append(lengths[pos])
+    max_len = lengths[-1]
+    return [0] + cuts + [max_len]
+
+
+def _collect_proxy_values(dataset: DIBJudgeDataset, attrs: Tuple[str, ...]) -> List[float]:
+    values: List[float] = []
+    for ex in dataset:
+        for attr in attrs:
+            val = getattr(ex, attr, None)
+            if val is None:
+                continue
+            if isinstance(val, float) and math.isnan(val):
+                continue
+            values.append(float(val))
+    return values
+
+
+def _compute_value_quantile_bins(
+    values: List[float],
+    bins: int,
+    fallback: Tuple[float, ...],
+) -> List[float]:
+    if not values or bins < 2:
+        return list(fallback)
+    values.sort()
+    n = len(values)
+    cuts: List[float] = []
+    for idx in range(1, bins):
+        q = idx / float(bins)
+        pos = int(math.ceil(q * n)) - 1
+        pos = min(max(pos, 0), n - 1)
+        cuts.append(values[pos])
+    return [values[0]] + cuts + [values[-1]]
 
 
 def _save_deepspeed_checkpoint(
@@ -461,6 +481,7 @@ def _save_hf_from_zero(
         compact_head_hidden=args.compact_head_hidden,
         compact_head_layers=args.compact_head_layers,
         compact_head_dropout=args.compact_head_dropout,
+        proxy_length_classes=getattr(args, "proxy_length_classes", DIBJudgeConfig.proxy_length_classes),
     )
     config_path = os.path.join(dibjudge_dir, "config.json")
     with open(config_path, "w", encoding="utf-8") as handle:
@@ -584,8 +605,11 @@ def _build_optimizer_params(
     }
     head_prefixes = (
         "eng_domain_head.",
+        "position_head.",
         "low_recon_head.",
-        "seq_shuffle_head.",
+        "length_bin_head.",
+        "nll_bin_head.",
+        "ttr_bin_head.",
         "compact_head.",
         "prompt_mlp.",
         "z_to_lm.",
@@ -687,10 +711,6 @@ def main() -> None:
     parser.add_argument("--max-bias-len", type=int, default=1024)
     parser.add_argument("--max-ref-len", type=int, default=1024)
     parser.add_argument("--max-lm-len", type=int, default=4096)
-    parser.add_argument("--shuffle-ratio-min", type=float, default=0.05)
-    parser.add_argument("--shuffle-ratio-max", type=float, default=0.3)
-    parser.add_argument("--shuffle-ratio-step", type=float, default=0.0)
-    parser.add_argument("--shuffle-ratio-schedule-ratio", type=float, default=0.7)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument(
@@ -719,10 +739,77 @@ def main() -> None:
     parser.add_argument("--bias-decoder-steps", type=int, default=1)
     parser.add_argument("--eng-domain-weight", type=float, default=1.0)
     parser.add_argument("--low-recon-weight", type=float, default=0.5)
-    parser.add_argument("--shuffle-weight", type=float, default=0.5)
     parser.add_argument("--z-l2-weight", type=float, default=0.1)
-    
-    
+    parser.add_argument("--nll-bin-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--ppl-bin-weight",
+        dest="nll_bin_weight",
+        type=float,
+        default=0.5,
+        help="Deprecated alias for --nll-bin-weight.",
+    )
+    parser.add_argument("--ttr-bin-weight", type=float, default=0.5)
+    parser.add_argument("--length-bin-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--position-weight",
+        type=float,
+        default=0.0,
+        help="Weight for adversarial position-discriminator loss.",
+    )
+    parser.add_argument(
+        "--proxy-nll-bins",
+        dest="proxy_nll_bins",
+        default="0,2.3026,2.9957,3.6889,4.3820,5.0752,13.8155",
+        help="Comma-separated bins for NLL (log PPL) ordinal regression.",
+    )
+    parser.add_argument(
+        "--proxy-ppl-bins",
+        dest="proxy_nll_bins",
+        default="0,2.3026,2.9957,3.6889,4.3820,5.0752,13.8155",
+        help="Deprecated alias for --proxy-nll-bins.",
+    )
+    parser.add_argument(
+        "--proxy-nll-quantiles",
+        dest="proxy_nll_quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use training-set NLL quantiles instead of fixed bins.",
+    )
+    parser.add_argument(
+        "--proxy-ppl-quantiles",
+        dest="proxy_nll_quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Deprecated alias for --proxy-nll-quantiles.",
+    )
+    parser.add_argument(
+        "--proxy-ttr-bins",
+        default="0,0.2,0.4,0.6,0.8,1.0",
+        help="Comma-separated bins for TTR ordinal regression.",
+    )
+    parser.add_argument(
+        "--proxy-ttr-quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use training-set TTR quantiles instead of fixed bins.",
+    )
+    parser.add_argument(
+        "--proxy-length-bins",
+        default="0,50,100,200,400,1000000",
+        help="Comma-separated bins for length ordinal regression.",
+    )
+    parser.add_argument(
+        "--proxy-length-quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use decile length quantiles from the training set instead of fixed bins.",
+    )
+    parser.add_argument(
+        "--proxy-soft-labels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use soft interpolation between ordinal bins.",
+    )
     parser.add_argument("--encoder-lr", type=float, default=2e-5)
     parser.add_argument("--lm-lr", type=float, default=2e-5)
     parser.add_argument("--lora-lr", type=float, default=2e-4)
@@ -805,8 +892,43 @@ def main() -> None:
         mu_id = lm_tok.pad_token_id or 0
     args.compact_mu_token_id = int(mu_id)
 
+    length_bins = _parse_bins(args.proxy_length_bins, float)
+    if len(length_bins) < 2:
+        length_bins = list(ProxyTaskConfig().length_bins)
+    nll_bins = _parse_bins(args.proxy_nll_bins, float)
+    if len(nll_bins) < 2:
+        nll_bins = list(ProxyTaskConfig().nll_bins)
+    ttr_bins = _parse_bins(args.proxy_ttr_bins, float)
+    if len(ttr_bins) < 2:
+        ttr_bins = list(ProxyTaskConfig().ttr_bins)
+
     dataset = DIBJudgeDataset.from_jsonl(args.data_path)
     _rank0_print(rank, "[stage done] dataset loaded")
+    if args.proxy_length_quantiles:
+        length_bins = _compute_length_quantile_bins(
+            dataset, lm_tok, args.max_bias_len, bins=10
+        )
+    if args.proxy_nll_quantiles:
+        nll_bins = _compute_value_quantile_bins(
+            _collect_proxy_values(dataset, ("proxy_nll_a", "proxy_nll_b")),
+            bins=10,
+            fallback=tuple(nll_bins),
+        )
+    if args.proxy_ttr_quantiles:
+        ttr_bins = _compute_value_quantile_bins(
+            _collect_proxy_values(dataset, ("proxy_ttr_a", "proxy_ttr_b")),
+            bins=10,
+            fallback=tuple(ttr_bins),
+        )
+    proxy_config = ProxyTaskConfig(
+        nll_bins=tuple(nll_bins),
+        ttr_bins=tuple(ttr_bins),
+        length_bins=tuple(length_bins),
+        use_soft_labels=bool(args.proxy_soft_labels),
+    )
+    args.proxy_nll_classes = max(2, len(nll_bins) - 1)
+    args.proxy_ttr_classes = max(2, len(ttr_bins) - 1)
+    args.proxy_length_classes = max(2, len(length_bins) - 1)
     sampler = (
         DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
         if world_size > 1
@@ -815,28 +937,13 @@ def main() -> None:
     samples_per_rank = math.ceil(len(dataset) / max(1, world_size))
     steps_per_epoch = math.ceil(samples_per_rank / max(1, args.per_device_train_batch_size))
     total_steps = max(1, steps_per_epoch * max(1, args.epochs))
-    shuffle_ratio_step = float(args.shuffle_ratio_step)
-    if args.shuffle_ratio_schedule_ratio > 0:
-        schedule_steps = max(1, int(total_steps * args.shuffle_ratio_schedule_ratio))
-        ratio_span = max(0.0, args.shuffle_ratio_max - args.shuffle_ratio_min)
-        if ratio_span > 0:
-            shuffle_ratio_step = ratio_span / schedule_steps
     grl_start = _phase_boundary(total_steps, args.grl_start_ratio)
-    if rank == 0:
-        _rank0_print(
-            rank,
-            "Shuffle schedule:",
-            f"min={args.shuffle_ratio_min} max={args.shuffle_ratio_max} step={shuffle_ratio_step:.6f}",
-        )
     collator = DIBJudgeCollator(
         lm_tok,
         max_bias_len=args.max_bias_len,
         max_ref_len=args.max_ref_len,
         max_lm_len=args.max_lm_len,
-        shuffle_ratio_min=args.shuffle_ratio_min,
-        shuffle_ratio_max=args.shuffle_ratio_max,
-        shuffle_ratio_step=shuffle_ratio_step,
-        shuffle_schedule_start_step=0,
+        proxy_config=proxy_config,
     )
     loader = DataLoader(
         dataset,
@@ -852,7 +959,7 @@ def main() -> None:
         batch = next(iter(loader))
         shapes = {k: tuple(v.shape) for k, v in batch.items() if torch.is_tensor(v)}
         _rank0_print(rank, "Debug batch shapes:", shapes)
-        for key in ("original_attention_mask", "shuffle_attention_mask", "lm_attention_mask"):
+        for key in ("original_attention_mask", "lm_attention_mask"):
             if key in batch:
                 mask = batch[key]
                 lengths = mask.sum(dim=-1).view(-1).tolist()
@@ -879,6 +986,9 @@ def main() -> None:
         compact_head_hidden=args.compact_head_hidden,
         compact_head_layers=args.compact_head_layers,
         compact_head_dropout=args.compact_head_dropout,
+        proxy_nll_classes=max(2, len(nll_bins) - 1),
+        proxy_ttr_classes=max(2, len(ttr_bins) - 1),
+        proxy_length_classes=max(2, len(length_bins) - 1),
     ).to(device)
     _maybe_resize_embeddings(model.shared_encoder, judge_tok, "shared_encoder", rank)
     _maybe_resize_embeddings(model.judge_lm, lm_tok, "judge_lm", rank)
@@ -958,6 +1068,17 @@ def main() -> None:
     engine, optimizer, _, _ = deepspeed.initialize(**ds_kwargs)
     _rank0_print(rank, "[stage done] deepspeed initialized")
     _print_trainable_params(engine.module, rank)
+    model_dtype = None
+    for param in engine.module.parameters():
+        if param.requires_grad:
+            model_dtype = param.dtype
+            break
+    if model_dtype is None:
+        for param in engine.module.parameters():
+            model_dtype = param.dtype
+            break
+    if model_dtype is None:
+        model_dtype = torch.bfloat16 if args.bf16 else torch.float32
     encoder_params: List[torch.nn.Parameter] = []
     lm_params: List[torch.nn.Parameter] = []
     if args.debug_aux_checks:
@@ -987,8 +1108,9 @@ def main() -> None:
             "bottleneck_noise_warmup_ratio": args.bottleneck_noise_warmup_ratio,
             "eng_domain_weight": args.eng_domain_weight,
             "low_recon_weight": args.low_recon_weight,
-            "shuffle_weight": args.shuffle_weight,
             "z_l2_weight": args.z_l2_weight,
+            "length_bin_weight": args.length_bin_weight,
+            "position_weight": args.position_weight,
             "mask_loss_weight": args.mask_loss_weight,
             "consistency_loss_weight": args.consistency_loss_weight,
         },
@@ -1045,9 +1167,15 @@ def main() -> None:
             "lm_loss": 0.0,
             "compact_kl_loss": 0.0,
             "domain_loss": 0.0,
+            "position_loss": 0.0,
             "low_recon_loss": 0.0,
             "z_l2_loss": 0.0,
-            "shuffle_loss": 0.0,
+            "nll_bin_loss": 0.0,
+            "ttr_bin_loss": 0.0,
+            "length_bin_loss": 0.0,
+            "nll_bin_mae": 0.0,
+            "ttr_bin_mae": 0.0,
+            "length_bin_mae": 0.0,
             "compression_loss": 0.0,
             "mask_loss": 0.0,
             "consistency_loss": 0.0,
@@ -1096,9 +1224,17 @@ def main() -> None:
             diag_metrics: Dict[str, float] = {}
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = engine(batch)
-                domain_loss, shuffle_loss, low_recon_loss, z_l2_loss = _compute_bias_terms(
-                    outputs, batch
-                )
+                proxy_losses = _compute_bias_terms(outputs, batch)
+                domain_loss = proxy_losses["domain_loss"]
+                position_loss = proxy_losses["position_loss"]
+                low_recon_loss = proxy_losses["low_recon_loss"]
+                z_l2_loss = proxy_losses["z_l2_loss"]
+                nll_bin_loss = proxy_losses["nll_bin_loss"]
+                ttr_bin_loss = proxy_losses["ttr_bin_loss"]
+                length_bin_loss = proxy_losses["length_bin_loss"]
+                nll_bin_mae = proxy_losses.get("nll_bin_mae", outputs["lm_loss"].new_tensor(0.0))
+                ttr_bin_mae = proxy_losses.get("ttr_bin_mae", outputs["lm_loss"].new_tensor(0.0))
+                length_bin_mae = proxy_losses.get("length_bin_mae", outputs["lm_loss"].new_tensor(0.0))
 
                 mask_loss = outputs.get(
                     "compact_mask_loss", outputs["lm_loss"].new_tensor(0.0)
@@ -1112,9 +1248,12 @@ def main() -> None:
                 )
                 bias_loss = (
                     args.eng_domain_weight * domain_loss
-                    + args.shuffle_weight * shuffle_loss
+                    + args.position_weight * position_loss
                     + args.low_recon_weight * low_recon_loss
                     + args.z_l2_weight * z_l2_loss
+                    + args.nll_bin_weight * nll_bin_loss
+                    + args.ttr_bin_weight * ttr_bin_loss
+                    + args.length_bin_weight * length_bin_loss
                 )
                 core_lm_loss = outputs["lm_loss"] + outputs["compact_kl_loss"]
             if (
@@ -1158,6 +1297,12 @@ def main() -> None:
                 + lambda_bias * bias_loss
             )
 
+            if args.bf16:
+                if total_loss.dtype != torch.float32:
+                    total_loss = total_loss.float()
+            elif model_dtype is not None and total_loss.dtype != model_dtype:
+                total_loss = total_loss.to(model_dtype)
+
             engine.backward(total_loss)
             if args.debug_aux_checks and accum_boundary:
                 total_params = [p for p in engine.module.parameters() if p.requires_grad]
@@ -1190,16 +1335,22 @@ def main() -> None:
                     bias_batch["bias_detach"] = True
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                         bias_outputs = engine(bias_batch)
-                        domain_loss_b, shuffle_loss_b, low_recon_loss_b, z_l2_loss_b = _compute_bias_terms(
-                            bias_outputs, bias_batch
-                        )
+                        proxy_losses_b = _compute_bias_terms(bias_outputs, bias_batch)
                         bias_loss_b = (
-                            args.eng_domain_weight * domain_loss_b
-                            + args.shuffle_weight * shuffle_loss_b
-                            + args.low_recon_weight * low_recon_loss_b
-                            + args.z_l2_weight * z_l2_loss_b
+                            args.eng_domain_weight * proxy_losses_b["domain_loss"]
+                            + args.position_weight * proxy_losses_b["position_loss"]
+                            + args.low_recon_weight * proxy_losses_b["low_recon_loss"]
+                            + args.z_l2_weight * proxy_losses_b["z_l2_loss"]
+                            + args.nll_bin_weight * proxy_losses_b["nll_bin_loss"]
+                            + args.ttr_bin_weight * proxy_losses_b["ttr_bin_loss"]
+                            + args.length_bin_weight * proxy_losses_b["length_bin_loss"]
                         )
                         bias_loss_b = bias_loss_b * lambda_bias
+                    if args.bf16:
+                        if bias_loss_b.dtype != torch.float32:
+                            bias_loss_b = bias_loss_b.float()
+                    elif model_dtype is not None and bias_loss_b.dtype != model_dtype:
+                        bias_loss_b = bias_loss_b.to(model_dtype)
                     engine.backward(bias_loss_b)
                     saved_sched = getattr(engine, "lr_scheduler", None)
                     if saved_sched is not None:
@@ -1212,9 +1363,15 @@ def main() -> None:
             totals["lm_loss"] += outputs["lm_loss"].item()
             totals["compact_kl_loss"] += outputs["compact_kl_loss"].item()
             totals["domain_loss"] += domain_loss.item()
+            totals["position_loss"] += position_loss.item()
             totals["low_recon_loss"] += low_recon_loss.item()
             totals["z_l2_loss"] += z_l2_loss.item()
-            totals["shuffle_loss"] += shuffle_loss.item()
+            totals["nll_bin_loss"] += nll_bin_loss.item()
+            totals["ttr_bin_loss"] += ttr_bin_loss.item()
+            totals["length_bin_loss"] += length_bin_loss.item()
+            totals["nll_bin_mae"] += nll_bin_mae.item()
+            totals["ttr_bin_mae"] += ttr_bin_mae.item()
+            totals["length_bin_mae"] += length_bin_mae.item()
             totals.setdefault("compression_loss", 0.0)
             totals["compression_loss"] += compression_loss.item()
             totals["mask_loss"] += mask_loss.item()
@@ -1274,9 +1431,15 @@ def main() -> None:
                             "lm_loss": outputs["lm_loss"].item(),
                             "compact_kl_loss": outputs["compact_kl_loss"].item(),
                             "domain_loss": domain_loss.item(),
+                            "position_loss": position_loss.item(),
                             "low_recon_loss": low_recon_loss.item(),
                             "z_l2_loss": z_l2_loss.item(),
-                            "shuffle_loss": shuffle_loss.item(),
+                            "nll_bin_loss": nll_bin_loss.item(),
+                            "ttr_bin_loss": ttr_bin_loss.item(),
+                            "length_bin_loss": length_bin_loss.item(),
+                            "nll_bin_mae": nll_bin_mae.item(),
+                            "ttr_bin_mae": ttr_bin_mae.item(),
+                            "length_bin_mae": length_bin_mae.item(),
                             "compression/mask_loss": mask_loss.item(),
                             "compression/consistency_loss": consistency_loss.item(),
                             "compression/loss": compression_loss.item(),
@@ -1289,17 +1452,15 @@ def main() -> None:
                             "weights/grl_lambda": grl_lambda,
                             "weights/bottleneck_noise_alpha": noise_alpha,
                             "weights/eng_domain": args.eng_domain_weight,
-                            "weights/shuffle": args.shuffle_weight,
+                            "weights/position": args.position_weight,
                             "weights/low_recon": args.low_recon_weight,
                             "weights/z_l2": args.z_l2_weight,
+                            "weights/nll_bin": args.nll_bin_weight,
+                            "weights/ttr_bin": args.ttr_bin_weight,
+                            "weights/length_bin": args.length_bin_weight,
                             "weights/mask_loss": args.mask_loss_weight,
                             "weights/consistency_loss": args.consistency_loss_weight,
                             **last_update_diag,
-                            "shuffle/ratio": float(
-                                batch.get("shuffle_ratio", 0.0)
-                                if not torch.is_tensor(batch.get("shuffle_ratio", None))
-                                else batch.get("shuffle_ratio").item()
-                            ),
                             "batch/lm_tokens": lm_tokens,
                             "batch/original_tokens": original_tokens,
                             **lr_stats,

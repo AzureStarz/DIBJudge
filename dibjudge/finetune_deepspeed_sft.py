@@ -109,6 +109,129 @@ def _save_deepspeed_checkpoint(
     engine.save_checkpoint(output_dir, tag=tag)
 
 
+def _normalize_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    normalized = {}
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        normalized[key] = value.cpu()
+    return normalized
+
+
+def _strip_prefix_if_present(
+    state_dict: Dict[str, torch.Tensor], prefix: str
+) -> Dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if all(key.startswith(prefix) for key in state_dict):
+        return {key[len(prefix) :]: value for key, value in state_dict.items()}
+    return state_dict
+
+
+def _merge_lora_into_lm_state(
+    lm_state: Dict[str, torch.Tensor],
+    args: argparse.Namespace,
+    rank: int,
+) -> Optional[Dict[str, torch.Tensor]]:
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError:
+        _rank0_print(rank, "[warn] peft is required to merge LoRA weights.")
+        return None
+    try:
+        base = AutoModelForCausalLM.from_pretrained(args.lm, local_files_only=True)
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to load base model for LoRA merge: {exc}")
+        return None
+
+    targets = [name.strip() for name in args.lora_targets.split(",") if name.strip()]
+    lora_cfg = LoraConfig(
+        r=int(args.lora_r),
+        lora_alpha=int(args.lora_alpha),
+        lora_dropout=float(args.lora_dropout),
+        target_modules=targets,
+        task_type="CAUSAL_LM",
+    )
+    peft_model = get_peft_model(base, lora_cfg)
+    missing, unexpected = peft_model.load_state_dict(lm_state, strict=False)
+    if missing:
+        _rank0_print(rank, f"[warn] missing keys while loading LoRA LM: {len(missing)}")
+    if unexpected:
+        _rank0_print(rank, f"[warn] unexpected keys while loading LoRA LM: {len(unexpected)}")
+    try:
+        merged = peft_model.merge_and_unload()
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to merge LoRA weights: {exc}")
+        return None
+    return {key: value.cpu() for key, value in merged.state_dict().items()}
+
+
+def _save_lm_assets(output_dir: str, args: argparse.Namespace, rank: int) -> None:
+    try:
+        lm_tok = AutoTokenizer.from_pretrained(
+            args.lm, local_files_only=True, use_fast=True
+        )
+        lm_tok.save_pretrained(output_dir)
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to save LM tokenizer: {exc}")
+    try:
+        from transformers import GenerationConfig
+    except ImportError:
+        return
+    try:
+        gen_cfg = GenerationConfig.from_pretrained(args.lm, local_files_only=True)
+        gen_cfg.save_pretrained(output_dir)
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to save generation config: {exc}")
+
+
+def _save_hf_checkpoint(
+    checkpoint_dir: str,
+    tag: str,
+    args: argparse.Namespace,
+    rank: int,
+) -> None:
+    output_dir = os.path.join(checkpoint_dir, f"hf-{tag}")
+    if rank != 0:
+        return
+    if not output_dir:
+        return
+    try:
+        from deepspeed.utils.zero_to_fp32 import (
+            get_fp32_state_dict_from_zero_checkpoint,
+        )
+    except ImportError:
+        _rank0_print(rank, "[warn] deepspeed is required to export HF checkpoints.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    _rank0_print(rank, f"[hf] extracting LM from {checkpoint_dir} tag={tag}")
+    raw_state = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
+    state_dict = _normalize_state_dict(raw_state)
+
+    if args.use_lora:
+        merged = _merge_lora_into_lm_state(state_dict, args, rank)
+        if merged is not None:
+            state_dict = merged
+
+    state_dict = _strip_prefix_if_present(state_dict, "base_model.model.")
+    state_dict = _strip_prefix_if_present(state_dict, "base_model.")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.lm, local_files_only=True)
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to load base model for HF export: {exc}")
+        return
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        _rank0_print(rank, f"[warn] missing keys while loading LM: {len(missing)}")
+    if unexpected:
+        _rank0_print(rank, f"[warn] unexpected keys while loading LM: {len(unexpected)}")
+    model.save_pretrained(output_dir)
+    _save_lm_assets(output_dir, args, rank)
+
+
 def _maybe_apply_lora(model: torch.nn.Module, args: argparse.Namespace, rank: int) -> torch.nn.Module:
     if not args.use_lora:
         return model
@@ -166,6 +289,23 @@ def _build_optimizer_params(
     if not param_groups:
         raise ValueError("No trainable parameters found for optimizer.")
     return param_groups
+
+
+def _zero_offload_enabled(ds_config: object) -> bool:
+    if not isinstance(ds_config, dict):
+        return False
+    zero_cfg = ds_config.get("zero_optimization")
+    if not isinstance(zero_cfg, dict):
+        return False
+    offload = zero_cfg.get("offload_optimizer")
+    if not offload:
+        return False
+    if isinstance(offload, dict):
+        device = str(offload.get("device", "")).lower()
+        return bool(device) and device not in {"none", "false", "off"}
+    if isinstance(offload, str):
+        return offload.lower() not in {"none", "false", "off"}
+    return True
 
 
 def _warmup_steps_from_ratio(total_steps: int, ratio: Optional[float], warmup_steps: int) -> int:
@@ -374,7 +514,6 @@ def main() -> None:
         weight_decay=args.weight_decay,
         lora_weight_decay=args.lora_weight_decay,
     )
-    optimizer = torch.optim.AdamW(optimizer_params)
 
     steps_per_epoch = math.ceil(len(dataset) / max(1, args.per_device_train_batch_size))
     if world_size > 1:
@@ -385,15 +524,6 @@ def main() -> None:
     warmup_steps = _warmup_steps_from_ratio(
         total_update_steps, args.warmup_ratio, args.warmup_steps
     )
-    scheduler = None
-    sched_name = str(args.scheduler_type or "").lower()
-    if sched_name and sched_name not in {"none", "disable", "disabled"}:
-        scheduler = get_scheduler(
-            sched_name,
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_update_steps,
-        )
 
     ds_config = args.deepspeed_config
     if isinstance(ds_config, str) and os.path.isfile(ds_config):
@@ -410,6 +540,37 @@ def main() -> None:
             ds_config["bf16"]["enabled"] = bool(args.bf16)
         if "fp16" in ds_config and isinstance(ds_config["fp16"], dict):
             ds_config["fp16"]["enabled"] = not bool(args.bf16)
+
+    force_ds_cpu = True
+    if isinstance(ds_config, dict) and "zero_force_ds_cpu_optimizer" in ds_config:
+        force_ds_cpu = bool(ds_config["zero_force_ds_cpu_optimizer"])
+    if _zero_offload_enabled(ds_config) and force_ds_cpu:
+        try:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+        except ImportError as exc:
+            _rank0_print(rank, f"[warn] failed to import DeepSpeedCPUAdam: {exc}")
+            optimizer = torch.optim.AdamW(optimizer_params)
+            if isinstance(ds_config, dict):
+                ds_config["zero_force_ds_cpu_optimizer"] = False
+                _rank0_print(
+                    rank,
+                    "[warn] falling back to AdamW; set zero_force_ds_cpu_optimizer=false",
+                )
+        else:
+            optimizer = DeepSpeedCPUAdam(optimizer_params)
+            _rank0_print(rank, "[stage done] using DeepSpeedCPUAdam for ZeRO-Offload")
+    else:
+        optimizer = torch.optim.AdamW(optimizer_params)
+
+    scheduler = None
+    sched_name = str(args.scheduler_type or "").lower()
+    if sched_name and sched_name not in {"none", "disable", "disabled"}:
+        scheduler = get_scheduler(
+            sched_name,
+            optimizer=optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_update_steps,
+        )
 
     ds_kwargs = {
         "model": model,
@@ -519,9 +680,9 @@ def main() -> None:
             )
 
     if args.save_at_end:
-        _save_deepspeed_checkpoint(
-            engine, args.output_dir or "outputs/deepspeed", "final", rank
-        )
+        checkpoint_dir = args.output_dir or "outputs/deepspeed"
+        _save_deepspeed_checkpoint(engine, checkpoint_dir, "final", rank)
+        _save_hf_checkpoint(checkpoint_dir, "final", args, rank)
 
     if swanlab_client is not None and rank == 0:
         finish_swanlab(swanlab_client)

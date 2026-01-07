@@ -15,29 +15,32 @@ bias_proxy_hidden: 0
 bias_proxy_layers: 0
 bias_proxy_dropout: 0.05
 low_recon_layer: 2
-compact_prior: 0.5
+compact_prior: 0.1
 compact_mu_token_id: -1
 compact_head_hidden: 0
 compact_head_layers: 0
 compact_head_dropout: 0.05
 
 # data config
-data_path: data/m_preference_collection_50k_qwen3-4b_no_ref_no_criteria.jsonl
+data_path: data/m_preference_collection_50k_qwen3-4b_no_ref_no_criteria.precomputed.jsonl
 per_device_train_batch_size: 1
 num_workers: 0
 max_bias_len: 1024
 max_ref_len: 1024
 max_lm_len: 4096
-shuffle_ratio_min: 0.1
-shuffle_ratio_max: 0.5
-shuffle_ratio_step: 0.0
-shuffle_ratio_schedule_ratio: 0.3
+proxy_nll_bins: "0,2.3026,2.9957,3.6889,4.3820,5.0752,13.8155"
+proxy_nll_quantiles: false
+proxy_ttr_bins: "0,0.2,0.4,0.6,0.8,1.0"
+proxy_ttr_quantiles: false
+proxy_length_bins: "0,50,100,200,400,1000000"
+proxy_length_quantiles: true
+proxy_soft_labels: true
 
 # runtime config
 epochs: 1
 deepspeed_config: configs/deepspeed/ds_z2_config.json
-output_dir: outputs/deepspeed/debug
-log_dir: logs/deepspeed/debug
+output_dir: outputs/debug/run-v1
+log_dir: logs/debug/run-v1
 save_every_steps: 0
 save_at_end: true
 bf16: true
@@ -48,7 +51,7 @@ debug_aux_checks: false
 debug_aux_checks_interval: 10
 use_swanlab: true
 swanlab_project: dibjudge
-swanlab_run_name: null
+swanlab_run_name: debug-run-v1
 swanlab_tags: null
 swanlab_log_steps: 1
 
@@ -87,5 +90,7 @@ grl_gamma: 10.0
 bias_decoder_steps: 2
 eng_domain_weight: 1.0
 low_recon_weight: 1.0
-shuffle_weight: 1.0
 z_l2_weight: 1.0
+nll_bin_weight: 0.5
+ttr_bin_weight: 0.5
+length_bin_weight: 0.5

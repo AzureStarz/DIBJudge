@@ -1,44 +1,67 @@
 from __future__ import annotations
 
 import json
-import random
+import math
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
 from torch.utils.data import Dataset
+
+from .proxy_tasks import ProxyTaskConfig
 
 
 @dataclass
 class DIBJudgeExample:
     instruction: str
     response_a: str
-    response_b: str
+    response_b: Optional[str]
     response_a_bt: str
-    response_b_bt: str
+    response_b_bt: Optional[str]
     judge_prompt: str
     output: str
+    proxy_length_a: Optional[float] = None
+    proxy_length_b: Optional[float] = None
+    proxy_nll_a: Optional[float] = None
+    proxy_nll_b: Optional[float] = None
+    proxy_ttr_a: Optional[float] = None
+    proxy_ttr_b: Optional[float] = None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, object]) -> "DIBJudgeExample":
         response_a = str(raw.get("response_A", ""))
-        response_b = str(raw.get("response_B", ""))
+        response_b = _coerce_optional_text(raw.get("response_B"))
         response_a_bt = _coerce_text(
             raw.get("response_A_bt", raw.get("response_A_eng")), response_a
         )
-        response_b_bt = _coerce_text(
-            raw.get("response_B_bt", raw.get("response_B_eng")), response_b
+        response_b_bt = _coerce_optional_text(
+            raw.get("response_B_bt", raw.get("response_B_eng"))
         )
+        judge_prompt = _coerce_optional_text(
+            raw.get("judge_prompt", raw.get("judge_instruction"))
+        )
+        instruction = _coerce_optional_text(
+            raw.get("instruction", raw.get("prompt"))
+        )
+        if response_b_bt is None:
+            response_b_bt = response_b
         return cls(
-            instruction=str(raw.get("instruction", "")),
+            instruction=instruction,
             response_a=response_a,
             response_b=response_b,
             response_a_bt=response_a_bt,
             response_b_bt=response_b_bt,
-            judge_prompt=str(raw.get("judge_prompt", "")),
+            judge_prompt=judge_prompt,
             output=str(raw.get("output", "")),
+            proxy_length_a=_coerce_optional_float(raw.get("proxy_length_A")),
+            proxy_length_b=_coerce_optional_float(raw.get("proxy_length_B")),
+            proxy_nll_a=_coerce_optional_nll(raw.get("proxy_nll_A"), raw.get("proxy_ppl_A")),
+            proxy_nll_b=_coerce_optional_nll(raw.get("proxy_nll_B"), raw.get("proxy_ppl_B")),
+            proxy_ttr_a=_coerce_optional_float(raw.get("proxy_ttr_A")),
+            proxy_ttr_b=_coerce_optional_float(raw.get("proxy_ttr_B")),
         )
 
 
@@ -47,14 +70,41 @@ class DIBJudgeDataset(Dataset):
         self.samples = list(samples)
 
     @classmethod
-    def from_jsonl(cls, path: str) -> "DIBJudgeDataset":
+    def from_jsonl(
+        cls, path: str, proxy_cache_path: Optional[str] = None
+    ) -> "DIBJudgeDataset":
         samples: List[DIBJudgeExample] = []
+        cache_path = proxy_cache_path or _infer_proxy_cache_path(path)
+        cache_iter = _iter_jsonl(cache_path) if cache_path else None
+        cache_exhausted = False
+        missing_proxy = False
         with open(path, "r", encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
                 raw = json.loads(line)
+                cache_raw = None
+                if cache_iter is not None and not cache_exhausted:
+                    try:
+                        cache_raw = next(cache_iter)
+                    except StopIteration:
+                        cache_exhausted = True
+                        cache_raw = None
+                        warnings.warn(
+                            "Proxy cache ended early; remaining samples will use in-file fields.",
+                            RuntimeWarning,
+                        )
+                if cache_raw is not None:
+                    _merge_proxy_cache(raw, cache_raw)
+                if _missing_proxy_fields(raw):
+                    missing_proxy = True
                 samples.append(DIBJudgeExample.from_dict(raw))
+        if missing_proxy and cache_path is None:
+            warnings.warn(
+                "Proxy fields missing in dataset and no proxy cache found. "
+                "Provide a proxy cache path or include proxy fields in the dataset.",
+                RuntimeWarning,
+            )
         return cls(samples)
 
     def __len__(self) -> int:
@@ -111,6 +161,163 @@ def _coerce_text(value: Optional[object], fallback: str) -> str:
     return text if text else fallback
 
 
+def _coerce_optional_text(value: Optional[object]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _has_response(text: Optional[str]) -> bool:
+    return bool(text and text.strip())
+
+
+def _bucketize_int(value: int, bins: Sequence[int]) -> int:
+    if len(bins) < 2:
+        return 0
+    for idx in range(len(bins) - 1):
+        if bins[idx] <= value <= bins[idx + 1]:
+            return idx
+    if value < bins[0]:
+        return 0
+    return len(bins) - 2
+
+
+def _soft_bin_target(
+    value: Optional[float],
+    bins: Sequence[float],
+    use_soft: bool,
+) -> Tuple[int, List[float]]:
+    num_bins = max(0, len(bins) - 1)
+    if num_bins <= 0:
+        return -100, []
+    if value is None:
+        return -100, [0.0] * num_bins
+    if isinstance(value, float) and math.isnan(value):
+        return -100, [0.0] * num_bins
+    idx = _bucketize_int(float(value), bins)
+    target = [0.0] * num_bins
+    if not use_soft or num_bins == 1:
+        target[idx] = 1.0
+        return idx, target
+    left = float(bins[idx])
+    right = float(bins[min(idx + 1, len(bins) - 1)])
+    if idx >= num_bins - 1 or right <= left:
+        target[idx] = 1.0
+        return idx, target
+    ratio = (float(value) - left) / (right - left)
+    ratio = min(max(ratio, 0.0), 1.0)
+    target[idx] = 1.0 - ratio
+    target[idx + 1] = ratio
+    return idx, target
+
+
+def _coerce_optional_int(value: Optional[object]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_float(value: Optional[object]) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(int(value))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_nll(nll_value: Optional[object], ppl_value: Optional[object]) -> Optional[float]:
+    nll = _coerce_optional_float(nll_value)
+    if nll is not None:
+        return nll
+    ppl = _coerce_optional_float(ppl_value)
+    if ppl is None:
+        return None
+    if ppl <= 0:
+        return None
+    return math.log(ppl)
+
+
+_PROXY_CACHE_FIELDS = (
+    "response_A_eng",
+    "response_B_eng",
+    "response_A_bt",
+    "response_B_bt",
+    "proxy_length_A",
+    "proxy_length_B",
+    "proxy_nll_A",
+    "proxy_nll_B",
+    "proxy_ppl_A",
+    "proxy_ppl_B",
+    "proxy_ttr_A",
+    "proxy_ttr_B",
+)
+
+
+def _iter_jsonl(path: Optional[str]) -> Iterable[Dict[str, object]]:
+    if path is None:
+        return iter(())
+    def _gen() -> Iterable[Dict[str, object]]:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                yield json.loads(line)
+    return _gen()
+
+
+def _infer_proxy_cache_path(path: str) -> Optional[str]:
+    base = Path(path)
+    candidates = [
+        base.with_suffix(".proxy.jsonl"),
+        base.with_suffix(".proxy_cache.jsonl"),
+        base.with_name(base.name + ".proxy.jsonl"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _is_null_value(value: Optional[object]) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _missing_proxy_fields(raw: Dict[str, object]) -> bool:
+    response_b = _coerce_optional_text(raw.get("response_B"))
+    has_b = _has_response(response_b)
+    def _missing_nll(prefix: str) -> bool:
+        nll = raw.get(f"proxy_nll_{prefix}")
+        ppl = raw.get(f"proxy_ppl_{prefix}")
+        return _is_null_value(nll) and _is_null_value(ppl)
+
+    if _missing_nll("A"):
+        return True
+    if has_b and _missing_nll("B"):
+        return True
+    return False
+
+
+def _merge_proxy_cache(raw: Dict[str, object], cache_raw: Dict[str, object]) -> None:
+    for field in _PROXY_CACHE_FIELDS:
+        if _is_null_value(raw.get(field)) and not _is_null_value(cache_raw.get(field)):
+            raw[field] = cache_raw.get(field)
+
+
 def _preview_text(text: str, limit: int = 120) -> str:
     if not text:
         return ""
@@ -147,136 +354,24 @@ def _find_section_span(
     return start, end
 
 
-def _pad_sequences_with_labels(
+def _pad_sequences(
     sequences: List[List[int]],
-    labels: List[List[int]],
     pad_id: int,
     max_length: Optional[int],
-    label_pad: int = -100,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     max_len = max((len(seq) for seq in sequences), default=0)
     if max_length is not None:
         max_len = min(max_len, max_length)
     batch = torch.full((len(sequences), max_len), pad_id, dtype=torch.long)
     mask = torch.zeros((len(sequences), max_len), dtype=torch.long)
-    label_batch = torch.full((len(sequences), max_len), label_pad, dtype=torch.long)
     for idx, seq in enumerate(sequences):
         seq = seq[:max_len]
-        lab = labels[idx][:max_len]
         if not seq:
             continue
         length = len(seq)
         batch[idx, :length] = torch.tensor(seq, dtype=torch.long)
         mask[idx, :length] = 1
-        label_batch[idx, :length] = torch.tensor(lab, dtype=torch.long)
-    return batch, mask, label_batch
-
-
-def _split_token_spans(
-    token_ids: List[int],
-    min_len: int,
-    max_len: int,
-    rng: random.Random,
-) -> List[Tuple[int, int]]:
-    spans: List[Tuple[int, int]] = []
-    idx = 0
-    total = len(token_ids)
-    while idx < total:
-        span_len = min_len if max_len <= min_len else rng.randint(min_len, max_len)
-        end = min(total, idx + span_len)
-        spans.append((idx, end))
-        idx = end
-    return spans
-
-
-def _select_span_indices(
-    spans: List[Tuple[int, int]],
-    total_tokens: int,
-    target_ratio: float,
-    rng: random.Random,
-) -> List[int]:
-    if not spans or total_tokens <= 0:
-        return []
-    span_indices = list(range(len(spans)))
-    rng.shuffle(span_indices)
-    target = max(1, int(total_tokens * target_ratio))
-    selected: List[int] = []
-    covered = 0
-    for idx in span_indices:
-        start, end = spans[idx]
-        selected.append(idx)
-        covered += end - start
-        if covered >= target:
-            break
-    return selected
-
-
-def _apply_shuffle_or_perturb(
-    token_ids: List[int],
-    rng: random.Random,
-    perturb_sources: List[List[int]],
-    shuffle_ratio: float,
-    min_len: int = 3,
-    max_len: int = 8,
-) -> Tuple[List[int], List[int]]:
-    if not token_ids:
-        return token_ids, []
-    spans = _split_token_spans(token_ids, min_len, max_len, rng)
-    selected = _select_span_indices(spans, len(token_ids), shuffle_ratio, rng)
-    if not selected:
-        labels = [1] * len(token_ids)
-        return token_ids, labels
-
-    op = "shuffle" if rng.random() < 0.5 else "perturb"
-    if op == "shuffle" and len(selected) < 2:
-        op = "perturb"
-
-    new_tokens = token_ids[:]
-    if op == "shuffle":
-        # Align permutation with positional order so spans actually swap locations.
-        selected_sorted = sorted(selected)
-        selected_spans = [spans[idx] for idx in selected_sorted]
-        permuted = selected_spans[:]
-        rng.shuffle(permuted)
-        if permuted == selected_spans and len(permuted) > 1:
-            permuted = permuted[1:] + permuted[:1]
-        span_iter = iter(permuted)
-        rebuilt: List[int] = []
-        selected_set = set(selected_sorted)
-        for idx, (start, end) in enumerate(spans):
-            if idx in selected_set:
-                src_start, src_end = next(span_iter)
-                rebuilt.extend(token_ids[src_start:src_end])
-            else:
-                rebuilt.extend(token_ids[start:end])
-        new_tokens = rebuilt
-    else:
-        changed = False
-        for idx in selected:
-            start, end = spans[idx]
-            span_len = end - start
-            if span_len <= 0:
-                continue
-            candidates = [
-                seq for seq in perturb_sources if seq is not token_ids and len(seq) >= span_len
-            ]
-            if not candidates:
-                continue
-            source = rng.choice(candidates)
-            src_start = rng.randrange(0, len(source) - span_len + 1)
-            new_tokens[start:end] = source[src_start : src_start + span_len]
-            changed = True
-        if not changed and len(new_tokens) > 1:
-            i, j = rng.sample(range(len(new_tokens)), 2)
-            new_tokens[i], new_tokens[j] = new_tokens[j], new_tokens[i]
-
-    labels = [1] * len(token_ids)
-    for idx in selected:
-        start, end = spans[idx]
-        for pos in range(start, end):
-            if 0 <= pos < len(labels):
-                labels[pos] = 0
-    return new_tokens, labels
+    return batch, mask
 
 
 class DIBJudgeCollator:
@@ -286,10 +381,7 @@ class DIBJudgeCollator:
         max_bias_len: Optional[int] = 1024,
         max_ref_len: Optional[int] = 1024,
         max_lm_len: Optional[int] = 4096,
-        shuffle_ratio_min: float = 0.05,
-        shuffle_ratio_max: float = 0.2,
-        shuffle_ratio_step: float = 0.02,
-        shuffle_schedule_start_step: int = 0,
+        proxy_config: Optional[ProxyTaskConfig] = None,
     ) -> None:
         if max_bias_len is None:
             max_bias_len = 1024
@@ -299,54 +391,94 @@ class DIBJudgeCollator:
         self.max_bias_len = max_bias_len
         self.max_ref_len = max_ref_len
         self.max_lm_len = max_lm_len
-        self.shuffle_rng = random.Random(13)
-        self.shuffle_pad_id = self.tokenizer.pad_token_id
-        if self.shuffle_pad_id is None:
-            self.shuffle_pad_id = self.tokenizer.eos_token_id or 0
-        self.shuffle_ratio_min = min(shuffle_ratio_min, shuffle_ratio_max)
-        self.shuffle_ratio_max = max(shuffle_ratio_min, shuffle_ratio_max)
-        self.shuffle_ratio_step = abs(shuffle_ratio_step)
-        self.shuffle_schedule_start_step = max(0, int(shuffle_schedule_start_step))
-        self.shuffle_step = 0
-        # Curriculum: start easy (more shuffled), then anneal to harder (less shuffled).
-        self.shuffle_ratio = self.shuffle_ratio_max
+        self.pad_id = self.tokenizer.pad_token_id
+        if self.pad_id is None:
+            self.pad_id = self.tokenizer.eos_token_id or 0
+        self.proxy_config = proxy_config or ProxyTaskConfig()
 
     def __call__(self, batch: Sequence[DIBJudgeExample]) -> Dict[str, torch.Tensor]:
-        current_ratio = self.shuffle_ratio
         base_sequences: List[List[int]] = []
-        original_labels: List[List[int]] = []
-        shuffle_sequences: List[List[int]] = []
-        shuffle_labels: List[List[int]] = []
+        length_labels: List[int] = []
+        length_targets: List[List[float]] = []
+        nll_labels: List[int] = []
+        nll_targets: List[List[float]] = []
+        ttr_labels: List[int] = []
+        ttr_targets: List[List[float]] = []
         english_texts: List[str] = []
+        response_mask: List[int] = []
+        use_soft = bool(getattr(self.proxy_config, "use_soft_labels", True))
         for ex in batch:
             # Encode A/B directly as separate sequences for each line.
-            english_texts.extend([ex.response_a_bt, ex.response_b_bt])
-            for response in (ex.response_a, ex.response_b):
+            resp_a = ex.response_a
+            resp_b = ex.response_b
+            resp_a_bt = ex.response_a_bt
+            resp_b_bt = ex.response_b_bt
+            has_a = _has_response(resp_a)
+            has_b = _has_response(resp_b)
+            response_mask.extend([1 if has_a else 0, 1 if has_b else 0])
+            english_texts.extend(
+                [
+                    resp_a_bt or resp_a or "",
+                    resp_b_bt or resp_b or "",
+                ]
+            )
+            responses = (
+                (
+                    resp_a or "",
+                    ex.proxy_length_a,
+                    ex.proxy_nll_a,
+                    ex.proxy_ttr_a,
+                    has_a,
+                ),
+                (
+                    resp_b or "",
+                    ex.proxy_length_b,
+                    ex.proxy_nll_b,
+                    ex.proxy_ttr_b,
+                    has_b,
+                ),
+            )
+            for response, length_val, nll_val, ttr_val, present in responses:
                 token_ids = _encode_ids(self.tokenizer, response, self.max_bias_len)
                 base_sequences.append(token_ids)
-                original_labels.append([1] * len(token_ids))
-        for token_ids in base_sequences:
-            shuffled_ids, token_labels = _apply_shuffle_or_perturb(
-                token_ids,
-                rng=self.shuffle_rng,
-                perturb_sources=base_sequences,
-                shuffle_ratio=current_ratio,
-            )
-            shuffle_sequences.append(shuffled_ids)
-            shuffle_labels.append(token_labels)
-        original_input_ids, original_attention_mask, original_shuffle_labels = _pad_sequences_with_labels(
+                if not present:
+                    # Missing responses (e.g., single-response samples) should not emit proxy targets.
+                    length_labels.append(-100)
+                    length_targets.append([0.0] * max(0, len(self.proxy_config.length_bins) - 1))
+                    nll_labels.append(-100)
+                    nll_targets.append([0.0] * max(0, len(self.proxy_config.nll_bins) - 1))
+                    ttr_labels.append(-100)
+                    ttr_targets.append([0.0] * max(0, len(self.proxy_config.ttr_bins) - 1))
+                    continue
+                if length_val is None:
+                    length_val = float(len(token_ids))
+                length_label, length_target = _soft_bin_target(
+                    length_val, self.proxy_config.length_bins, use_soft
+                )
+                length_labels.append(int(length_label))
+                length_targets.append(length_target)
+
+                nll_label, nll_target = _soft_bin_target(
+                    nll_val, self.proxy_config.nll_bins, use_soft
+                )
+                nll_labels.append(int(nll_label))
+                nll_targets.append(nll_target)
+
+                if ttr_val is None:
+                    token_count = len(token_ids)
+                    if token_count:
+                        ttr_val = float(len(set(token_ids))) / float(token_count)
+                    else:
+                        ttr_val = 0.0
+                ttr_label, ttr_target = _soft_bin_target(
+                    ttr_val, self.proxy_config.ttr_bins, use_soft
+                )
+                ttr_labels.append(int(ttr_label))
+                ttr_targets.append(ttr_target)
+        original_input_ids, original_attention_mask = _pad_sequences(
             base_sequences,
-            original_labels,
-            self.shuffle_pad_id,
+            self.pad_id,
             self.max_bias_len,
-            label_pad=-100,
-        )
-        shuffle_input_ids, shuffle_attention_mask, shuffle_labels = _pad_sequences_with_labels(
-            shuffle_sequences,
-            shuffle_labels,
-            self.shuffle_pad_id,
-            self.max_bias_len,
-            label_pad=-100,
         )
         english_enc = _encode_texts(
             self.tokenizer,
@@ -360,35 +492,46 @@ class DIBJudgeCollator:
         batch_size = len(batch)
         original_input_ids = original_input_ids.view(batch_size, 2, -1)
         original_attention_mask = original_attention_mask.view(batch_size, 2, -1)
-        original_shuffle_labels = original_shuffle_labels.view(batch_size, 2, -1)
-        shuffle_input_ids = shuffle_input_ids.view(batch_size, 2, -1)
-        shuffle_attention_mask = shuffle_attention_mask.view(batch_size, 2, -1)
-        shuffle_labels = shuffle_labels.view(batch_size, 2, -1)
         english_input_ids = english_enc["input_ids"].view(batch_size, 2, -1)
         english_attention_mask = english_enc["attention_mask"].view(
             batch_size, 2, -1
         )
-        self.shuffle_step += 1
-        if self.shuffle_ratio_step > 0 and self.shuffle_step > self.shuffle_schedule_start_step:
-            self.shuffle_ratio = max(
-                self.shuffle_ratio_min, self.shuffle_ratio - self.shuffle_ratio_step
-            )
+        proxy_len = torch.tensor(length_labels, dtype=torch.long).view(batch_size, 2)
+        proxy_len_target = torch.tensor(length_targets, dtype=torch.float).view(
+            batch_size, 2, -1
+        )
+        proxy_nll = torch.tensor(nll_labels, dtype=torch.long).view(batch_size, 2)
+        proxy_nll_target = torch.tensor(nll_targets, dtype=torch.float).view(
+            batch_size, 2, -1
+        )
+        proxy_ttr = torch.tensor(ttr_labels, dtype=torch.long).view(batch_size, 2)
+        proxy_ttr_target = torch.tensor(ttr_targets, dtype=torch.float).view(
+            batch_size, 2, -1
+        )
+        response_mask_tensor = torch.tensor(response_mask, dtype=torch.long).view(batch_size, 2)
+        position_labels = torch.zeros((batch_size, 2), dtype=torch.long)
+        position_labels[:, 1] = 1
+        position_labels = position_labels.masked_fill(response_mask_tensor.eq(0), -100)
 
-        return {
+        batch_dict = {
             "original_input_ids": original_input_ids,
             "original_attention_mask": original_attention_mask,
-            "shuffle_input_ids": shuffle_input_ids,
-            "shuffle_attention_mask": shuffle_attention_mask,
-            "original_shuffle_labels": original_shuffle_labels,
-            "shuffle_labels": shuffle_labels,
             "english_input_ids": english_input_ids,
             "english_attention_mask": english_attention_mask,
-            "shuffle_ratio": current_ratio,
+            "proxy_length_label": proxy_len,
+            "proxy_length_target": proxy_len_target,
+            "proxy_nll_label": proxy_nll,
+            "proxy_nll_target": proxy_nll_target,
+            "proxy_ttr_label": proxy_ttr,
+            "proxy_ttr_target": proxy_ttr_target,
+            "proxy_position_label": position_labels,
             "lm_input_ids": lm_inputs["input_ids"],
             "lm_attention_mask": lm_inputs["attention_mask"],
             "lm_labels": lm_labels,
             "lm_response_types": lm_response_types,
+            "response_mask": response_mask_tensor,
         }
+        return batch_dict
 
     def _build_lm_inputs(
         self, batch: Sequence[DIBJudgeExample]
@@ -475,6 +618,7 @@ class DIBJudgeCollator:
         labels = full_enc["input_ids"].clone()
         response_types = torch.zeros_like(labels)
         for i, ex in enumerate(batch):
+            has_b = _has_response(ex.response_b)
             prompt_len = int(prompt_enc["attention_mask"][i].sum().item())
             prompt_len = min(prompt_len, labels.size(1))
             lead_special = 0
@@ -492,9 +636,11 @@ class DIBJudgeCollator:
             span_a = _find_section_span(
                 prompt, "###Response A to evaluate:", "###Response B to evaluate:"
             )
-            span_b = _find_section_span(
-                prompt, "###Response B to evaluate:", "###Evaluation Criteria:"
-            )
+            span_b = None
+            if has_b:
+                span_b = _find_section_span(
+                    prompt, "###Response B to evaluate:", "###Evaluation Criteria:"
+                )
             used_token_fallback = False
             if prompt_offsets is not None and (span_a or span_b):
                 for tok_idx, (start, end) in enumerate(prompt_offsets[i][:prompt_len]):
@@ -509,7 +655,11 @@ class DIBJudgeCollator:
                 prompt_ids = prompt_enc["input_ids"][i][:prompt_len].tolist()
                 lead = lead_special
                 resp_a_ids = _encode_ids(self.tokenizer, ex.response_a, self.max_lm_len)
-                resp_b_ids = _encode_ids(self.tokenizer, ex.response_b, self.max_lm_len)
+                resp_b_ids = (
+                    _encode_ids(self.tokenizer, ex.response_b or "", self.max_lm_len)
+                    if has_b
+                    else []
+                )
                 span_a_ids = _find_subseq(prompt_ids, resp_a_ids)
                 if span_a_ids is None and resp_a_ids:
                     span_a_ids = _find_subseq(prompt_ids, resp_a_ids[1:])
@@ -547,8 +697,8 @@ class DIBJudgeCollator:
                     f"prompt_snippet='{snippet}'",
                     RuntimeWarning,
                 )
-            if response_types[i].eq(2).sum().item() == 0:
-                probe = _preview_text(ex.response_b, limit=80)
+            if has_b and response_types[i].eq(2).sum().item() == 0:
+                probe = _preview_text(ex.response_b or "", limit=80)
                 probe_idx = prompt.find(probe) if probe else -1
                 snippet = _format_span_debug(prompt, probe_idx, probe_idx + len(probe))
                 warnings.warn(
@@ -557,7 +707,7 @@ class DIBJudgeCollator:
                     f"truncated={'yes' if truncated else 'no'} "
                     f"marker_span={'yes' if span_b is not None else 'no'} "
                     f"fallback={'token' if used_token_fallback else 'marker'}; "
-                    f"resp_preview='{_preview_text(ex.response_b)}'; "
+                    f"resp_preview='{_preview_text(ex.response_b or '')}'; "
                     f"prompt_snippet='{snippet}'",
                     RuntimeWarning,
                 )

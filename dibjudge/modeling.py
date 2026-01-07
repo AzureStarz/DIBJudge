@@ -37,11 +37,15 @@ class _GradientReversalFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs: torch.Tensor, scale: float) -> torch.Tensor:
         ctx.scale = float(scale)
+        ctx.input_dtype = inputs.dtype
         return inputs.view_as(inputs)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
-        return grad_output.neg() * ctx.scale, None
+        grad = grad_output.neg() * ctx.scale
+        if grad.dtype != ctx.input_dtype:
+            grad = grad.to(ctx.input_dtype)
+        return grad, None
 
 
 def gradient_reversal(inputs: torch.Tensor, scale: float) -> torch.Tensor:
@@ -147,8 +151,81 @@ class DomainDiscriminatorHead(_TokenClassifierHead):
     pass
 
 
-class SeqShuffleDiscriminatorHead(_TokenClassifierHead):
+class HetsDiscriminatorHead(_TokenClassifierHead):
     pass
+
+
+class PositionDiscriminatorHead(_TokenClassifierHead):
+    pass
+
+
+class ProxyRegressionHead(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 0,
+        layers: int = 0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.ln = nn.LayerNorm(in_dim)
+        self.mlp = None
+        self.act = nn.GELU()
+        proj_in = in_dim
+        if layers > 0 and hidden_dim > 0:
+            blocks = []
+            for idx in range(layers):
+                in_features = in_dim if idx == 0 else hidden_dim
+                blocks.append(nn.Linear(in_features, hidden_dim))
+                blocks.append(nn.GELU())
+                if dropout > 0:
+                    blocks.append(nn.Dropout(dropout))
+            self.mlp = nn.Sequential(*blocks)
+            proj_in = hidden_dim
+        self.proj = nn.Linear(proj_in, 1)
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        pooled = self.ln(pooled)
+        if self.mlp is not None:
+            pooled = self.mlp(pooled)
+        else:
+            pooled = self.act(pooled)
+        return self.proj(pooled).squeeze(-1)
+
+
+class ProxyClassifierHead(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        num_classes: int,
+        hidden_dim: int = 0,
+        layers: int = 0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.ln = nn.LayerNorm(in_dim)
+        self.mlp = None
+        self.act = nn.GELU()
+        proj_in = in_dim
+        if layers > 0 and hidden_dim > 0:
+            blocks = []
+            for idx in range(layers):
+                in_features = in_dim if idx == 0 else hidden_dim
+                blocks.append(nn.Linear(in_features, hidden_dim))
+                blocks.append(nn.GELU())
+                if dropout > 0:
+                    blocks.append(nn.Dropout(dropout))
+            self.mlp = nn.Sequential(*blocks)
+            proj_in = hidden_dim
+        self.classifier = nn.Linear(proj_in, num_classes)
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        pooled = self.ln(pooled)
+        if self.mlp is not None:
+            pooled = self.mlp(pooled)
+        else:
+            pooled = self.act(pooled)
+        return self.classifier(pooled)
 
 
 class TokenReconstructionHead(nn.Module):
@@ -243,6 +320,9 @@ class DIBJudgeConfig:
     bias_proxy_hidden: int = 0
     bias_proxy_layers: int = 1
     bias_proxy_dropout: float = 0.0
+    proxy_nll_classes: int = 6
+    proxy_ttr_classes: int = 5
+    proxy_length_classes: int = 5
     low_recon_layer: int = 2
     compact_prior: float = 0.3
     compact_mu_token_id: int = 0
@@ -294,6 +374,12 @@ class DIBJudgeModel(nn.Module):
             layers=bias_layers,
             dropout=bias_dropout,
         )
+        self.position_head = PositionDiscriminatorHead(
+            config.z_latent_dim,
+            hidden_dim=bias_hidden,
+            layers=bias_layers,
+            dropout=bias_dropout,
+        )
         self.surface_stat_dim = 2 * encoder_hidden
         recon_hidden = self._resolve_bias_proxy_hidden(
             config.z_latent_dim, self.surface_stat_dim
@@ -305,8 +391,23 @@ class DIBJudgeModel(nn.Module):
             layers=bias_layers,
             dropout=bias_dropout,
         )
-        self.seq_shuffle_head = SeqShuffleDiscriminatorHead(
+        self.length_bin_head = ProxyClassifierHead(
             config.z_latent_dim,
+            num_classes=max(2, int(config.proxy_length_classes)),
+            hidden_dim=bias_hidden,
+            layers=bias_layers,
+            dropout=bias_dropout,
+        )
+        self.nll_bin_head = ProxyClassifierHead(
+            config.z_latent_dim,
+            num_classes=max(2, int(config.proxy_nll_classes)),
+            hidden_dim=bias_hidden,
+            layers=bias_layers,
+            dropout=bias_dropout,
+        )
+        self.ttr_bin_head = ProxyClassifierHead(
+            config.z_latent_dim,
+            num_classes=max(2, int(config.proxy_ttr_classes)),
             hidden_dim=bias_hidden,
             layers=bias_layers,
             dropout=bias_dropout,
@@ -357,9 +458,12 @@ class DIBJudgeModel(nn.Module):
         state_dict = state.get("model", state)
         keep_prefixes = (
             "shared_encoder.",
-            "seq_shuffle_head.",
             "eng_domain_head.",
+            "position_head.",
             "low_recon_head.",
+            "length_bin_head.",
+            "nll_bin_head.",
+            "ttr_bin_head.",
             "compact_head.",
             "prompt_mlp.",
             "z_to_lm.",
@@ -440,17 +544,13 @@ class DIBJudgeModel(nn.Module):
         _fill(2, pi_b)
         return pi_logits
 
-    def _encode_bias_triplet(
+    def _encode_bias_bundle(
         self,
         orig_ids: torch.Tensor,
         orig_mask: torch.Tensor,
-        shuf_ids: torch.Tensor,
-        shuf_mask: torch.Tensor,
         eng_ids: torch.Tensor,
         eng_mask: torch.Tensor,
     ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -459,11 +559,8 @@ class DIBJudgeModel(nn.Module):
         torch.Tensor,
     ]:
         orig_ids, orig_mask, orig_shape = self._flatten_pair_inputs(orig_ids, orig_mask)
-        shuf_ids, shuf_mask, _ = self._flatten_pair_inputs(shuf_ids, shuf_mask)
         eng_ids, eng_mask, _ = self._flatten_pair_inputs(eng_ids, eng_mask)
         orig_len = orig_ids.size(1)
-        shuf_len = shuf_ids.size(1)
-        eng_len = eng_ids.size(1)
 
         orig_outputs = self.shared_encoder(
             input_ids=orig_ids,
@@ -479,32 +576,18 @@ class DIBJudgeModel(nn.Module):
         idx = max(0, min(idx, len(hidden_states) - 1))
         low_hidden = hidden_states[idx][:, :orig_len]
 
-        target_len = max(shuf_len, eng_len)
-        pad_id = self.shared_encoder.config.pad_token_id or 0
-        shuf_ids, shuf_mask = self._pad_to_len(shuf_ids, shuf_mask, target_len, pad_id)
-        eng_ids, eng_mask = self._pad_to_len(eng_ids, eng_mask, target_len, pad_id)
-        all_ids = torch.cat([shuf_ids, eng_ids], dim=0)
-        all_mask = torch.cat([shuf_mask, eng_mask], dim=0)
-        outputs = self.shared_encoder(
-            input_ids=all_ids,
-            attention_mask=all_mask,
+        eng_outputs = self.shared_encoder(
+            input_ids=eng_ids,
+            attention_mask=eng_mask,
             output_hidden_states=False,
             use_cache=False,
         )
-        hidden = self._get_hidden(outputs)
-        idx = 0
-        shuf_hidden = hidden[idx : idx + shuf_ids.size(0), :shuf_len]
-        shuf_mask = shuf_mask[: shuf_ids.size(0), :shuf_len]
-        idx += shuf_ids.size(0)
-        eng_ref_hidden = hidden[idx : idx + eng_ids.size(0), :eng_len]
-        eng_ref_mask = eng_mask[: eng_ids.size(0), :eng_len]
+        eng_hidden = self._get_hidden(eng_outputs)
         return (
             orig_hidden,
             orig_mask,
-            shuf_hidden,
-            shuf_mask,
-            eng_ref_hidden,
-            eng_ref_mask,
+            eng_hidden,
+            eng_mask,
             orig_shape,
             low_hidden,
         )
@@ -615,12 +698,12 @@ class DIBJudgeModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         embed_layer = self.judge_lm.get_input_embeddings()
         inputs_embeds = embed_layer(input_ids)
-        compact_mask_loss = torch.zeros((), device=inputs_embeds.device)
-        compact_con_loss = torch.zeros((), device=inputs_embeds.device)
-        compact_kl_loss = torch.zeros((), device=inputs_embeds.device)
-        compact_pi_mean = torch.zeros((), device=inputs_embeds.device)
-        compact_mask_mean = torch.zeros((), device=inputs_embeds.device)
-        compact_pi_saturation = torch.zeros((), device=inputs_embeds.device)
+        compact_mask_loss = inputs_embeds.new_zeros(())
+        compact_con_loss = inputs_embeds.new_zeros(())
+        compact_kl_loss = inputs_embeds.new_zeros(())
+        compact_pi_mean = inputs_embeds.new_zeros(())
+        compact_mask_mean = inputs_embeds.new_zeros(())
+        compact_pi_saturation = inputs_embeds.new_zeros(())
         if pi_logits is None:
             pi_logits = inputs_embeds.new_zeros(inputs_embeds.size(0), inputs_embeds.size(1))
         if response_types is not None and z_prompts is not None:
@@ -759,24 +842,20 @@ class DIBJudgeModel(nn.Module):
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Expected batch keys: original_input_ids, original_attention_mask,
-        shuffle_input_ids, shuffle_attention_mask, english_input_ids,
-        english_attention_mask, lm_input_ids, lm_attention_mask, lm_labels (optional),
-        Judge/shuffle/english tensors can be shaped (batch, seq)
-        or (batch, 2, seq)."""
+        english_input_ids, english_attention_mask, lm_input_ids,
+        lm_attention_mask, lm_labels (optional). Optional proxy keys:
+        proxy_* labels.
+        Judge/english tensors can be shaped (batch, seq) or (batch, 2, seq)."""
         (
             orig_hidden,
             orig_mask,
-            shuf_hidden,
-            shuf_mask,
             eng_ref_hidden,
             eng_ref_mask,
             orig_shape,
             low_hidden,
-        ) = self._encode_bias_triplet(
+        ) = self._encode_bias_bundle(
             batch["original_input_ids"],
             batch["original_attention_mask"],
-            batch["shuffle_input_ids"],
-            batch["shuffle_attention_mask"],
             batch["english_input_ids"],
             batch["english_attention_mask"],
         )
@@ -787,24 +866,19 @@ class DIBJudgeModel(nn.Module):
             bsz, pairs = orig_shape
 
         z_orig = self._build_z_prompts(orig_hidden, orig_mask)
-        z_shuf = self._build_z_prompts(shuf_hidden, shuf_mask)
         z_ref = self._build_z_prompts(eng_ref_hidden, eng_ref_mask)
         noise_alpha = float(batch.get("bottleneck_noise_alpha", self.config.bottleneck_noise_alpha))
         z_orig, z_orig_l2 = self._apply_bottleneck_noise(z_orig, noise_alpha)
-        z_shuf, z_shuf_l2 = self._apply_bottleneck_noise(z_shuf, noise_alpha)
         z_ref, z_ref_l2 = self._apply_bottleneck_noise(z_ref, noise_alpha)
         grl_scale = self._resolve_grl_scale(batch)
-        z_l2_loss = (z_orig_l2 + z_shuf_l2 + z_ref_l2) / 3.0
+        z_l2_loss = (z_orig_l2 + z_ref_l2) / 2.0
         z_orig_adv = gradient_reversal(z_orig, grl_scale)
-        z_shuf_adv = gradient_reversal(z_shuf, grl_scale)
         z_ref_adv = gradient_reversal(z_ref, grl_scale)
         if batch.get("bias_detach", False):
             z_orig_adv = z_orig_adv.detach()
-            z_shuf_adv = z_shuf_adv.detach()
             z_ref_adv = z_ref_adv.detach()
             z_l2_loss = z_l2_loss.detach()
         z_orig_pool = z_orig_adv.mean(dim=1)
-        z_shuf_pool = z_shuf_adv.mean(dim=1)
         z_ref_pool = z_ref_adv.mean(dim=1)
         low_recon_pred = self.low_recon_head(z_orig_pool)
         low_recon_target = self._compute_low_stats(low_hidden, orig_mask).detach()
@@ -837,7 +911,7 @@ class DIBJudgeModel(nn.Module):
         return_lm_logits = bool(batch.get("return_lm_logits", False))
 
         domain_logits = self.eng_domain_head(torch.cat([z_orig_pool, z_ref_pool], dim=0))
-        shuffle_logits = self.seq_shuffle_head(torch.cat([z_orig_pool, z_shuf_pool], dim=0))
+        position_logits = self.position_head(z_orig_pool)
         outputs = {
             "lm_loss": lm_out["loss"],
             "compact_mask_loss": lm_out["compact_mask_loss"],
@@ -847,11 +921,14 @@ class DIBJudgeModel(nn.Module):
             "compact_mask_mean": lm_out["compact_mask_mean"],
             "compact_pi_saturation": lm_out["compact_pi_saturation"],
             "domain_logits": domain_logits,
+            "position_logits": position_logits,
             "low_recon_pred": low_recon_pred,
             "low_recon_target": low_recon_target,
-            "shuffle_logits": shuffle_logits,
             "z_l2_loss": z_l2_loss,
         }
+        outputs["length_bin_logits"] = self.length_bin_head(z_orig_pool)
+        outputs["nll_bin_logits"] = self.nll_bin_head(z_orig_pool)
+        outputs["ttr_bin_logits"] = self.ttr_bin_head(z_orig_pool)
         if return_lm_logits:
             outputs["lm_logits"] = lm_out["logits"]
         return outputs

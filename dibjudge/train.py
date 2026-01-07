@@ -12,6 +12,7 @@ from torch.optim import AdamW
 from transformers import get_scheduler
 
 from .modeling import DIBJudgeModel
+from .proxy_tasks import compute_proxy_losses
 
 
 @dataclass
@@ -39,9 +40,11 @@ class TrainConfig:
     bottleneck_noise_alpha: float = 8.0
     bottleneck_noise_warmup_ratio: Optional[float] = 0.2
     eng_domain_weight: float = 1.0
-    shuffle_weight: float = 0.5
     low_recon_weight: float = 0.5
     z_l2_weight: float = 0.1
+    nll_bin_weight: float = 0.5
+    ttr_bin_weight: float = 0.5
+    length_bin_weight: float = 0.5
     lambda_compression: float = 1.0
     lambda_compression_warmup_ratio: Optional[float] = 0.05
     mask_loss_weight: float = 1.0
@@ -118,7 +121,9 @@ def _collect_param_groups(model: nn.Module) -> Dict[str, Dict[str, nn.Parameter]
     head_prefixes = (
         "eng_domain_head.",
         "low_recon_head.",
-        "seq_shuffle_head.",
+        "length_bin_head.",
+        "nll_bin_head.",
+        "ttr_bin_head.",
         "compact_head.",
         "prompt_mlp.",
         "z_to_lm.",
@@ -217,70 +222,8 @@ def _phase_boundary(total_steps: int, grl_start_ratio: float) -> int:
 def _compute_bias_terms(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = outputs["lm_loss"].device
-    shuffle_loss = torch.zeros((), device=device)
-    shuffle_logits = outputs.get("shuffle_logits")
-    if shuffle_logits is not None:
-        token_logits = shuffle_logits
-        half = token_logits.size(0) // 2
-        token_labels = torch.cat(
-            [
-                torch.ones(half, device=token_logits.device, dtype=torch.long),
-                torch.zeros(token_logits.size(0) - half, device=token_logits.device, dtype=torch.long),
-            ],
-            dim=0,
-        )
-        weight = None
-        valid = token_labels != -100
-        if valid.any():
-            counts = torch.bincount(token_labels[valid], minlength=2).float()
-            if torch.all(counts > 0):
-                weight = (counts.sum() / (2.0 * counts)).clamp(max=5.0)
-                weight = weight.to(token_logits.device)
-        if token_logits.dim() == 2:
-            shuffle_loss = nn.functional.cross_entropy(
-                token_logits.float(),
-                token_labels.view(-1),
-                ignore_index=-100,
-                weight=weight,
-            )
-        else:
-            shuffle_loss = nn.functional.cross_entropy(
-                token_logits.float().view(-1, token_logits.size(-1)),
-                token_labels.view(-1),
-                ignore_index=-100,
-                weight=weight,
-            )
-    domain_logits = outputs.get("domain_logits")
-    if domain_logits is None:
-        domain_loss = outputs["lm_loss"].new_tensor(0.0)
-    else:
-        half = domain_logits.size(0) // 2
-        domain_labels = torch.cat(
-            [
-                torch.zeros(half, device=domain_logits.device, dtype=torch.long),
-                torch.ones(domain_logits.size(0) - half, device=domain_logits.device, dtype=torch.long),
-            ],
-            dim=0,
-        )
-        weight = None
-        counts = torch.bincount(domain_labels, minlength=2).float()
-        if torch.all(counts > 0):
-            weight = (counts.sum() / (2.0 * counts)).clamp(max=5.0)
-            weight = weight.to(domain_logits.device)
-        domain_loss = nn.functional.cross_entropy(
-            domain_logits.float(), domain_labels, weight=weight
-        )
-    low_recon_pred = outputs.get("low_recon_pred")
-    low_recon_target = outputs.get("low_recon_target")
-    if low_recon_pred is None or low_recon_target is None:
-        low_recon_loss = outputs["lm_loss"].new_tensor(0.0)
-    else:
-        diff = (low_recon_pred.float() - low_recon_target.float()).pow(2).mean(dim=-1)
-        low_recon_loss = diff.mean()
-    z_l2_loss = outputs.get("z_l2_loss", outputs["lm_loss"].new_tensor(0.0))
-    return domain_loss, shuffle_loss, low_recon_loss, z_l2_loss
+) -> Dict[str, torch.Tensor]:
+    return compute_proxy_losses(outputs, batch)
 
 
 def _grl_schedule(
@@ -337,7 +280,12 @@ def train_one_epoch(
         "domain_loss": 0.0,
         "low_recon_loss": 0.0,
         "z_l2_loss": 0.0,
-        "shuffle_loss": 0.0,
+        "nll_bin_loss": 0.0,
+        "ttr_bin_loss": 0.0,
+        "length_bin_loss": 0.0,
+        "nll_bin_mae": 0.0,
+        "ttr_bin_mae": 0.0,
+        "length_bin_mae": 0.0,
         "mask_loss": 0.0,
         "consistency_loss": 0.0,
         "compression_loss": 0.0,
@@ -392,7 +340,16 @@ def train_one_epoch(
             outputs = model(batch)
             if outputs["lm_loss"] is None:
                 raise ValueError("lm_labels must be provided for training.")
-            domain_loss, shuffle_loss, low_recon_loss, z_l2_loss = _compute_bias_terms(outputs, batch)
+            proxy_losses = _compute_bias_terms(outputs, batch)
+            domain_loss = proxy_losses["domain_loss"]
+            low_recon_loss = proxy_losses["low_recon_loss"]
+            z_l2_loss = proxy_losses["z_l2_loss"]
+            nll_bin_loss = proxy_losses["nll_bin_loss"]
+            ttr_bin_loss = proxy_losses["ttr_bin_loss"]
+            length_bin_loss = proxy_losses["length_bin_loss"]
+            nll_bin_mae = proxy_losses.get("nll_bin_mae", outputs["lm_loss"].new_tensor(0.0))
+            ttr_bin_mae = proxy_losses.get("ttr_bin_mae", outputs["lm_loss"].new_tensor(0.0))
+            length_bin_mae = proxy_losses.get("length_bin_mae", outputs["lm_loss"].new_tensor(0.0))
 
             mask_loss = outputs.get("compact_mask_loss", torch.zeros((), device=outputs["lm_loss"].device))
             consistency_loss = outputs.get(
@@ -404,9 +361,11 @@ def train_one_epoch(
             )
             bias_loss = (
                 config.eng_domain_weight * domain_loss
-                + config.shuffle_weight * shuffle_loss
                 + config.low_recon_weight * low_recon_loss
                 + config.z_l2_weight * z_l2_loss
+                + config.nll_bin_weight * nll_bin_loss
+                + config.ttr_bin_weight * ttr_bin_loss
+                + config.length_bin_weight * length_bin_loss
             )
             core_lm_loss = outputs["lm_loss"] + outputs["compact_kl_loss"]
             if config.debug_aux_checks and step % config.debug_aux_checks_interval == 0:
@@ -483,14 +442,14 @@ def train_one_epoch(
                     bias_batch["bias_detach"] = True
                     with autocast("cuda", enabled=config.use_amp, dtype=config.amp_dtype):
                         bias_outputs = model(bias_batch)
-                        domain_loss_b, shuffle_loss_b, low_recon_loss_b, z_l2_loss_b = _compute_bias_terms(
-                            bias_outputs, bias_batch
-                        )
+                        proxy_losses_b = _compute_bias_terms(bias_outputs, bias_batch)
                         bias_loss_b = (
-                            config.eng_domain_weight * domain_loss_b
-                            + config.shuffle_weight * shuffle_loss_b
-                            + config.low_recon_weight * low_recon_loss_b
-                            + config.z_l2_weight * z_l2_loss_b
+                            config.eng_domain_weight * proxy_losses_b["domain_loss"]
+                            + config.low_recon_weight * proxy_losses_b["low_recon_loss"]
+                            + config.z_l2_weight * proxy_losses_b["z_l2_loss"]
+                            + config.nll_bin_weight * proxy_losses_b["nll_bin_loss"]
+                            + config.ttr_bin_weight * proxy_losses_b["ttr_bin_loss"]
+                            + config.length_bin_weight * proxy_losses_b["length_bin_loss"]
                         )
                         bias_loss_b = bias_loss_b * lambda_bias
                     scaler.scale(bias_loss_b).backward()
@@ -506,7 +465,12 @@ def train_one_epoch(
         totals["domain_loss"] += domain_loss.item()
         totals["low_recon_loss"] += low_recon_loss.item()
         totals["z_l2_loss"] += z_l2_loss.item()
-        totals["shuffle_loss"] += shuffle_loss.item()
+        totals["nll_bin_loss"] += nll_bin_loss.item()
+        totals["ttr_bin_loss"] += ttr_bin_loss.item()
+        totals["length_bin_loss"] += length_bin_loss.item()
+        totals["nll_bin_mae"] += nll_bin_mae.item()
+        totals["ttr_bin_mae"] += ttr_bin_mae.item()
+        totals["length_bin_mae"] += length_bin_mae.item()
         totals["mask_loss"] += mask_loss.item()
         totals["consistency_loss"] += consistency_loss.item()
         totals.setdefault("compression_loss", 0.0)
@@ -551,7 +515,12 @@ def train_one_epoch(
                     "domain_loss": domain_loss.item(),
                     "low_recon_loss": low_recon_loss.item(),
                     "z_l2_loss": z_l2_loss.item(),
-                    "shuffle_loss": shuffle_loss.item(),
+                    "nll_bin_loss": nll_bin_loss.item(),
+                    "ttr_bin_loss": ttr_bin_loss.item(),
+                    "length_bin_loss": length_bin_loss.item(),
+                    "nll_bin_mae": nll_bin_mae.item(),
+                    "ttr_bin_mae": ttr_bin_mae.item(),
+                    "length_bin_mae": length_bin_mae.item(),
                     "compression/mask_loss": mask_loss.item(),
                     "compression/consistency_loss": consistency_loss.item(),
                     "compression/loss": compression_loss.item(),
@@ -567,16 +536,13 @@ def train_one_epoch(
                     "weights/grl_lambda": grl_lambda,
                     "weights/bottleneck_noise_alpha": noise_alpha,
                     "weights/eng_domain": config.eng_domain_weight,
-                    "weights/shuffle": config.shuffle_weight,
                     "weights/low_recon": config.low_recon_weight,
                     "weights/z_l2": config.z_l2_weight,
+                    "weights/nll_bin": config.nll_bin_weight,
+                    "weights/ttr_bin": config.ttr_bin_weight,
+                    "weights/length_bin": config.length_bin_weight,
                     "weights/mask_loss": config.mask_loss_weight,
                     "weights/consistency_loss": config.consistency_loss_weight,
-                    "shuffle/ratio": float(
-                        batch.get("shuffle_ratio", 0.0)
-                        if not torch.is_tensor(batch.get("shuffle_ratio", None))
-                        else batch.get("shuffle_ratio").item()
-                    ),
                     "grad_norm/main": last_grad_norm,
                     **last_update_diag,
                     **last_clip_diag,

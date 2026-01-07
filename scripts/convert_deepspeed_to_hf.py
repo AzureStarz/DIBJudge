@@ -85,6 +85,41 @@ def _print_key_summary(label: str, keys: Iterable[str], limit: int = 20) -> None
     print(f"[warn] {label} ({len(keys)}): {preview}{suffix}")
 
 
+def _merge_lora_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    base_model: str,
+    args: argparse.Namespace,
+    dtype: Optional[torch.dtype],
+) -> AutoModelForCausalLM:
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:
+        raise RuntimeError("peft is required for --merge-lora") from exc
+
+    targets = [name.strip() for name in args.lora_targets.split(",") if name.strip()]
+    lora_cfg = LoraConfig(
+        r=int(args.lora_r),
+        lora_alpha=int(args.lora_alpha),
+        lora_dropout=float(args.lora_dropout),
+        target_modules=targets,
+        task_type="CAUSAL_LM",
+    )
+    load_kwargs = {"trust_remote_code": args.trust_remote_code}
+    if dtype is not None:
+        load_kwargs["torch_dtype"] = dtype
+    base = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
+    peft_model = get_peft_model(base, lora_cfg)
+    remapped = _remap_state_dict(state_dict, set(peft_model.state_dict().keys()))
+    missing, unexpected = peft_model.load_state_dict(remapped, strict=False)
+    _print_key_summary("missing keys", missing)
+    _print_key_summary("unexpected keys", unexpected)
+    try:
+        merged = peft_model.merge_and_unload()
+    except Exception as exc:
+        raise RuntimeError(f"failed to merge LoRA weights: {exc}") from exc
+    return merged.cpu()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Convert a DeepSpeed ZeRO checkpoint to a Hugging Face checkpoint."
@@ -122,6 +157,19 @@ def main() -> int:
         help="Save weights as safetensors if available.",
     )
     parser.add_argument(
+        "--merge-lora",
+        action="store_true",
+        help="Merge LoRA weights into the base model before saving.",
+    )
+    parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-targets",
+        default="q_proj,k_proj,v_proj,o_proj",
+        help="Comma-separated list of module names for LoRA injection.",
+    )
+    parser.add_argument(
         "--skip-tokenizer",
         action="store_true",
         help="Skip saving tokenizer files.",
@@ -137,18 +185,20 @@ def main() -> int:
 
     config = AutoConfig.from_pretrained(args.base_model, trust_remote_code=args.trust_remote_code)
     dtype = _resolve_dtype(args.dtype, getattr(config, "torch_dtype", None))
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=args.trust_remote_code)
-    if dtype is not None:
-        model = model.to(dtype=dtype)
-    model = model.cpu()
 
     print(f"[info] loading DeepSpeed checkpoint from {checkpoint_dir} tag={tag or 'latest'}")
     state_dict = _load_zero_checkpoint(checkpoint_dir, tag)
-    state_dict = _remap_state_dict(state_dict, set(model.state_dict().keys()))
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    _print_key_summary("missing keys", missing)
-    _print_key_summary("unexpected keys", unexpected)
+    if args.merge_lora:
+        model = _merge_lora_state_dict(state_dict, args.base_model, args, dtype)
+    else:
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=args.trust_remote_code)
+        if dtype is not None:
+            model = model.to(dtype=dtype)
+        model = model.cpu()
+        state_dict = _remap_state_dict(state_dict, set(model.state_dict().keys()))
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        _print_key_summary("missing keys", missing)
+        _print_key_summary("unexpected keys", unexpected)
 
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(

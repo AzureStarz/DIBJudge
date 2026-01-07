@@ -10,9 +10,9 @@ append_eos: true
 
 # runtime config
 epochs: 3
-deepspeed_config: configs/deepspeed/ds_z3_offload_config.json
-output_dir: outputs/deepspeed/sft_mR3_baseline
-log_dir: logs/deepspeed/sft_mR3_baseline
+deepspeed_config: configs/deepspeed/ds_z2_config.json
+output_dir: outputs/deepspeed/lora_mR3_baseline
+log_dir: logs/deepspeed/lora_mR3_baseline
 save_every_steps: 0
 save_at_end: true
 bf16: true
@@ -20,7 +20,7 @@ gradient_checkpointing: true
 torch_autocast: false
 use_swanlab: true
 swanlab_project: dibjudge
-swanlab_run_name: Qwen3-4B_mR3_baseline_vanilla_SFT
+swanlab_run_name: Qwen3-4B_mR3_baseline_vanilla_LoRA
 swanlab_tags: null
 swanlab_log_steps: 1
 
@@ -33,7 +33,7 @@ max_grad_norm: 1.0
 grad_accum_steps: 16
 
 # LoRA config
-use_lora: false
+use_lora: true
 lora_r: 8
 lora_alpha: 16
 lora_dropout: 0.05

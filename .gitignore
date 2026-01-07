@@ -8,3 +8,6 @@ scripts/rm_r1_dataset/*
 scripts/__pycache__/*
 dibjudge/__pycache__/*
 model/*
+*.jsonl
+scripts/mr3_dataset/*
+scripts/data

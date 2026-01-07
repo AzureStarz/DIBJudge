@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
-from typing import List, Tuple
+from typing import List
 
 from transformers import AutoTokenizer
 
@@ -16,45 +16,6 @@ def _ensure_pad(tokenizer) -> None:
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
-
-
-def _collect_spans(labels: List[int], target: int = 0) -> List[Tuple[int, int]]:
-    spans: List[Tuple[int, int]] = []
-    start = None
-    for idx, label in enumerate(labels):
-        if label == target:
-            if start is None:
-                start = idx
-        elif start is not None:
-            spans.append((start, idx))
-            start = None
-    if start is not None:
-        spans.append((start, len(labels)))
-    return spans
-
-
-def _decode_marked(tokenizer, ids: List[int], labels: List[int]) -> str:
-    if not ids:
-        return ""
-    spans = _collect_spans(labels, target=0)
-    if not spans:
-        return _normalize(tokenizer.decode(ids, skip_special_tokens=True))
-    parts: List[str] = []
-    cursor = 0
-    for start, end in spans:
-        if start > cursor:
-            chunk = _normalize(tokenizer.decode(ids[cursor:start], skip_special_tokens=True))
-            if chunk:
-                parts.append(chunk)
-        marked = _normalize(tokenizer.decode(ids[start:end], skip_special_tokens=True))
-        if marked:
-            parts.append(f"<<{marked}>>")
-        cursor = end
-    if cursor < len(ids):
-        chunk = _normalize(tokenizer.decode(ids[cursor:], skip_special_tokens=True))
-        if chunk:
-            parts.append(chunk)
-    return _normalize(" ".join(parts))
 
 
 def main() -> None:
@@ -115,14 +76,17 @@ def main() -> None:
             norm_a = _normalize(decoded_a)
             norm_b = _normalize(decoded_b)
             ref_a = _normalize(ex.response_a)
-            ref_b = _normalize(ex.response_b)
+            ref_b = _normalize(ex.response_b or "")
             print(f"\nExample {idx}:")
             print("response_a:", ref_a[:200])
             print("decoded_a :", norm_a[:200])
             print("match_a  :", ref_a in norm_a or norm_a in ref_a)
-            print("response_b:", ref_b[:200])
-            print("decoded_b :", norm_b[:200])
-            print("match_b  :", ref_b in norm_b or norm_b in ref_b)
+            if ex.response_b:
+                print("response_b:", ref_b[:200])
+                print("decoded_b :", norm_b[:200])
+                print("match_b  :", ref_b in norm_b or norm_b in ref_b)
+            else:
+                print("response_b: (missing)")
     else:
         print("\nDecoded response spans: (lm_response_types not available)")
 
@@ -172,53 +136,6 @@ def main() -> None:
             tok_ids = [tid for tid, m in zip(ids, mask) if m == 1]
             decoded = judge_tok.decode(tok_ids, skip_special_tokens=True)
             print(f"original_resp_{resp_idx}:", _normalize(decoded)[:200])
-
-    print("\nShuffle span comparison (marked spans show shuffled/perturbed tokens):")
-    shuffle_ids = batch["shuffle_input_ids"]
-    shuffle_mask = batch["shuffle_attention_mask"]
-    shuffle_labels = batch["shuffle_labels"]
-    max_spans = 4
-    for idx in range(min(len(batch_items), shuffle_ids.size(0))):
-        print(f"\nExample {idx}:")
-        for resp_idx in range(2):
-            ids_before = original_ids[idx, resp_idx].tolist()
-            ids_after = shuffle_ids[idx, resp_idx].tolist()
-            mask = shuffle_mask[idx, resp_idx].tolist()
-            labels = shuffle_labels[idx, resp_idx].tolist()
-            length = sum(mask)
-            ids_before = ids_before[:length]
-            ids_after = ids_after[:length]
-            labels = labels[:length]
-            spans = _collect_spans(labels, target=0)
-            if not spans:
-                print(f"resp_{resp_idx}: <no shuffled spans>")
-                continue
-            before_marked = _decode_marked(judge_tok, ids_before, labels)
-            after_marked = _decode_marked(judge_tok, ids_after, labels)
-            print(f"resp_{resp_idx}_before:", before_marked[:400])
-            print(f"resp_{resp_idx}_after :", after_marked[:400])
-            for span_idx, (start, end) in enumerate(spans[:max_spans]):
-                before_span = _normalize(judge_tok.decode(ids_before[start:end], skip_special_tokens=True))
-                after_span = _normalize(judge_tok.decode(ids_after[start:end], skip_special_tokens=True))
-                print(
-                    f"  span_{span_idx}: "
-                    f"before='{before_span[:160]}' after='{after_span[:160]}'"
-                )
-            if len(spans) > max_spans:
-                print(f"  ... {len(spans) - max_spans} more spans")
-
-    print("\nShuffle visualization (judge tokenizer tokens):")
-    for idx in range(min(len(batch_items), shuffle_ids.size(0))):
-        print(f"\nExample {idx}:")
-        for resp_idx in range(2):
-            ids = shuffle_ids[idx, resp_idx].tolist()
-            mask = shuffle_mask[idx, resp_idx].tolist()
-            tok_ids = [tid for tid, m in zip(ids, mask) if m == 1]
-            if not tok_ids:
-                print(f"shuffle_resp_{resp_idx}: <empty>")
-                continue
-            decoded = judge_tok.decode(tok_ids, skip_special_tokens=True)
-            print(f"shuffle_resp_{resp_idx}:", _normalize(decoded)[:200])
 
 
 if __name__ == "__main__":

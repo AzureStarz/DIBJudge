@@ -28,6 +28,7 @@ export NCCL_NVLS_DISABLE=1
 export NCCL_SHM_DISABLE=1
 export NCCL_P2P_LEVEL=LOC
 
+module load amd/gcc_compiler/11.3.0
 num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 # num_gpus=4
 echo "Detected ${num_gpus} GPUs"
@@ -46,4 +47,10 @@ deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
 #     --config configs/finetune_deepspeed.yaml \
 #     --use-lora
 
-bash scripts/slurm_dibjudge_evaluation.sbatch
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/deepspeed/main/hf-epoch-1/lm \
+#     --checkpoint outputs/deepspeed/main/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B-Base/main \
+#     --languages zh \
+#     --template prometheus \
+#     --tensor_parallel_size ${num_gpus}

@@ -72,6 +72,7 @@ def _build_parser(config: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--bias-proxy-hidden", type=int, default=DIBJudgeConfig.bias_proxy_hidden)
     parser.add_argument("--bias-proxy-layers", type=int, default=DIBJudgeConfig.bias_proxy_layers)
     parser.add_argument("--bias-proxy-dropout", type=float, default=DIBJudgeConfig.bias_proxy_dropout)
+    parser.add_argument("--proxy-length-classes", type=int, default=DIBJudgeConfig.proxy_length_classes)
     parser.add_argument("--low-recon-layer", type=int, default=DIBJudgeConfig.low_recon_layer)
     parser.add_argument("--compact-prior", type=float, default=DIBJudgeConfig.compact_prior)
     parser.add_argument("--compact-mu-token-id", type=int, default=DIBJudgeConfig.compact_mu_token_id)

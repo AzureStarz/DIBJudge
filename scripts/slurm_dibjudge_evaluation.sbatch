@@ -104,7 +104,7 @@ module load amd/singularity/3.10.4
 
 # Paths
 SIF=/online1/hpc_containers/base_hpc_glibc_235.sif
-CONDA_ENV=/path/to/workspace/online1/miniconda3/envs/vllm_0112/
+CONDA_ENV=/path/to/workspace/online1/miniconda3/envs/vllm_0112_new/
 BIND1=/online1/hpc_containers/conda/
 BIND2=/path/to/bind/
 

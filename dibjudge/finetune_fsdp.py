@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import math
 import warnings
 import os
+import json
+import math
 from dataclasses import asdict
 from typing import List, Optional, Tuple
 import functools
@@ -15,6 +16,7 @@ from transformers import AutoTokenizer
 
 from .data import DIBJudgeCollator, DIBJudgeDataset
 from .modeling import DIBJudgeConfig, DIBJudgeModel
+from .proxy_tasks import ProxyTaskConfig
 from .swanlab_utils import finish_swanlab, init_swanlab, log_swanlab
 from .train import TrainConfig, create_optimizers, create_scheduler, train_one_epoch
 
@@ -103,6 +105,87 @@ def _save_yaml_config(args: argparse.Namespace, path: str) -> None:
         yaml.safe_dump(vars(args), handle, sort_keys=True)
 
 
+def _parse_bins(text: str, cast=float) -> List:
+    if text is None:
+        return []
+    if isinstance(text, (list, tuple)):
+        return [cast(val) for val in text]
+    parts = []
+    for raw in str(text).split(","):
+        raw = raw.strip().strip("[]")
+        if not raw:
+            continue
+        parts.append(cast(raw))
+    return parts
+
+
+def _encode_ids(tokenizer, text: str, max_length: Optional[int]) -> List[int]:
+    kwargs = {"add_special_tokens": False, "truncation": True}
+    if max_length is not None:
+        kwargs["max_length"] = max_length
+    return tokenizer(text, **kwargs)["input_ids"]
+
+
+def _has_response(text: Optional[str]) -> bool:
+    return bool(text and text.strip())
+
+
+def _compute_length_quantile_bins(
+    dataset: DIBJudgeDataset,
+    tokenizer,
+    max_length: Optional[int],
+    bins: int = 10,
+) -> List[int]:
+    lengths: List[int] = []
+    for ex in dataset:
+        lengths.append(len(_encode_ids(tokenizer, ex.response_a or "", max_length)))
+        if _has_response(ex.response_b):
+            lengths.append(len(_encode_ids(tokenizer, ex.response_b or "", max_length)))
+    if not lengths or bins < 2:
+        return list(ProxyTaskConfig().length_bins)
+    lengths.sort()
+    n = len(lengths)
+    cuts: List[int] = []
+    for idx in range(1, bins):
+        q = idx / float(bins)
+        pos = int(math.ceil(q * n)) - 1
+        pos = min(max(pos, 0), n - 1)
+        cuts.append(lengths[pos])
+    max_len = lengths[-1]
+    return [0] + cuts + [max_len]
+
+
+def _collect_proxy_values(dataset: DIBJudgeDataset, attrs: Tuple[str, ...]) -> List[float]:
+    values: List[float] = []
+    for ex in dataset:
+        for attr in attrs:
+            val = getattr(ex, attr, None)
+            if val is None:
+                continue
+            if isinstance(val, float) and math.isnan(val):
+                continue
+            values.append(float(val))
+    return values
+
+
+def _compute_value_quantile_bins(
+    values: List[float],
+    bins: int,
+    fallback: Tuple[float, ...],
+) -> List[float]:
+    if not values or bins < 2:
+        return list(fallback)
+    values.sort()
+    n = len(values)
+    cuts: List[float] = []
+    for idx in range(1, bins):
+        q = idx / float(bins)
+        pos = int(math.ceil(q * n)) - 1
+        pos = min(max(pos, 0), n - 1)
+        cuts.append(values[pos])
+    return [values[0]] + cuts + [values[-1]]
+
+
 def _resolve_wrap_classes(model: torch.nn.Module, names: List[str]) -> List[type]:
     if not names:
         return []
@@ -113,8 +196,6 @@ def _resolve_wrap_classes(model: torch.nn.Module, names: List[str]) -> List[type
         if cls.__name__ in target and cls not in classes:
             classes.append(cls)
     return classes
-
-
 
 
 def _print_trainable_params(model: torch.nn.Module, rank: int) -> None:
@@ -331,10 +412,6 @@ def main() -> None:
     parser.add_argument("--max-bias-len", type=int, default=1024)
     parser.add_argument("--max-ref-len", type=int, default=1024)
     parser.add_argument("--max-lm-len", type=int, default=4096)
-    parser.add_argument("--shuffle-ratio-min", type=float, default=0.05)
-    parser.add_argument("--shuffle-ratio-max", type=float, default=0.3)
-    parser.add_argument("--shuffle-ratio-step", type=float, default=0.0)
-    parser.add_argument("--shuffle-ratio-schedule-ratio", type=float, default=0.7)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--use-lora", action="store_true")
@@ -375,8 +452,71 @@ def main() -> None:
     parser.add_argument("--bias-decoder-steps", type=int, default=1)
     parser.add_argument("--eng-domain-weight", type=float, default=1.0)
     parser.add_argument("--low-recon-weight", type=float, default=0.5)
-    parser.add_argument("--shuffle-weight", type=float, default=0.5)
     parser.add_argument("--z-l2-weight", type=float, default=0.1)
+    parser.add_argument("--nll-bin-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--ppl-bin-weight",
+        dest="nll_bin_weight",
+        type=float,
+        default=0.5,
+        help="Deprecated alias for --nll-bin-weight.",
+    )
+    parser.add_argument("--ttr-bin-weight", type=float, default=0.5)
+    parser.add_argument("--length-bin-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--proxy-nll-bins",
+        dest="proxy_nll_bins",
+        default="0,2.3026,2.9957,3.6889,4.3820,5.0752,13.8155",
+        help="Comma-separated bins for NLL (log PPL) ordinal regression.",
+    )
+    parser.add_argument(
+        "--proxy-ppl-bins",
+        dest="proxy_nll_bins",
+        default="0,2.3026,2.9957,3.6889,4.3820,5.0752,13.8155",
+        help="Deprecated alias for --proxy-nll-bins.",
+    )
+    parser.add_argument(
+        "--proxy-nll-quantiles",
+        dest="proxy_nll_quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use training-set NLL quantiles instead of fixed bins.",
+    )
+    parser.add_argument(
+        "--proxy-ppl-quantiles",
+        dest="proxy_nll_quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Deprecated alias for --proxy-nll-quantiles.",
+    )
+    parser.add_argument(
+        "--proxy-ttr-bins",
+        default="0,0.2,0.4,0.6,0.8,1.0",
+        help="Comma-separated bins for TTR ordinal regression.",
+    )
+    parser.add_argument(
+        "--proxy-ttr-quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use training-set TTR quantiles instead of fixed bins.",
+    )
+    parser.add_argument(
+        "--proxy-length-bins",
+        default="0,50,100,200,400,1000000",
+        help="Comma-separated bins for length ordinal regression.",
+    )
+    parser.add_argument(
+        "--proxy-length-quantiles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use decile length quantiles from the training set instead of fixed bins.",
+    )
+    parser.add_argument(
+        "--proxy-soft-labels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use soft interpolation between ordinal bins.",
+    )
     parser.add_argument("--hard-neg-k", type=int, default=32)
     parser.add_argument("--hard-neg-gamma", type=float, default=1.2)
 
@@ -444,33 +584,50 @@ def main() -> None:
         mu_id = lm_tok.pad_token_id or 0
     args.compact_mu_token_id = int(mu_id)
 
+    length_bins = _parse_bins(args.proxy_length_bins, float)
+    if len(length_bins) < 2:
+        length_bins = list(ProxyTaskConfig().length_bins)
+    nll_bins = _parse_bins(args.proxy_nll_bins, float)
+    if len(nll_bins) < 2:
+        nll_bins = list(ProxyTaskConfig().nll_bins)
+    ttr_bins = _parse_bins(args.proxy_ttr_bins, float)
+    if len(ttr_bins) < 2:
+        ttr_bins = list(ProxyTaskConfig().ttr_bins)
+
     dataset = DIBJudgeDataset.from_jsonl(args.data_path)
     _rank0_print(rank, "[stage done] dataset loaded")
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-    shuffle_ratio_step = float(args.shuffle_ratio_step)
-    if args.shuffle_ratio_schedule_ratio > 0:
-        samples_per_rank = math.ceil(len(dataset) / max(1, world_size))
-        steps_per_epoch = math.ceil(samples_per_rank / max(1, args.per_device_train_batch_size))
-        total_steps = max(1, steps_per_epoch * max(1, args.epochs))
-        schedule_steps = max(1, int(total_steps * args.shuffle_ratio_schedule_ratio))
-        ratio_span = max(0.0, args.shuffle_ratio_max - args.shuffle_ratio_min)
-        if ratio_span > 0:
-            shuffle_ratio_step = ratio_span / schedule_steps
-    if rank == 0:
-        _rank0_print(
-            rank,
-            "Shuffle schedule:",
-            f"min={args.shuffle_ratio_min} max={args.shuffle_ratio_max} step={shuffle_ratio_step:.6f}",
+    if args.proxy_length_quantiles:
+        length_bins = _compute_length_quantile_bins(
+            dataset, lm_tok, args.max_bias_len, bins=10
         )
+    if args.proxy_nll_quantiles:
+        nll_bins = _compute_value_quantile_bins(
+            _collect_proxy_values(dataset, ("proxy_nll_a", "proxy_nll_b")),
+            bins=10,
+            fallback=tuple(nll_bins),
+        )
+    if args.proxy_ttr_quantiles:
+        ttr_bins = _compute_value_quantile_bins(
+            _collect_proxy_values(dataset, ("proxy_ttr_a", "proxy_ttr_b")),
+            bins=10,
+            fallback=tuple(ttr_bins),
+        )
+    proxy_config = ProxyTaskConfig(
+        nll_bins=tuple(nll_bins),
+        ttr_bins=tuple(ttr_bins),
+        length_bins=tuple(length_bins),
+        use_soft_labels=bool(args.proxy_soft_labels),
+    )
+    args.proxy_nll_classes = max(2, len(nll_bins) - 1)
+    args.proxy_ttr_classes = max(2, len(ttr_bins) - 1)
+    args.proxy_length_classes = max(2, len(length_bins) - 1)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
     collator = DIBJudgeCollator(
         lm_tok,
         max_bias_len=args.max_bias_len,
         max_ref_len=args.max_ref_len,
         max_lm_len=args.max_lm_len,
-        shuffle_ratio_min=args.shuffle_ratio_min,
-        shuffle_ratio_max=args.shuffle_ratio_max,
-        shuffle_ratio_step=shuffle_ratio_step,
-        shuffle_schedule_start_step=0,
+        proxy_config=proxy_config,
     )
     loader = DataLoader(
         dataset,
@@ -486,7 +643,7 @@ def main() -> None:
         batch = next(iter(loader))
         shapes = {k: tuple(v.shape) for k, v in batch.items() if torch.is_tensor(v)}
         _rank0_print(rank, "Debug batch shapes:", shapes)
-        for key in ("original_attention_mask", "shuffle_attention_mask", "lm_attention_mask"):
+        for key in ("original_attention_mask", "lm_attention_mask"):
             if key in batch:
                 mask = batch[key]
                 lengths = mask.sum(dim=-1).view(-1).tolist()
@@ -513,6 +670,9 @@ def main() -> None:
         compact_head_hidden=args.compact_head_hidden,
         compact_head_layers=args.compact_head_layers,
         compact_head_dropout=args.compact_head_dropout,
+        proxy_nll_classes=max(2, len(nll_bins) - 1),
+        proxy_ttr_classes=max(2, len(ttr_bins) - 1),
+        proxy_length_classes=max(2, len(length_bins) - 1),
     ).to(device)
     _maybe_resize_embeddings(model.shared_encoder, judge_tok, "shared_encoder", rank)
     _maybe_resize_embeddings(model.judge_lm, lm_tok, "judge_lm", rank)
@@ -569,10 +729,12 @@ def main() -> None:
         lambda_compression_warmup_ratio=args.lambda_compression_warmup_ratio,
         mask_loss_weight=args.mask_loss_weight,
         consistency_loss_weight=args.consistency_loss_weight,
-        shuffle_weight=args.shuffle_weight,
         eng_domain_weight=args.eng_domain_weight,
         low_recon_weight=args.low_recon_weight,
         z_l2_weight=args.z_l2_weight,
+        nll_bin_weight=args.nll_bin_weight,
+        ttr_bin_weight=args.ttr_bin_weight,
+        length_bin_weight=args.length_bin_weight,
         debug_aux_checks=args.debug_aux_checks,
         debug_aux_checks_interval=args.debug_aux_checks_interval,
     )

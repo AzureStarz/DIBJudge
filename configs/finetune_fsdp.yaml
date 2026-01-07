@@ -28,10 +28,13 @@ num_workers: 4
 max_bias_len: 1024
 max_ref_len: 1024
 max_lm_len: 4096
-shuffle_ratio_min: 0.05
-shuffle_ratio_max: 0.3
-shuffle_ratio_step: 0.0
-shuffle_ratio_schedule_ratio: 0.7
+proxy_nll_bins: "0,2.3026,2.9957,3.6889,4.3820,5.0752,13.8155"
+proxy_nll_quantiles: false
+proxy_ttr_bins: "0,0.2,0.4,0.6,0.8,1.0"
+proxy_ttr_quantiles: false
+proxy_length_bins: "0,50,100,200,400,1000000"
+proxy_length_quantiles: true
+proxy_soft_labels: true
 
 # runtime config
 epochs: 1
@@ -86,5 +89,7 @@ grl_gamma: 10.0
 bias_decoder_steps: 1
 eng_domain_weight: 1.0
 low_recon_weight: 0.5
-shuffle_weight: 0.5
 z_l2_weight: 0.1
+nll_bin_weight: 0.5
+ttr_bin_weight: 0.5
+length_bin_weight: 0.5
