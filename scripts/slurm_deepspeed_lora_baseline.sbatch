@@ -23,7 +23,7 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_NVLS_DISABLE=1
 export NCCL_SHM_DISABLE=1
-export NCCL_P2P_LEVEL=LOC
+export NCCL_P2P_LEVEL=NVL
 
 module load amd/gcc_compiler/11.3.0
 num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)

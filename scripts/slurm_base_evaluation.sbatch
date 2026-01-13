@@ -34,6 +34,8 @@ num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 echo "Detected ${num_gpus} GPUs"
 
 python scripts/vanilla_evaluation.py \
-    --model model/Qwen3-4B-Base \
+    --model model/mR3-Qwen3-4B-en-prompt-en-thinking \
     --tensor_parallel_size ${num_gpus} \
-    --output_dir results/Qwen3-4B-Base/base
+    --output_dir results/baselines/mR3-Qwen3-4B-en-prompt-en-thinking \
+    --languages zh \
+    --template mr3_templates

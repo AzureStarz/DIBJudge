@@ -42,28 +42,6 @@ def _rank0_print(rank: int, *args: object, **kwargs: object) -> None:
         print(*args, **kwargs)
 
 
-def _grl_schedule(
-    max_lambda: float, step: int, total_steps: int, warmup_steps: int, gamma: float
-) -> float:
-    if max_lambda <= 0:
-        return 0.0
-    if total_steps <= 0:
-        return max_lambda
-    if step < warmup_steps:
-        return 0.0
-    denom = max(1, total_steps - warmup_steps)
-    progress = min(1.0, max(0.0, float(step - warmup_steps + 1) / float(denom)))
-    return max_lambda * (2.0 / (1.0 + math.exp(-gamma * progress)) - 1.0)
-
-
-def _phase_boundary(total_steps: int, grl_start_ratio: float) -> int:
-    if total_steps <= 0:
-        return 0
-    ratio = min(1.0, max(0.0, float(grl_start_ratio)))
-    core_steps = int(total_steps * ratio)
-    return min(total_steps, max(0, core_steps))
-
-
 def _warmup_steps_from_ratio(
     total_steps: int, ratio: Optional[float], warmup_steps: int
 ) -> int:
@@ -72,6 +50,22 @@ def _warmup_steps_from_ratio(
     if ratio < 0:
         raise ValueError("warmup_ratio must be >= 0.")
     return int(total_steps * ratio)
+
+
+def _piecewise_linear(progress: float, points: List[Tuple[float, float]]) -> float:
+    if not points:
+        return 0.0
+    progress = max(0.0, min(1.0, float(progress)))
+    points = sorted(points, key=lambda x: x[0])
+    if progress <= points[0][0]:
+        return float(points[0][1])
+    for (p0, v0), (p1, v1) in zip(points, points[1:]):
+        if progress <= p1:
+            if p1 <= p0 + 1e-8:
+                return float(v1)
+            t = (progress - p0) / (p1 - p0)
+            return float(v0 + t * (v1 - v0))
+    return float(points[-1][1])
 
 
 def _compute_bias_terms(
@@ -107,6 +101,129 @@ def _maybe_tqdm(iterable, rank: int, desc: str):
     return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
 
 
+def _install_checkpoint_warning_hook(rank: int, log_path: Optional[str] = None) -> None:
+    if rank != 0:
+        return
+    if getattr(_install_checkpoint_warning_hook, "_installed", False):
+        return
+    import torch
+    import torch.utils.checkpoint as _checkpoint
+    import inspect
+    import traceback
+    import warnings as _warnings
+
+    orig_showwarning = _warnings.showwarning
+    orig_checkpoint = _checkpoint.checkpoint
+    orig_forward = _checkpoint.CheckpointFunction.forward
+    _install_checkpoint_warning_hook._count = 0
+    max_logs = 5
+
+    def _log_line(text: str) -> None:
+        _rank0_print(rank, text)
+        if not log_path:
+            return
+        try:
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError:
+            pass
+
+    def _showwarning(message, category, filename, lineno, file=None, line=None):
+        text = str(message)
+        if "None of the inputs have requires_grad=True" in text:
+            stack = traceback.extract_stack()
+            idx = None
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i].filename.endswith("torch/utils/checkpoint.py"):
+                    idx = i
+                    break
+            caller = stack[idx - 1] if idx is not None and idx > 0 else None
+            _log_line(f"[checkpoint warn] {text}")
+            if caller is not None:
+                _log_line(
+                    f"[checkpoint warn] caller={caller.filename}:{caller.lineno} in {caller.name}"
+                )
+            if idx is None:
+                idx = len(stack) - 1
+            start = max(0, idx - 4)
+            end = min(len(stack), idx + 2)
+            snippet = "".join(traceback.format_list(stack[start:end])).rstrip()
+            if snippet:
+                _log_line("[checkpoint warn] stack:\n" + snippet)
+        return orig_showwarning(message, category, filename, lineno, file=file, line=line)
+
+    def _describe_run_function(run_function) -> None:
+        if _install_checkpoint_warning_hook._count >= max_logs:
+            return
+        _install_checkpoint_warning_hook._count += 1
+        name = getattr(run_function, "__qualname__", None) or getattr(run_function, "__name__", None)
+        if not name:
+            name = repr(run_function)
+        src_file = None
+        try:
+            src_file = inspect.getsourcefile(run_function)
+        except TypeError:
+            src_file = None
+        _log_line(f"[checkpoint warn] run_function={name}")
+        if src_file:
+            _log_line(f"[checkpoint warn] run_function_file={src_file}")
+        owner = getattr(run_function, "__self__", None)
+        if isinstance(owner, torch.nn.Module):
+            _log_line(f"[checkpoint warn] bound_module={owner.__class__.__name__}")
+        elif owner is not None:
+            _log_line(f"[checkpoint warn] bound_self={type(owner).__name__}")
+        inner = getattr(run_function, "func", None)
+        if inner is not None:
+            _log_line(f"[checkpoint warn] partial_func={repr(inner)}")
+            inner_self = getattr(inner, "__self__", None)
+            if isinstance(inner_self, torch.nn.Module):
+                _log_line(f"[checkpoint warn] partial_module={inner_self.__class__.__name__}")
+        closure = getattr(run_function, "__closure__", None)
+        if closure:
+            for cell in closure:
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if isinstance(value, torch.nn.Module):
+                    _log_line(f"[checkpoint warn] closure_module={value.__class__.__name__}")
+                    break
+
+    def _checkpoint_wrapper(function, *args, **kwargs):
+        has_grad_input = any(
+            torch.is_tensor(arg) and arg.requires_grad for arg in args
+        )
+        if not has_grad_input:
+            stack = traceback.extract_stack()
+            caller = None
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i].filename.endswith("torch/utils/checkpoint.py"):
+                    if i > 0:
+                        caller = stack[i - 1]
+                    break
+            _log_line("[checkpoint warn] checkpoint() called with no grad inputs")
+            if caller is not None:
+                _log_line(
+                    f"[checkpoint warn] caller={caller.filename}:{caller.lineno} in {caller.name}"
+                )
+            _describe_run_function(function)
+        return orig_checkpoint(function, *args, **kwargs)
+
+    def _forward_wrapper(ctx, run_function, preserve_rng_state, *args):
+        has_grad_input = any(
+            torch.is_tensor(arg) and arg.requires_grad for arg in args
+        )
+        if not has_grad_input:
+            _log_line("[checkpoint warn] CheckpointFunction.forward has no grad inputs")
+            _describe_run_function(run_function)
+        return orig_forward(ctx, run_function, preserve_rng_state, *args)
+
+    _warnings.showwarning = _showwarning
+    _checkpoint.checkpoint = _checkpoint_wrapper
+    _checkpoint.CheckpointFunction.forward = staticmethod(_forward_wrapper)
+    _install_checkpoint_warning_hook._installed = True
+
+
 def _param_grad_norm(params: List[torch.nn.Parameter], device: torch.device) -> float:
     total = torch.zeros((), device=device)
     for param in params:
@@ -115,6 +232,128 @@ def _param_grad_norm(params: List[torch.nn.Parameter], device: torch.device) -> 
         grad = param.grad.detach().float()
         total += grad.pow(2).sum()
     return float(total.sqrt().item())
+
+
+def _collect_vq_task_samples(
+    model: DIBJudgeModel,
+    dataset: DIBJudgeDataset,
+    collator: DIBJudgeCollator,
+    max_samples: int,
+    batch_size: int,
+    device: torch.device,
+    seed: int,
+    rank: int,
+) -> Optional[torch.Tensor]:
+    if max_samples <= 0 or len(dataset) == 0:
+        return None
+    batch_size = max(1, int(batch_size))
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    indices = torch.randperm(len(dataset), generator=generator).tolist()
+    samples: List[torch.Tensor] = []
+    total = 0
+    batch_examples = []
+    model_was_training = model.training
+    model.eval()
+
+    def _random_subset(vectors: torch.Tensor, count: int) -> torch.Tensor:
+        if count <= 0 or vectors.numel() == 0:
+            return vectors.new_zeros((0, vectors.size(-1)))
+        if vectors.size(0) <= count:
+            return vectors
+        idx = torch.randperm(vectors.size(0), device=vectors.device)[:count]
+        return vectors[idx]
+
+    def _sample_task_tokens(task_tokens: torch.Tensor, count: int) -> torch.Tensor:
+        if count <= 0 or task_tokens.numel() == 0:
+            return task_tokens.new_zeros((0, task_tokens.size(-1)))
+        if task_tokens.dim() != 3:
+            flat = task_tokens.reshape(-1, task_tokens.size(-1))
+            return _random_subset(flat, count)
+        prompt_len = task_tokens.size(1)
+        if prompt_len <= 1:
+            flat = task_tokens.reshape(-1, task_tokens.size(-1))
+            return _random_subset(flat, count)
+        per_pos = int(math.ceil(float(count) / float(prompt_len)))
+        per_pos = max(1, per_pos)
+        buckets = []
+        for idx in range(prompt_len):
+            buckets.append(_random_subset(task_tokens[:, idx, :], per_pos))
+        flat = torch.cat(buckets, dim=0)
+        return _random_subset(flat, count)
+
+    try:
+        with torch.no_grad():
+            for idx in indices:
+                batch_examples.append(dataset[idx])
+                if len(batch_examples) < batch_size:
+                    continue
+                batch = collator(batch_examples)
+                batch_examples = []
+                orig_ids = batch["original_input_ids"].to(device)
+                orig_mask = batch["original_attention_mask"].to(device)
+                orig_ids, orig_mask, _ = model._flatten_pair_inputs(orig_ids, orig_mask)
+                outputs = model.shared_encoder(
+                    input_ids=orig_ids,
+                    attention_mask=orig_mask,
+                    output_hidden_states=False,
+                    use_cache=False,
+                )
+                hidden = model._get_hidden(outputs)
+                pooled = model._pool_hidden(hidden, orig_mask)
+                task_tokens = model.task_mlp(pooled)
+                needed = max_samples - total
+                if needed <= 0:
+                    break
+                flat = _sample_task_tokens(task_tokens, needed)
+                samples.append(flat.detach().cpu())
+                total += flat.size(0)
+                if total >= max_samples:
+                    break
+            if batch_examples and total < max_samples:
+                batch = collator(batch_examples)
+                orig_ids = batch["original_input_ids"].to(device)
+                orig_mask = batch["original_attention_mask"].to(device)
+                orig_ids, orig_mask, _ = model._flatten_pair_inputs(orig_ids, orig_mask)
+                outputs = model.shared_encoder(
+                    input_ids=orig_ids,
+                    attention_mask=orig_mask,
+                    output_hidden_states=False,
+                    use_cache=False,
+                )
+                hidden = model._get_hidden(outputs)
+                pooled = model._pool_hidden(hidden, orig_mask)
+                task_tokens = model.task_mlp(pooled)
+                needed = max_samples - total
+                if needed > 0:
+                    flat = _sample_task_tokens(task_tokens, needed)
+                    samples.append(flat.detach().cpu())
+                    total += flat.size(0)
+    finally:
+        if model_was_training:
+            model.train()
+    if not samples:
+        _rank0_print(rank, "[warn] VQ init requested but no samples were collected.")
+        return None
+    collected = torch.cat(samples, dim=0)
+    _rank0_print(rank, f"[stage done] collected {collected.size(0)} VQ init samples")
+    return collected
+
+
+def _resolve_vq_init_samples(args: argparse.Namespace, dataset_len: int, rank: int) -> int:
+    requested = int(getattr(args, "vq_init_samples", 0))
+    if requested > 0:
+        return requested
+    prompt_len = max(1, int(getattr(args, "z_prompt_len", 1)))
+    num_codes = max(1, int(getattr(args, "task_codebook_size", 1)))
+    num_codebooks = max(1, int(getattr(args, "vq_num_codebooks", 1)))
+    target = int(num_codes * num_codebooks * prompt_len * 8)
+    target = max(10000, target)
+    if dataset_len > 0:
+        target = min(target, int(dataset_len) * prompt_len)
+    if rank == 0:
+        _rank0_print(rank, f"[stage done] auto vq_init_samples={target}")
+    return int(target)
 
 
 def _grad_norm_from_loss(
@@ -160,6 +399,33 @@ def _save_yaml_config(args: argparse.Namespace, path: str) -> None:
         os.makedirs(dir_path, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(vars(args), handle, sort_keys=True)
+
+
+def _resolve_zero_stage(config: object) -> Optional[int]:
+    cfg = None
+    if isinstance(config, str) and os.path.isfile(config):
+        try:
+            with open(config, "r", encoding="utf-8") as handle:
+                cfg = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+    elif isinstance(config, dict):
+        cfg = config
+    if not isinstance(cfg, dict):
+        return None
+    zero_opt = cfg.get("zero_optimization")
+    if isinstance(zero_opt, dict):
+        stage = zero_opt.get("stage")
+    elif isinstance(zero_opt, int):
+        stage = zero_opt
+    else:
+        stage = None
+    if stage is None:
+        return None
+    try:
+        return int(stage)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_bins(text: str, cast=float) -> List:
@@ -241,6 +507,59 @@ def _compute_value_quantile_bins(
         pos = min(max(pos, 0), n - 1)
         cuts.append(values[pos])
     return [values[0]] + cuts + [values[-1]]
+
+
+def _preview_text(text: str, limit: int = 120) -> str:
+    if not text:
+        return ""
+    text = text.replace("\n", "\\n")
+    return text[:limit]
+
+
+def _prefilter_long_prompts(
+    dataset: DIBJudgeDataset,
+    tokenizer,
+    max_lm_len: int,
+    rank: int,
+    log_samples: int = 3,
+    preview_len: int = 120,
+) -> DIBJudgeDataset:
+    if max_lm_len <= 0 or len(dataset) == 0:
+        return dataset
+    max_check_len = max_lm_len + 1
+    kept: List[DIBJudgeExample] = []
+    dropped: List[Tuple[int, int, str]] = []
+    for idx, ex in enumerate(dataset):
+        prompt = ex.judge_prompt
+        enc = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_check_len,
+        )
+        prompt_len = len(enc.get("input_ids", []))
+        if prompt_len >= max_lm_len:
+            dropped.append((idx, prompt_len, prompt))
+        else:
+            kept.append(ex)
+    if rank == 0:
+        total = len(kept) + len(dropped)
+        ratio = (len(dropped) / total) if total else 0.0
+        _rank0_print(
+            rank,
+            "[data] prefilter_long_prompts dropped "
+            f"{len(dropped)}/{total} ({ratio:.2%}) with max_lm_len={max_lm_len}",
+        )
+        log_samples = max(0, int(log_samples))
+        for idx, (orig_idx, prompt_len, prompt) in enumerate(dropped[:log_samples]):
+            preview = _preview_text(prompt, limit=preview_len)
+            _rank0_print(
+                rank,
+                "[data] prefilter_long_prompts sample "
+                f"{idx + 1}: idx={orig_idx} prompt_tokens={prompt_len} "
+                f"prompt='{preview}'",
+            )
+    return DIBJudgeDataset(kept)
 
 
 def _save_deepspeed_checkpoint(
@@ -402,7 +721,11 @@ def _save_hf_from_zero(
 
     os.makedirs(output_dir, exist_ok=True)
     _rank0_print(rank, f"[hf] extracting DIBJudge from {checkpoint_dir} tag={tag}")
-    raw_state = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
+    try:
+        raw_state = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
+    except FileNotFoundError as exc:
+        _rank0_print(rank, f"[warn] HF export skipped: {exc}")
+        return
     state_dict = _normalize_state_dict(raw_state)
 
     dibjudge_state = {
@@ -465,22 +788,33 @@ def _save_hf_from_zero(
         judge_lm_name=args.lm,
         z_latent_dim=args.z_latent_dim,
         z_prompt_len=args.z_prompt_len,
+        bias_prompt_len=args.bias_prompt_len,
+        task_codebook_size=args.task_codebook_size,
+        vq_num_codebooks=args.vq_num_codebooks,
+        vq_commitment_gamma=args.vq_commitment_gamma,
+        vq_ema_decay=args.vq_ema_decay,
+        vq_use_ema=args.vq_use_ema,
+        vq_normalize_inputs=args.vq_normalize_inputs,
+        vq_codebook_trainable=args.vq_codebook_trainable,
+        vq_dead_code_threshold=args.vq_dead_code_threshold,
+        vq_reset_dead_codes=args.vq_reset_dead_codes,
+        vq_align_samples=args.vq_align_samples,
         z_prompt_prefix_len=args.z_prompt_prefix_len,
         z_prompt_postfix_len=args.z_prompt_postfix_len,
         prompt_mlp_hidden=args.prompt_mlp_hidden,
         prompt_mlp_layers=args.prompt_mlp_layers,
         prompt_mlp_dropout=args.prompt_mlp_dropout,
-        grl_lambda=args.grl_lambda,
         bottleneck_noise_alpha=args.bottleneck_noise_alpha,
         bias_proxy_hidden=args.bias_proxy_hidden,
         bias_proxy_layers=args.bias_proxy_layers,
         bias_proxy_dropout=args.bias_proxy_dropout,
         low_recon_layer=args.low_recon_layer,
-        compact_prior=args.compact_prior,
+        compact_prior=args.compact_keep_init,
         compact_mu_token_id=args.compact_mu_token_id,
         compact_head_hidden=args.compact_head_hidden,
         compact_head_layers=args.compact_head_layers,
         compact_head_dropout=args.compact_head_dropout,
+        compact_pi_init=args.compact_pi_init,
         proxy_length_classes=getattr(args, "proxy_length_classes", DIBJudgeConfig.proxy_length_classes),
     )
     config_path = os.path.join(dibjudge_dir, "config.json")
@@ -604,17 +938,15 @@ def _build_optimizer_params(
         "head": [],
     }
     head_prefixes = (
-        "eng_domain_head.",
-        "position_head.",
+        "task_mlp.",
+        "bias_mlp.",
+        "vq_task.",
+        "task_vq_to_lm.",
         "low_recon_head.",
         "length_bin_head.",
         "nll_bin_head.",
         "ttr_bin_head.",
         "compact_head.",
-        "prompt_mlp.",
-        "z_to_lm.",
-        "z_prompt_prefix",
-        "z_prompt_postfix",
     )
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -663,13 +995,85 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="DeepSpeed LoRA finetuning for DIBJudge.")
     parser.add_argument("--data-path", default=None)
+    parser.add_argument(
+        "--proxy-cache-path",
+        default=None,
+        help="Optional JSONL file with proxy labels aligned to --data-path.",
+    )
+    parser.add_argument(
+        "--max-training-samples",
+        type=int,
+        default=0,
+        help="Cap the number of training samples (0 = no cap).",
+    )
     parser.add_argument("--judge-encoder", default=None)
     parser.add_argument("--lm", default=None)
     parser.add_argument("--z-latent-dim", type=int, default=256)
     parser.add_argument("--z-prompt-len", type=int, default=16)
+    parser.add_argument("--bias-prompt-len", type=int, default=8)
     parser.add_argument("--prompt-mlp-hidden", type=int, default=0)
     parser.add_argument("--prompt-mlp-layers", type=int, default=1)
     parser.add_argument("--prompt-mlp-dropout", type=float, default=0.1)
+    parser.add_argument("--task-codebook-size", type=int, default=1024)
+    parser.add_argument("--vq-num-codebooks", type=int, default=4)
+    parser.add_argument("--vq-commitment-gamma", type=float, default=0.05)
+    parser.add_argument("--vq-ema-decay", type=float, default=0.99)
+    parser.add_argument(
+        "--vq-use-ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use EMA updates for VQ codebooks.",
+    )
+    parser.add_argument(
+        "--vq-normalize-inputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize encoder outputs before VQ.",
+    )
+    parser.add_argument(
+        "--vq-codebook-trainable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow gradient updates to VQ codebooks in addition to EMA.",
+    )
+    parser.add_argument("--vq-dead-code-threshold", type=float, default=0.1)
+    parser.add_argument(
+        "--vq-reset-dead-codes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reset dead codes to random batch vectors.",
+    )
+    parser.add_argument("--vq-align-samples", type=int, default=512)
+    parser.add_argument(
+        "--vq-usage-weight",
+        type=float,
+        default=0.1,
+        help="Weight for code usage regularization.",
+    )
+    parser.add_argument(
+        "--vq-init-samples",
+        type=int,
+        default=0,
+        help="Number of task tokens to sample for VQ codebook kmeans++ init (0 = auto).",
+    )
+    parser.add_argument(
+        "--vq-init-batch-size",
+        type=int,
+        default=0,
+        help="Batch size for VQ init forward passes (0 = per_device_train_batch_size).",
+    )
+    parser.add_argument(
+        "--vq-init-spherical",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize samples before VQ codebook initialization.",
+    )
+    parser.add_argument(
+        "--vq-init-seed",
+        type=int,
+        default=0,
+        help="Random seed for VQ codebook init sampling.",
+    )
     parser.add_argument("--bottleneck-noise-alpha", type=float, default=8.0)
     parser.add_argument("--bottleneck-noise-warmup-ratio", type=float, default=0.2)
     parser.add_argument("--z-prompt-prefix-len", type=int, default=1)
@@ -690,7 +1094,6 @@ def main() -> None:
     parser.add_argument("--bias-proxy-layers", type=int, default=-1)
     parser.add_argument("--bias-proxy-dropout", type=float, default=-1.0)
     parser.add_argument("--low-recon-layer", type=int, default=2)
-    parser.add_argument("--compact-prior", type=float, default=0.3)
     parser.add_argument("--compact-mu-token-id", type=int, default=-1)
     parser.add_argument("--compact-head-hidden", type=int, default=0)
     parser.add_argument("--compact-head-layers", type=int, default=1)
@@ -708,11 +1111,16 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--max-bias-len", type=int, default=1024)
-    parser.add_argument("--max-ref-len", type=int, default=1024)
+    parser.add_argument("--max-response-len", type=int, default=1024)
     parser.add_argument("--max-lm-len", type=int, default=4096)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--checkpoint-reentrant",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use reentrant activation checkpointing in the custom wrapper.",
+    )
     parser.add_argument(
         "--torch-autocast",
         action=argparse.BooleanOptionalAction,
@@ -729,17 +1137,47 @@ def main() -> None:
         help="Comma-separated module names for LoRA injection.",
     )
     parser.add_argument("--lambda-compression", type=float, default=1.0)
-    parser.add_argument("--lambda-compression-warmup-ratio", type=float, default=0.05)
     parser.add_argument("--mask-loss-weight", type=float, default=1.0)
     parser.add_argument("--consistency-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--mask-group-weight",
+        type=float,
+        default=0.5,
+        help="Weight for (mask_loss + consistency_loss) group loss.",
+    )
+    parser.add_argument(
+        "--loss-schedule",
+        choices=["static", "dynamic"],
+        default="dynamic",
+        help="Use dynamic scheduling for auxiliary losses (dynamic) or keep static weights.",
+    )
+    parser.add_argument(
+        "--disable-compactor",
+        action="store_true",
+        help="Disable compact masking and compact losses (KL/mask/consistency).",
+    )
+    parser.add_argument(
+        "--disable-z-prompt-insertion",
+        action="store_true",
+        help="Disable insertion of task prompt tokens into the LM input.",
+    )
+    parser.add_argument("--compact-keep-init", type=float, default=0.9)
+    parser.add_argument(
+        "--compact-keep-final",
+        type=float,
+        default=0.7,
+        help="Final keep ratio target for dynamic scheduling.",
+    )
+    parser.add_argument(
+        "--compact-pi-init",
+        type=float,
+        default=0.95,
+        help="Initialize compact head bias so sigmoid(pi) ~= this value.",
+    )
+    parser.add_argument("--kl-weight-max", type=float, default=1.0)
+    parser.add_argument("--z-dropout", type=float, default=0.0)
     parser.add_argument("--lambda-bias", type=float, default=1.0)
-    parser.add_argument("--grl-lambda", type=float, default=1.0)
-    parser.add_argument("--grl-start-ratio", type=float, default=0.3)
-    parser.add_argument("--grl-gamma", type=float, default=10.0)
-    parser.add_argument("--bias-decoder-steps", type=int, default=1)
-    parser.add_argument("--eng-domain-weight", type=float, default=1.0)
     parser.add_argument("--low-recon-weight", type=float, default=0.5)
-    parser.add_argument("--z-l2-weight", type=float, default=0.1)
     parser.add_argument("--nll-bin-weight", type=float, default=0.5)
     parser.add_argument(
         "--ppl-bin-weight",
@@ -750,12 +1188,9 @@ def main() -> None:
     )
     parser.add_argument("--ttr-bin-weight", type=float, default=0.5)
     parser.add_argument("--length-bin-weight", type=float, default=0.5)
-    parser.add_argument(
-        "--position-weight",
-        type=float,
-        default=0.0,
-        help="Weight for adversarial position-discriminator loss.",
-    )
+    parser.add_argument("--vq-task-weight", type=float, default=1.0)
+    parser.add_argument("--vq-align-weight", type=float, default=0.0)
+    parser.add_argument("--disentangle-weight", type=float, default=1.0)
     parser.add_argument(
         "--proxy-nll-bins",
         dest="proxy_nll_bins",
@@ -828,6 +1263,95 @@ def main() -> None:
         default=False,
         help="Enable auxiliary-loss diagnostics (grad norms, coverage).",
     )
+    parser.add_argument(
+        "--debug-loss-spike",
+        action="store_true",
+        help="Log batch-level diagnostics when lm_loss spikes.",
+    )
+    parser.add_argument(
+        "--debug-loss-spike-threshold",
+        type=float,
+        default=0.0,
+        help="Trigger spike logging when lm_loss exceeds this value.",
+    )
+    parser.add_argument(
+        "--debug-loss-spike-multiplier",
+        type=float,
+        default=0.0,
+        help="Trigger spike logging when lm_loss exceeds EMA * multiplier.",
+    )
+    parser.add_argument(
+        "--debug-loss-spike-max-samples",
+        type=int,
+        default=3,
+        help="Max samples to print when a loss spike is detected.",
+    )
+    parser.add_argument(
+        "--debug-loss-spike-preview",
+        type=int,
+        default=120,
+        help="Max characters to show in debug prompt/output previews.",
+    )
+    parser.add_argument(
+        "--filter-lm-truncated",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mask LM labels for samples where prompt hits max length or tokenizer reports truncation.",
+    )
+    parser.add_argument(
+        "--min-target-tokens",
+        type=int,
+        default=0,
+        help="Mask LM labels for samples with fewer than this many target tokens.",
+    )
+    parser.add_argument(
+        "--drop-lm-truncated",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Hard-drop samples where prompt hits max length or tokenizer reports truncation.",
+    )
+    parser.add_argument(
+        "--drop-min-target-tokens",
+        type=int,
+        default=0,
+        help="Hard-drop samples with fewer than this many target tokens.",
+    )
+    parser.add_argument(
+        "--prefilter-long-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pre-tokenize prompts and drop samples with prompt_len >= max_lm_len.",
+    )
+    parser.add_argument(
+        "--prefilter-long-prompts-log-samples",
+        type=int,
+        default=3,
+        help="Number of dropped prompt samples to log when prefiltering.",
+    )
+    parser.add_argument(
+        "--prefilter-long-prompts-preview",
+        type=int,
+        default=120,
+        help="Max characters to show for dropped prompt previews.",
+    )
+    parser.add_argument(
+        "--debug-lm-sample",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log one detokenized LM input sample before training.",
+    )
+    parser.add_argument(
+        "--debug-lm-sample-max-tokens",
+        type=int,
+        default=None,
+        help="Max LM tokens to detokenize for the debug LM sample.",
+    )
+    parser.add_argument(
+        "--debug-checkpoint-warning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log stack/caller info when checkpoint warns about missing grads.",
+    )
     parser.add_argument("--debug-aux-checks-interval", type=int, default=200)
     parser.add_argument("--use-swanlab", action="store_true")
     parser.add_argument("--swanlab-project", default="dibjudge")
@@ -854,6 +1378,8 @@ def main() -> None:
     missing = [name for name in required if not getattr(args, name)]
     if missing:
         parser.error(f"Missing required arguments (or YAML keys): {', '.join(missing)}")
+    if args.debug_lm_sample_max_tokens is None or args.debug_lm_sample_max_tokens <= 0:
+        args.debug_lm_sample_max_tokens = int(args.max_lm_len)
 
     import deepspeed
 
@@ -866,6 +1392,10 @@ def main() -> None:
         warnings.filterwarnings("default")
     else:
         warnings.filterwarnings("ignore")
+    if args.debug_checkpoint_warning:
+        log_base = args.log_dir or args.output_dir or "."
+        log_path = os.path.join(log_base, "checkpoint_warn_rank0.log")
+        _install_checkpoint_warning_hook(rank, log_path=log_path)
 
     if not args.no_save_config and args.save_config is None and args.config is None:
         args.save_config = os.path.join("configs", "finetune_deepspeed.yaml")
@@ -902,11 +1432,26 @@ def main() -> None:
     if len(ttr_bins) < 2:
         ttr_bins = list(ProxyTaskConfig().ttr_bins)
 
-    dataset = DIBJudgeDataset.from_jsonl(args.data_path)
+    dataset = DIBJudgeDataset.from_jsonl(
+        args.data_path, proxy_cache_path=args.proxy_cache_path
+    )
+    max_samples = int(args.max_training_samples)
+    if max_samples > 0 and len(dataset) > max_samples:
+        dataset = DIBJudgeDataset(dataset.samples[:max_samples])
+        _rank0_print(rank, f"[stage done] dataset capped to {max_samples} samples")
     _rank0_print(rank, "[stage done] dataset loaded")
+    if args.prefilter_long_prompts:
+        dataset = _prefilter_long_prompts(
+            dataset=dataset,
+            tokenizer=lm_tok,
+            max_lm_len=int(args.max_lm_len),
+            rank=rank,
+            log_samples=int(args.prefilter_long_prompts_log_samples),
+            preview_len=int(args.prefilter_long_prompts_preview),
+        )
     if args.proxy_length_quantiles:
         length_bins = _compute_length_quantile_bins(
-            dataset, lm_tok, args.max_bias_len, bins=10
+            dataset, lm_tok, args.max_response_len, bins=10
         )
     if args.proxy_nll_quantiles:
         nll_bins = _compute_value_quantile_bins(
@@ -937,13 +1482,19 @@ def main() -> None:
     samples_per_rank = math.ceil(len(dataset) / max(1, world_size))
     steps_per_epoch = math.ceil(samples_per_rank / max(1, args.per_device_train_batch_size))
     total_steps = max(1, steps_per_epoch * max(1, args.epochs))
-    grl_start = _phase_boundary(total_steps, args.grl_start_ratio)
+    proxy_labels_enabled = bool(args.proxy_cache_path)
     collator = DIBJudgeCollator(
         lm_tok,
-        max_bias_len=args.max_bias_len,
-        max_ref_len=args.max_ref_len,
+        max_response_len=args.max_response_len,
         max_lm_len=args.max_lm_len,
         proxy_config=proxy_config,
+        enable_proxy_labels=proxy_labels_enabled,
+        debug_spike=bool(args.debug_loss_spike),
+        debug_preview_len=int(args.debug_loss_spike_preview),
+        filter_truncated=bool(args.filter_lm_truncated),
+        min_target_tokens=int(args.min_target_tokens),
+        drop_truncated=bool(args.drop_lm_truncated),
+        drop_min_target_tokens=int(args.drop_min_target_tokens),
     )
     loader = DataLoader(
         dataset,
@@ -955,37 +1506,74 @@ def main() -> None:
         collate_fn=collator,
     )
     _rank0_print(rank, "[stage done] dataloader ready")
-    if args.debug_data and rank == 0:
+    if rank == 0 and (args.debug_data or args.debug_lm_sample):
         batch = next(iter(loader))
-        shapes = {k: tuple(v.shape) for k, v in batch.items() if torch.is_tensor(v)}
-        _rank0_print(rank, "Debug batch shapes:", shapes)
-        for key in ("original_attention_mask", "lm_attention_mask"):
-            if key in batch:
-                mask = batch[key]
-                lengths = mask.sum(dim=-1).view(-1).tolist()
-                _rank0_print(rank, f"{key} lengths (first 8):", lengths[:8])
+        if args.debug_data:
+            shapes = {k: tuple(v.shape) for k, v in batch.items() if torch.is_tensor(v)}
+            _rank0_print(rank, "Debug batch shapes:", shapes)
+            for key in ("original_attention_mask", "lm_attention_mask"):
+                if key in batch:
+                    mask = batch[key]
+                    lengths = mask.sum(dim=-1).view(-1).tolist()
+                    _rank0_print(rank, f"{key} lengths (first 8):", lengths[:8])
+        if args.debug_lm_sample:
+            lm_ids = batch.get("lm_input_ids")
+            lm_mask = batch.get("lm_attention_mask")
+            lm_labels = batch.get("lm_labels")
+            if torch.is_tensor(lm_ids):
+                max_tokens = max(1, int(args.debug_lm_sample_max_tokens))
+                take = int(lm_ids.size(1))
+                if torch.is_tensor(lm_mask):
+                    take = int(lm_mask[0].sum().item())
+                take = min(take, max_tokens)
+                ids = lm_ids[0, :take].tolist()
+                decoded = lm_tok.decode(ids, skip_special_tokens=False)
+                _rank0_print(
+                    rank,
+                    f"[lm sample] tokens={take} text='{decoded}'",
+                )
+                if torch.is_tensor(lm_labels):
+                    label_ids = lm_labels[0].tolist()
+                    label_ids = [tok for tok in label_ids if tok != -100][:take]
+                    label_decoded = lm_tok.decode(
+                        label_ids, skip_special_tokens=False
+                    ) if label_ids else ""
+                    _rank0_print(
+                        rank,
+                        f"[lm sample] labels='{label_decoded}'",
+                    )
 
     model = DIBJudgeModel.init_from_backbones(
         judge_encoder_name=args.judge_encoder,
         judge_lm_name=args.lm,
         z_latent_dim=args.z_latent_dim,
         z_prompt_len=args.z_prompt_len,
+        bias_prompt_len=args.bias_prompt_len,
+        task_codebook_size=args.task_codebook_size,
+        vq_num_codebooks=args.vq_num_codebooks,
+        vq_commitment_gamma=args.vq_commitment_gamma,
+        vq_ema_decay=args.vq_ema_decay,
+        vq_use_ema=args.vq_use_ema,
+        vq_normalize_inputs=args.vq_normalize_inputs,
+        vq_codebook_trainable=args.vq_codebook_trainable,
+        vq_dead_code_threshold=args.vq_dead_code_threshold,
+        vq_reset_dead_codes=args.vq_reset_dead_codes,
+        vq_align_samples=args.vq_align_samples,
         prompt_mlp_hidden=args.prompt_mlp_hidden,
         prompt_mlp_layers=args.prompt_mlp_layers,
         prompt_mlp_dropout=args.prompt_mlp_dropout,
-        bottleneck_noise_alpha=args.bottleneck_noise_alpha,
-        grl_lambda=args.grl_lambda,
         z_prompt_prefix_len=args.z_prompt_prefix_len,
         z_prompt_postfix_len=args.z_prompt_postfix_len,
         low_recon_layer=args.low_recon_layer,
         bias_proxy_hidden=args.bias_proxy_hidden,
         bias_proxy_layers=args.bias_proxy_layers,
         bias_proxy_dropout=args.bias_proxy_dropout,
-        compact_prior=args.compact_prior,
+        compact_prior=args.compact_keep_init,
         compact_mu_token_id=args.compact_mu_token_id,
         compact_head_hidden=args.compact_head_hidden,
         compact_head_layers=args.compact_head_layers,
         compact_head_dropout=args.compact_head_dropout,
+        compact_pi_init=args.compact_pi_init,
         proxy_nll_classes=max(2, len(nll_bins) - 1),
         proxy_ttr_classes=max(2, len(ttr_bins) - 1),
         proxy_length_classes=max(2, len(length_bins) - 1),
@@ -995,21 +1583,69 @@ def main() -> None:
     skip_encoder_checkpointing = _set_shared_encoder_trainable(
         model, args.encoder_trainable, rank
     )
-    _rank0_print(rank, "[stage done] model initialized")
-    if args.gradient_checkpointing:
-        # DeepSpeed ZeRO-3 can trigger metadata mismatch in non-reentrant checkpointing.
-        gc_kwargs = {"use_reentrant": True}
-        if not skip_encoder_checkpointing:
-            model.shared_encoder.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs=gc_kwargs
+    vq_init_samples = _resolve_vq_init_samples(args, len(dataset), rank)
+    args.vq_init_samples = vq_init_samples
+    if vq_init_samples > 0:
+        if rank == 0:
+            init_batch_size = (
+                int(args.vq_init_batch_size)
+                if int(args.vq_init_batch_size) > 0
+                else int(args.per_device_train_batch_size)
             )
-        model.judge_lm.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs=gc_kwargs
-        )
+            samples = _collect_vq_task_samples(
+                model=model,
+                dataset=dataset,
+                collator=collator,
+                max_samples=int(vq_init_samples),
+                batch_size=init_batch_size,
+                device=device,
+                seed=int(args.vq_init_seed),
+                rank=rank,
+            )
+            if samples is not None:
+                model.vq_task.initialize_codebook(
+                    samples.to(device),
+                    max_samples=int(vq_init_samples),
+                    seed=int(args.vq_init_seed),
+                    spherical=bool(args.vq_init_spherical),
+                )
+                _rank0_print(rank, "[stage done] VQ codebook initialized with kmeans++")
+            del samples
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        if dist.is_initialized() and world_size > 1:
+            dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
+            with torch.no_grad():
+                dist.broadcast(model.vq_task.codebook, src=0)
+                dist.broadcast(model.vq_task.ema_w, src=0)
+                dist.broadcast(model.vq_task.ema_cluster_size, src=0)
+            dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    _rank0_print(rank, "[stage done] model initialized")
     _maybe_apply_lora(model, args)
     if args.freeze_lm_when_no_lora and not args.use_lora:
         _set_lm_trainable(model, False, rank)
     _rank0_print(rank, "[stage done] lora applied" if args.use_lora else "[stage done] lora skipped")
+    if args.gradient_checkpointing:
+        lm_trainable = any(param.requires_grad for param in model.judge_lm.parameters())
+        encoder_ckpt = str(args.encoder_trainable).lower() == "all"
+        model.set_gradient_checkpointing(
+            encoder=encoder_ckpt,
+            lm=lm_trainable,
+            use_reentrant=bool(args.checkpoint_reentrant),
+        )
+        zero_stage = _resolve_zero_stage(args.deepspeed_config)
+        zero_stage_str = str(zero_stage) if zero_stage is not None else "unknown"
+        _rank0_print(
+            rank,
+            "[stage done] gradient checkpointing enabled "
+            f"(encoder={encoder_ckpt} lm={lm_trainable} "
+            f"reentrant={bool(args.checkpoint_reentrant)} "
+            f"zero_stage={zero_stage_str})",
+        )
+    else:
+        model.set_gradient_checkpointing(encoder=False, lm=False, use_reentrant=False)
 
     optimizer_params = _build_optimizer_params(
         model,
@@ -1045,6 +1681,12 @@ def main() -> None:
         with open(ds_config, "r", encoding="utf-8") as handle:
             ds_config = json.load(handle)
     if isinstance(ds_config, dict):
+        if sched_name in {"none", "disable", "disabled"} and "scheduler" in ds_config:
+            _rank0_print(
+                rank,
+                "[warn] scheduler disabled via args; removing scheduler from deepspeed config",
+            )
+            ds_config.pop("scheduler", None)
         ds_config["gradient_accumulation_steps"] = args.grad_accum_steps
         ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
         ds_config["train_batch_size"] = (
@@ -1090,7 +1732,7 @@ def main() -> None:
             elif name.startswith("judge_lm."):
                 lm_params.append(param)
 
-    use_amp = args.torch_autocast
+    use_amp = bool(args.torch_autocast)
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
 
     _rank0_print(rank, "DeepSpeed config:", ds_config)
@@ -1098,19 +1740,21 @@ def main() -> None:
         rank,
         "Loss config:",
         {
+            "loss_schedule": args.loss_schedule,
+            "disable_compactor": args.disable_compactor,
+            "disable_z_prompt_insertion": args.disable_z_prompt_insertion,
             "lambda_bias": args.lambda_bias,
             "lambda_compression": args.lambda_compression,
-            "lambda_compression_warmup_ratio": args.lambda_compression_warmup_ratio,
-            "grl_lambda": args.grl_lambda,
-            "grl_start_ratio": args.grl_start_ratio,
-            "grl_gamma": args.grl_gamma,
-            "bottleneck_noise_alpha": args.bottleneck_noise_alpha,
-            "bottleneck_noise_warmup_ratio": args.bottleneck_noise_warmup_ratio,
-            "eng_domain_weight": args.eng_domain_weight,
+            "compact_keep_init": args.compact_keep_init,
+            "compact_keep_final": args.compact_keep_final,
+            "kl_weight_max": args.kl_weight_max,
+            "z_dropout": args.z_dropout,
             "low_recon_weight": args.low_recon_weight,
-            "z_l2_weight": args.z_l2_weight,
+            "vq_task_weight": args.vq_task_weight,
+            "vq_usage_weight": args.vq_usage_weight,
+            "vq_align_weight": args.vq_align_weight,
+            "disentangle_weight": args.disentangle_weight,
             "length_bin_weight": args.length_bin_weight,
-            "position_weight": args.position_weight,
             "mask_loss_weight": args.mask_loss_weight,
             "consistency_loss_weight": args.consistency_loss_weight,
         },
@@ -1141,20 +1785,8 @@ def main() -> None:
         _rank0_print(rank, "[stage done] swanlab initialized")
 
     step = 0
+    ema_lm_loss: Optional[float] = None
     last_update_diag: Dict[str, float] = {}
-    total_steps_est = max(1, args.epochs * len(loader))
-    grl_start = _phase_boundary(total_steps_est, args.grl_start_ratio)
-    warmup_phase_steps = grl_start if grl_start > 0 else total_steps_est
-    compression_warmup_steps = (
-        int(warmup_phase_steps * args.lambda_compression_warmup_ratio)
-        if args.lambda_compression_warmup_ratio is not None
-        else 0
-    )
-    noise_warmup_steps = (
-        int(warmup_phase_steps * args.bottleneck_noise_warmup_ratio)
-        if args.bottleneck_noise_warmup_ratio is not None
-        else 0
-    )
     for epoch in range(1, args.epochs + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -1166,10 +1798,14 @@ def main() -> None:
             "loss": 0.0,
             "lm_loss": 0.0,
             "compact_kl_loss": 0.0,
-            "domain_loss": 0.0,
-            "position_loss": 0.0,
             "low_recon_loss": 0.0,
-            "z_l2_loss": 0.0,
+            "vq_task_loss": 0.0,
+            "vq_align_loss": 0.0,
+            "vq_usage_loss": 0.0,
+            "disentangle_loss": 0.0,
+            "vq_task_perplexity": 0.0,
+            "vq_task_dead_fraction": 0.0,
+            "vq_task_avg_distance": 0.0,
             "nll_bin_loss": 0.0,
             "ttr_bin_loss": 0.0,
             "length_bin_loss": 0.0,
@@ -1177,8 +1813,13 @@ def main() -> None:
             "ttr_bin_mae": 0.0,
             "length_bin_mae": 0.0,
             "compression_loss": 0.0,
+            "mask_group_loss": 0.0,
             "mask_loss": 0.0,
             "consistency_loss": 0.0,
+            "lm_drop_count": 0.0,
+            "lm_drop_seen": 0.0,
+            "lm_drop_maxlen": 0.0,
+            "lm_drop_min_target": 0.0,
             "steps": 0,
         }
 
@@ -1188,53 +1829,110 @@ def main() -> None:
             accum_boundary = step_index % args.grad_accum_steps == 0
             optim_step = step_index // args.grad_accum_steps
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            if step < grl_start:
-                progress = float(step + 1) / float(max(1, grl_start))
-                lambda_bias = args.lambda_bias * min(1.0, progress)
-                grl_lambda = 0.0
-                bias_detach = True
+            if total_update_steps > 0:
+                progress = min(1.0, float(optim_step) / float(total_update_steps))
             else:
-                lambda_bias = args.lambda_bias
-                grl_lambda = _grl_schedule(
-                    args.grl_lambda,
-                    step,
-                    total_steps_est,
-                    grl_start,
-                    args.grl_gamma,
+                progress = 0.0
+            device = batch["lm_input_ids"].device
+            disable_compactor = bool(args.disable_compactor)
+            disable_z_prompt_insertion = bool(args.disable_z_prompt_insertion)
+            if args.loss_schedule == "dynamic":
+                keep_init = float(args.compact_keep_init)
+                keep_final = float(args.compact_keep_final)
+                keep_ratio = _piecewise_linear(
+                    progress,
+                    [
+                        (0.0, keep_init),
+                        (0.2, keep_init),
+                        (0.6, keep_final),
+                        (1.0, keep_final),
+                    ],
                 )
-                bias_detach = False
-            if compression_warmup_steps > 0:
-                lambda_compression = min(
-                    args.lambda_compression,
-                    args.lambda_compression * float(step + 1) / float(compression_warmup_steps),
+                keep_ratio = min(max(keep_ratio, 0.0), 1.0)
+                kl_weight = _piecewise_linear(
+                    progress,
+                    [
+                        (0.0, 0.0),
+                        (0.2, 0.0),
+                        (0.5, float(args.kl_weight_max)),
+                        (1.0, float(args.kl_weight_max)),
+                    ],
                 )
+                lambda_compression = float(args.lambda_compression) * _piecewise_linear(
+                    progress,
+                    [
+                        (0.0, 0.1),
+                        (0.1, 0.1),
+                        (0.4, 1.0),
+                        (1.0, 0.3),
+                    ],
+                )
+                lambda_bias = float(args.lambda_bias) * _piecewise_linear(
+                    progress,
+                    [
+                        (0.0, 0.2),
+                        (0.05, 0.2),
+                        (0.3, 1.0),
+                        (0.7, 1.0),
+                        (1.0, 0.2),
+                    ],
+                )
+                disentangle_weight = float(args.disentangle_weight) * _piecewise_linear(
+                    progress,
+                    [
+                        (0.0, 0.0),
+                        (0.2, 0.0),
+                        (0.6, 1.0),
+                        (1.0, 0.5),
+                    ],
+                )
+                vq_commit_ramp = _piecewise_linear(
+                    progress,
+                    [
+                        (0.0, 0.0),
+                        (0.1, 1.0),
+                        (1.0, 1.0),
+                    ],
+                )
+                mask_group_scale = 1.0
             else:
-                lambda_compression = args.lambda_compression
-            if noise_warmup_steps > 0:
-                noise_alpha = min(
-                    args.bottleneck_noise_alpha,
-                    args.bottleneck_noise_alpha * float(step + 1) / float(noise_warmup_steps),
-                )
-            else:
-                noise_alpha = args.bottleneck_noise_alpha
-            batch["grl_lambda"] = batch["lm_input_ids"].new_tensor(grl_lambda)
-            batch["bottleneck_noise_alpha"] = batch["lm_input_ids"].new_tensor(noise_alpha)
-            batch["bias_detach"] = bias_detach
+                keep_ratio = min(max(float(args.compact_keep_init), 0.0), 1.0)
+                kl_weight = float(args.kl_weight_max)
+                lambda_compression = float(args.lambda_compression)
+                lambda_bias = float(args.lambda_bias)
+                disentangle_weight = float(args.disentangle_weight)
+                vq_commit_ramp = 1.0
+                mask_group_scale = 1.0
+            if disable_compactor:
+                keep_ratio = 1.0
+                kl_weight = 0.0
+                mask_group_scale = 0.0
+            z_dropout = float(args.z_dropout)
+            batch["compact_prior"] = torch.tensor(keep_ratio, device=device, dtype=torch.float32)
+            batch["z_task_dropout"] = torch.tensor(z_dropout, device=device, dtype=torch.float32)
+            batch["compact_mask_scale"] = torch.tensor(
+                mask_group_scale, device=device, dtype=torch.float32
+            )
+            batch["disable_compactor"] = disable_compactor
+            batch["disable_z_prompt_insertion"] = disable_z_prompt_insertion
 
             diag_metrics: Dict[str, float] = {}
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = engine(batch)
                 proxy_losses = _compute_bias_terms(outputs, batch)
-                domain_loss = proxy_losses["domain_loss"]
-                position_loss = proxy_losses["position_loss"]
                 low_recon_loss = proxy_losses["low_recon_loss"]
-                z_l2_loss = proxy_losses["z_l2_loss"]
                 nll_bin_loss = proxy_losses["nll_bin_loss"]
                 ttr_bin_loss = proxy_losses["ttr_bin_loss"]
                 length_bin_loss = proxy_losses["length_bin_loss"]
                 nll_bin_mae = proxy_losses.get("nll_bin_mae", outputs["lm_loss"].new_tensor(0.0))
                 ttr_bin_mae = proxy_losses.get("ttr_bin_mae", outputs["lm_loss"].new_tensor(0.0))
                 length_bin_mae = proxy_losses.get("length_bin_mae", outputs["lm_loss"].new_tensor(0.0))
+                vq_task_loss = outputs.get("vq_task_loss", outputs["lm_loss"].new_tensor(0.0))
+                vq_align_loss = outputs.get("vq_align_loss", outputs["lm_loss"].new_tensor(0.0))
+                vq_usage_loss = outputs.get(
+                    "vq_task_usage_loss", outputs["lm_loss"].new_tensor(0.0)
+                )
+                disentangle_loss = outputs.get("disentangle_loss", outputs["lm_loss"].new_tensor(0.0))
 
                 mask_loss = outputs.get(
                     "compact_mask_loss", outputs["lm_loss"].new_tensor(0.0)
@@ -1242,20 +1940,101 @@ def main() -> None:
                 consistency_loss = outputs.get(
                     "compact_con_loss", outputs["lm_loss"].new_tensor(0.0)
                 )
-                compression_loss = (
+                mask_group_loss = (
                     args.mask_loss_weight * mask_loss
                     + args.consistency_loss_weight * consistency_loss
                 )
+                compression_loss = (
+                    args.vq_task_weight * vq_task_loss * vq_commit_ramp
+                    + args.vq_align_weight * vq_align_loss
+                    + args.vq_usage_weight * vq_usage_loss * vq_commit_ramp
+                )
                 bias_loss = (
-                    args.eng_domain_weight * domain_loss
-                    + args.position_weight * position_loss
                     + args.low_recon_weight * low_recon_loss
-                    + args.z_l2_weight * z_l2_loss
                     + args.nll_bin_weight * nll_bin_loss
                     + args.ttr_bin_weight * ttr_bin_loss
                     + args.length_bin_weight * length_bin_loss
                 )
-                core_lm_loss = outputs["lm_loss"] + outputs["compact_kl_loss"]
+                core_lm_loss = outputs["lm_loss"] + kl_weight * outputs["compact_kl_loss"]
+            total_loss = (
+                core_lm_loss
+                + (args.mask_group_weight * mask_group_scale) * mask_group_loss
+                + lambda_compression * compression_loss
+                + lambda_bias * bias_loss
+                + disentangle_weight * disentangle_loss
+            )
+            if args.debug_loss_spike and rank == 0:
+                lm_loss_val = float(outputs["lm_loss"].detach().item())
+                ema_ref = ema_lm_loss if ema_lm_loss is not None else lm_loss_val
+                spike = False
+                if args.debug_loss_spike_threshold > 0:
+                    spike = spike or lm_loss_val >= float(args.debug_loss_spike_threshold)
+                if args.debug_loss_spike_multiplier > 0 and ema_ref > 0:
+                    spike = spike or lm_loss_val >= float(args.debug_loss_spike_multiplier) * ema_ref
+                if spike:
+                    labels = batch.get("lm_labels")
+                    attention = batch.get("lm_attention_mask")
+                    label_counts = None
+                    pad_ratio = None
+                    filtered = batch.get("debug_lm_filtered")
+                    filtered_count = 0
+                    if torch.is_tensor(filtered):
+                        filtered_count = int(filtered.sum().item())
+                    if torch.is_tensor(labels) and torch.is_tensor(attention):
+                        label_counts = labels.ne(-100).sum(dim=1).detach().cpu()
+                        pad_counts = attention.eq(0).sum(dim=1).detach().cpu()
+                        pad_ratio = pad_counts.float() / max(1, attention.size(1))
+                    truncated = batch.get("debug_lm_truncated")
+                    prompt_tokens = batch.get("debug_prompt_tokens")
+                    prompt_preview = batch.get("debug_prompt_preview")
+                    output_preview = batch.get("debug_output_preview")
+                    trunc_list = (
+                        truncated.detach().cpu().tolist()
+                        if torch.is_tensor(truncated)
+                        else None
+                    )
+                    prompt_tok_list = (
+                        prompt_tokens.detach().cpu().tolist()
+                        if torch.is_tensor(prompt_tokens)
+                        else None
+                    )
+                    _rank0_print(
+                        rank,
+                        "[loss spike] "
+                        f"step={step} lm_loss={lm_loss_val:.4f} total_loss={total_loss.item():.4f} "
+                        f"ema={ema_ref:.4f} "
+                        f"labels_mean={(label_counts.float().mean().item() if label_counts is not None else 0.0):.2f} "
+                        f"labels_min={(int(label_counts.min().item()) if label_counts is not None else 0)} "
+                        f"pad_ratio_mean={(pad_ratio.mean().item() if pad_ratio is not None else 0.0):.3f} "
+                        f"truncated={(sum(trunc_list) if trunc_list is not None else 0)} "
+                        f"filtered={filtered_count}",
+                    )
+                    if label_counts is not None:
+                        max_samples = max(1, int(args.debug_loss_spike_max_samples))
+                        idx = torch.argsort(label_counts, dim=0)
+                        for rank_idx in range(min(max_samples, idx.numel())):
+                            i = int(idx[rank_idx].item())
+                            label_count = int(label_counts[i].item())
+                            pad_r = float(pad_ratio[i].item()) if pad_ratio is not None else 0.0
+                            trunc_flag = trunc_list[i] if trunc_list is not None else 0
+                            prompt_tok = prompt_tok_list[i] if prompt_tok_list is not None else 0
+                            _rank0_print(
+                                rank,
+                                "[loss spike sample] "
+                                f"idx={i} label_tokens={label_count} pad_ratio={pad_r:.3f} "
+                                f"truncated={trunc_flag} prompt_tokens={prompt_tok}",
+                            )
+                            if prompt_preview is not None:
+                                _rank0_print(
+                                    rank,
+                                    f"[loss spike sample] prompt='{prompt_preview[i]}'",
+                                )
+                            if output_preview is not None:
+                                _rank0_print(
+                                    rank,
+                                    f"[loss spike sample] output='{output_preview[i]}'",
+                                )
+                ema_lm_loss = 0.95 * ema_ref + 0.05 * lm_loss_val
             if (
                 args.debug_aux_checks
                 and step % args.debug_aux_checks_interval == 0
@@ -1291,12 +2070,6 @@ def main() -> None:
             elif args.debug_aux_checks and step % args.debug_aux_checks_interval == 0:
                 diag_metrics["diag/grad_norm/skipped_checkpointing"] = 1.0
 
-            total_loss = (
-                core_lm_loss
-                + lambda_compression * compression_loss
-                + lambda_bias * bias_loss
-            )
-
             if args.bf16:
                 if total_loss.dtype != torch.float32:
                     total_loss = total_loss.float()
@@ -1323,49 +2096,18 @@ def main() -> None:
                 }
             engine.step()
 
-            if (
-                args.bias_decoder_steps > 1
-                and step >= grl_start
-                and accum_boundary
-            ):
-                for _ in range(args.bias_decoder_steps - 1):
-                    engine.zero_grad()
-                    bias_batch = dict(batch)
-                    bias_batch["grl_lambda"] = batch["lm_input_ids"].new_tensor(0.0)
-                    bias_batch["bias_detach"] = True
-                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        bias_outputs = engine(bias_batch)
-                        proxy_losses_b = _compute_bias_terms(bias_outputs, bias_batch)
-                        bias_loss_b = (
-                            args.eng_domain_weight * proxy_losses_b["domain_loss"]
-                            + args.position_weight * proxy_losses_b["position_loss"]
-                            + args.low_recon_weight * proxy_losses_b["low_recon_loss"]
-                            + args.z_l2_weight * proxy_losses_b["z_l2_loss"]
-                            + args.nll_bin_weight * proxy_losses_b["nll_bin_loss"]
-                            + args.ttr_bin_weight * proxy_losses_b["ttr_bin_loss"]
-                            + args.length_bin_weight * proxy_losses_b["length_bin_loss"]
-                        )
-                        bias_loss_b = bias_loss_b * lambda_bias
-                    if args.bf16:
-                        if bias_loss_b.dtype != torch.float32:
-                            bias_loss_b = bias_loss_b.float()
-                    elif model_dtype is not None and bias_loss_b.dtype != model_dtype:
-                        bias_loss_b = bias_loss_b.to(model_dtype)
-                    engine.backward(bias_loss_b)
-                    saved_sched = getattr(engine, "lr_scheduler", None)
-                    if saved_sched is not None:
-                        engine.lr_scheduler = None
-                    engine.step()
-                    if saved_sched is not None:
-                        engine.lr_scheduler = saved_sched
 
             totals["loss"] += total_loss.item()
             totals["lm_loss"] += outputs["lm_loss"].item()
             totals["compact_kl_loss"] += outputs["compact_kl_loss"].item()
-            totals["domain_loss"] += domain_loss.item()
-            totals["position_loss"] += position_loss.item()
             totals["low_recon_loss"] += low_recon_loss.item()
-            totals["z_l2_loss"] += z_l2_loss.item()
+            totals["vq_task_loss"] += vq_task_loss.item()
+            totals["vq_align_loss"] += vq_align_loss.item()
+            totals["vq_usage_loss"] += vq_usage_loss.item()
+            totals["disentangle_loss"] += disentangle_loss.item()
+            totals["vq_task_perplexity"] += float(outputs.get("vq_task_perplexity", 0.0))
+            totals["vq_task_dead_fraction"] += float(outputs.get("vq_task_dead_fraction", 0.0))
+            totals["vq_task_avg_distance"] += float(outputs.get("vq_task_avg_distance", 0.0))
             totals["nll_bin_loss"] += nll_bin_loss.item()
             totals["ttr_bin_loss"] += ttr_bin_loss.item()
             totals["length_bin_loss"] += length_bin_loss.item()
@@ -1374,8 +2116,21 @@ def main() -> None:
             totals["length_bin_mae"] += length_bin_mae.item()
             totals.setdefault("compression_loss", 0.0)
             totals["compression_loss"] += compression_loss.item()
+            totals["mask_group_loss"] += mask_group_loss.item()
             totals["mask_loss"] += mask_loss.item()
             totals["consistency_loss"] += consistency_loss.item()
+            drop_count = batch.get("debug_lm_drop_count")
+            drop_seen = batch.get("debug_lm_drop_seen")
+            drop_maxlen = batch.get("debug_lm_drop_maxlen_count")
+            drop_min_target = batch.get("debug_lm_drop_min_target_count")
+            if torch.is_tensor(drop_count):
+                totals["lm_drop_count"] += float(drop_count.item())
+            if torch.is_tensor(drop_seen):
+                totals["lm_drop_seen"] += float(drop_seen.item())
+            if torch.is_tensor(drop_maxlen):
+                totals["lm_drop_maxlen"] += float(drop_maxlen.item())
+            if torch.is_tensor(drop_min_target):
+                totals["lm_drop_min_target"] += float(drop_min_target.item())
             totals["steps"] += 1
             if tqdm_enabled and step % tqdm_every == 0:
                 epoch_loader.set_postfix(
@@ -1430,10 +2185,17 @@ def main() -> None:
                             "loss": total_loss.item(),
                             "lm_loss": outputs["lm_loss"].item(),
                             "compact_kl_loss": outputs["compact_kl_loss"].item(),
-                            "domain_loss": domain_loss.item(),
-                            "position_loss": position_loss.item(),
                             "low_recon_loss": low_recon_loss.item(),
-                            "z_l2_loss": z_l2_loss.item(),
+                            "vq_task_loss": vq_task_loss.item(),
+                            "vq_align_loss": vq_align_loss.item(),
+                            "vq_usage_loss": vq_usage_loss.item(),
+                            "disentangle_loss": disentangle_loss.item(),
+                            "vq/task_commitment_loss": float(outputs.get("vq_task_commitment_loss", 0.0)),
+                            "vq/task_codebook_loss": float(outputs.get("vq_task_codebook_loss", 0.0)),
+                            "vq/task_perplexity": float(outputs.get("vq_task_perplexity", 0.0)),
+                            "vq/task_usage_loss": float(outputs.get("vq_task_usage_loss", 0.0)),
+                            "vq/task_dead_fraction": float(outputs.get("vq_task_dead_fraction", 0.0)),
+                            "vq/task_avg_distance": float(outputs.get("vq_task_avg_distance", 0.0)),
                             "nll_bin_loss": nll_bin_loss.item(),
                             "ttr_bin_loss": ttr_bin_loss.item(),
                             "length_bin_loss": length_bin_loss.item(),
@@ -1449,17 +2211,35 @@ def main() -> None:
                             "compact/kl_loss": outputs["compact_kl_loss"].item(),
                             "weights/lambda_bias": lambda_bias,
                             "weights/lambda_compression": lambda_compression,
-                            "weights/grl_lambda": grl_lambda,
-                            "weights/bottleneck_noise_alpha": noise_alpha,
-                            "weights/eng_domain": args.eng_domain_weight,
-                            "weights/position": args.position_weight,
+                            "weights/kl_weight": kl_weight,
+                            "weights/keep_ratio": keep_ratio,
+                            "weights/z_task_dropout": z_dropout,
+                            "weights/vq_commit_scale": vq_commit_ramp,
                             "weights/low_recon": args.low_recon_weight,
-                            "weights/z_l2": args.z_l2_weight,
+                            "weights/vq_task": args.vq_task_weight,
+                            "weights/vq_usage": args.vq_usage_weight,
+                            "weights/vq_align": args.vq_align_weight,
+                            "weights/disentangle": disentangle_weight,
                             "weights/nll_bin": args.nll_bin_weight,
                             "weights/ttr_bin": args.ttr_bin_weight,
                             "weights/length_bin": args.length_bin_weight,
+                            "weights/mask_group": args.mask_group_weight * mask_group_scale,
+                            "weights/mask_group_scale": mask_group_scale,
                             "weights/mask_loss": args.mask_loss_weight,
                             "weights/consistency_loss": args.consistency_loss_weight,
+                            "data/lm_drop_count": float(drop_count.item()) if torch.is_tensor(drop_count) else 0.0,
+                            "data/lm_drop_seen": float(drop_seen.item()) if torch.is_tensor(drop_seen) else 0.0,
+                            "data/lm_drop_ratio": float(
+                                (drop_count.item() / drop_seen.item())
+                                if torch.is_tensor(drop_count) and torch.is_tensor(drop_seen) and drop_seen.item() > 0
+                                else 0.0
+                            ),
+                            "data/lm_drop_maxlen_count": float(drop_maxlen.item())
+                            if torch.is_tensor(drop_maxlen)
+                            else 0.0,
+                            "data/lm_drop_min_target_count": float(drop_min_target.item())
+                            if torch.is_tensor(drop_min_target)
+                            else 0.0,
                             **last_update_diag,
                             "batch/lm_tokens": lm_tokens,
                             "batch/original_tokens": original_tokens,
@@ -1494,6 +2274,11 @@ def main() -> None:
         if rank == 0:
             denom = max(1, totals["steps"])
             metrics = {k: (v / denom) if k != "steps" else v for k, v in totals.items()}
+            seen = totals.get("lm_drop_seen", 0.0)
+            if seen > 0:
+                metrics["lm_drop_ratio"] = totals.get("lm_drop_count", 0.0) / seen
+                metrics["lm_drop_maxlen_ratio"] = totals.get("lm_drop_maxlen", 0.0) / seen
+                metrics["lm_drop_min_target_ratio"] = totals.get("lm_drop_min_target", 0.0) / seen
             _rank0_print(rank, f"epoch={epoch} metrics={metrics}")
             if swanlab_client is not None:
                 epoch_metrics = {f"epoch/{k}": v for k, v in metrics.items() if k != "steps"}

@@ -26,7 +26,8 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_NVLS_DISABLE=1
 export NCCL_SHM_DISABLE=1
-export NCCL_P2P_LEVEL=LOC
+export NCCL_P2P_LEVEL=NVL
+export CUDA_LAUNCH_BLOCKING=1
 
 module load amd/gcc_compiler/11.3.0
 num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -38,8 +39,15 @@ echo "Detected ${num_gpus} GPUs"
 # python scripts/convet_to_hf.py
 ###
 
-deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
-    --config configs/finetune_deepspeed.yaml
+# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+#     --prefilter-long-prompts \
+#     --prefilter-long-prompts-log-samples 0 \
+#     --debug-lm-sample \
+#     --debug-lm-sample-max-tokens 16384 \
+#     --debug-loss-spike \
+#     --debug-loss-spike-threshold 20 \
+#     --debug-loss-spike-max-samples 3 \
+#     --config configs/finetune_deepspeed.yaml
 
 # python scripts/convert_zero_to_hf.py \
 #     --checkpoint-dir outputs/deepspeed/debug \
@@ -47,10 +55,10 @@ deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
 #     --config configs/finetune_deepspeed.yaml \
 #     --use-lora
 
-# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-#     --model outputs/deepspeed/main/hf-epoch-1/lm \
-#     --checkpoint outputs/deepspeed/main/hf-epoch-1/dibjudge \
-#     --output_dir results/Qwen3-4B-Base/main \
-#     --languages zh \
-#     --template prometheus \
-#     --tensor_parallel_size ${num_gpus}
+bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+    --model outputs/debug/hf-epoch-1/lm \
+    --checkpoint outputs/debug/hf-epoch-1/dibjudge \
+    --output_dir results/Qwen3-4B/debug \
+    --languages zh \
+    --template mr3_templates \
+    --tensor_parallel_size ${num_gpus}

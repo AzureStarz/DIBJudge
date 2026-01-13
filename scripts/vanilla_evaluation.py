@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
+import re
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from datasets import load_dataset
 
@@ -35,6 +37,8 @@ DEFAULT_USER_PROMPT = (
 
 DEFAULT_VERDICT_A = "[[A]]"
 DEFAULT_VERDICT_B = "[[B]]"
+QWEN3_SYSTEM_PREFIX = "You are Qwen3, an AI assistant that reasons, thinks, and answers strictly in English."
+_PRINTED_TEST_PROMPT = False
 
 
 class _SafeDict(dict):
@@ -85,8 +89,8 @@ def _load_template(
     template_name: Optional[str],
     verdict_a: Optional[str],
     verdict_b: Optional[str],
-) -> Tuple[Optional[str], str, str]:
-    template = None
+) -> Tuple[Optional[Union[str, Dict[str, object]]], str, str]:
+    template: Optional[Union[str, Dict[str, object]]] = None
     config_verdict_a = None
     config_verdict_b = None
     if template_name:
@@ -100,8 +104,15 @@ def _load_template(
         with open(candidate, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         template = data.get("template")
-        config_verdict_a = data.get("verdict_answer_A_pattern")
-        config_verdict_b = data.get("verdict_answer_B_pattern")
+        if template is None and isinstance(data, dict) and "general" in data:
+            template = data
+        if template is not None:
+            config_verdict_a = data.get("verdict_answer_A_pattern")
+            config_verdict_b = data.get("verdict_answer_B_pattern")
+    if template is not None and config_verdict_a is None and config_verdict_b is None:
+        if isinstance(template, dict) and "schema" in template:
+            config_verdict_a = "\"score\": \"Assistant A\""
+            config_verdict_b = "\"score\": \"Assistant B\""
     verdict_a = verdict_a or config_verdict_a or DEFAULT_VERDICT_A
     verdict_b = verdict_b or config_verdict_b or DEFAULT_VERDICT_B
     return template, verdict_a, verdict_b
@@ -127,9 +138,17 @@ def _render_default_prompt(
         apply = getattr(tokenizer, "apply_chat_template", None)
         if callable(apply):
             try:
-                return apply(messages, tokenize=False, add_generation_prompt=True)
+                return apply(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=True,
+                )
             except TypeError:
-                return apply(messages, tokenize=False)
+                try:
+                    return apply(messages, tokenize=False, add_generation_prompt=True)
+                except TypeError:
+                    return apply(messages, tokenize=False)
     return system_prompt + "\n\n" + user_prompt
 
 
@@ -153,7 +172,116 @@ def _render_template_prompt(
             "tgt_lang": tgt_lang,
         }
     )
-    return template.format_map(payload)
+    try:
+        return template.format_map(payload)
+    except ValueError:
+        return _safe_format_template(template, payload)
+
+
+def _safe_format_template(template: str, payload: Dict[str, object]) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key in payload:
+            return str(payload[key])
+        return match.group(0)
+
+    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+
+def _get_reproducible_rubric_str(rubric_list: Sequence[object], seed_value: object) -> str:
+    if not rubric_list:
+        return ""
+    seed_text = str(seed_value)
+    digest = hashlib.sha256(seed_text.encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(rubric_list)
+    rubric = rubric_list[idx]
+    if isinstance(rubric, dict):
+        preferred = ["Assistant A", "Assistant B", "Tie", "Both Bad"]
+        keys = [k for k in preferred if k in rubric]
+        keys.extend([k for k in rubric.keys() if k not in keys])
+        return "\n".join(f"{key}: {rubric[key]}" for key in keys)
+    if isinstance(rubric, (list, tuple)):
+        return "\n".join(str(item) for item in rubric)
+    return str(rubric)
+
+
+def _select_mr3_template_type(
+    templated_dict: Dict[str, object],
+    benchmark: str,
+    row: dict,
+) -> str:
+    if benchmark == "multilingual-reward-bench":
+        data_source = str(row.get("category") or row.get("subset") or "")
+    else:
+        data_source = str(row.get("subset") or "")
+    data_source = data_source.strip().lower()
+    if "chat" in data_source:
+        return "general"
+    if data_source and data_source in templated_dict:
+        return data_source
+    for key in templated_dict:
+        if key in {"schema", "tags", "general"}:
+            continue
+        if key in data_source:
+            return key
+    return "general"
+
+
+def _render_mr3_prompt(
+    tokenizer,
+    templated_dict: Dict[str, object],
+    template_type: str,
+    question: str,
+    answer_a: str,
+    answer_b: str,
+    row_id: object,
+) -> str:
+    instruction_msg = str(templated_dict.get("instruction_msg") or "Instruction")
+    rubric_list = templated_dict.get(template_type, {}).get("rubric_list", [])
+    shuffled_rubric = _get_reproducible_rubric_str(rubric_list, row_id)
+    task_description = templated_dict.get(template_type, {}).get("task_description", "")
+    tags = templated_dict.get("tags", {})
+    schema = templated_dict.get(template_type, {}).get("schema")
+    if not schema:
+        schema = templated_dict.get("schema", {})
+    developer_text = (
+        f"{QWEN3_SYSTEM_PREFIX}\n\n"
+        f"# {instruction_msg}\n"
+        f"{task_description}\n\n"
+        f"# {tags.get('evaluation_rubric_tag', 'Evaluation Rubric')}\n"
+        f"{shuffled_rubric}\n\n"
+        f"# {tags.get('response_format_tag', 'Response Format')}\n\n"
+        f"{schema}"
+    )
+    user_text = (
+        f"# {tags.get('input_tag', 'Input')}\n"
+        f"{question}\n\n"
+        "# Assistant A\n"
+        f"{answer_a}\n\n"
+        "# Assistant B\n"
+        f"{answer_b}\n\n"
+        f"# {tags.get('your_response_tag', 'Your Response')}\n"
+    )
+    messages = [
+        {"role": "system", "content": developer_text},
+        {"role": "user", "content": user_text},
+    ]
+    if tokenizer is not None:
+        apply = getattr(tokenizer, "apply_chat_template", None)
+        if callable(apply):
+            try:
+                return apply(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=True,
+                )
+            except TypeError:
+                try:
+                    return apply(messages, tokenize=False, add_generation_prompt=True)
+                except TypeError:
+                    return apply(messages, tokenize=False)
+    return developer_text + "\n\n" + user_text
 
 
 def _load_mm_eval(local_dir: str):
@@ -262,7 +390,7 @@ def _resolve_mreward_languages(
 
 def _build_task(
     row: dict,
-    template: Optional[str],
+    template: Optional[Union[str, Dict[str, object]]],
     tokenizer,
     rng: random.Random,
     benchmark: str,
@@ -283,9 +411,21 @@ def _build_task(
     src_lang = str(language_override or row.get("language", ""))
     tgt_lang = src_lang
     if template:
-        prompt = _render_template_prompt(
-            template, question, answer_a, answer_b, src_lang, tgt_lang
-        )
+        if isinstance(template, dict):
+            template_type = _select_mr3_template_type(template, benchmark, row)
+            prompt = _render_mr3_prompt(
+                tokenizer,
+                template,
+                template_type,
+                question,
+                answer_a,
+                answer_b,
+                row.get("id"),
+            )
+        else:
+            prompt = _render_template_prompt(
+                template, question, answer_a, answer_b, src_lang, tgt_lang
+            )
     else:
         prompt = _render_default_prompt(
             tokenizer, question, answer_a, answer_b, src_lang, tgt_lang
@@ -297,11 +437,17 @@ def _build_task(
         "prompt": question,
         "answer_a": answer_a,
         "answer_b": answer_b,
+        "subset": row.get("subset"),
+        "category": row.get("category"),
         "chosen_model": row.get("chosen_model"),
         "rejected_model": row.get("rejected_model"),
         "expected_verdict": expected,
         "swapped": swap,
     }
+    global _PRINTED_TEST_PROMPT
+    if not _PRINTED_TEST_PROMPT:
+        print("[test] final_prompt:\n", prompt)
+        _PRINTED_TEST_PROMPT = True
     return prompt, meta
 
 
@@ -391,6 +537,15 @@ def _init_transformers(
     )
     model_obj.eval()
     return model_obj, tokenizer
+
+
+def _init_tokenizer_only(model: str, trust_remote_code: bool):
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 def _generate_transformers(
@@ -610,16 +765,21 @@ def main() -> None:
         default=True,
     )
     parser.add_argument("--batch_size", type=int, default=8192)
-    parser.add_argument("--max_tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--top_k", type=int, default=-1)
+    parser.add_argument("--max_tokens", type=int, default=16384)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--max_model_len", type=int, default=None)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--debug-prompt-only",
+        action="store_true",
+        help="Print one constructed prompt and exit without running evaluation.",
+    )
     parser.add_argument(
         "--reuse_results",
         action=argparse.BooleanOptionalAction,
@@ -675,6 +835,47 @@ def main() -> None:
 
     if not expected_groups:
         raise ValueError("No evaluation prompts were built for the selected benchmarks.")
+
+    if args.debug_prompt_only:
+        tokenizer = None
+        if args.model:
+            try:
+                tokenizer = _init_tokenizer_only(
+                    args.model, trust_remote_code=args.trust_remote_code
+                )
+            except Exception as exc:
+                print(f"[warn] failed to load tokenizer: {exc}")
+                tokenizer = None
+        global _PRINTED_TEST_PROMPT
+        _PRINTED_TEST_PROMPT = True
+        prompt = None
+        if mm_grouped is not None:
+            lang = mm_selected[0] if mm_selected else next(iter(mm_grouped.keys()))
+            rows = mm_grouped[lang]
+            if not rows:
+                raise ValueError("MM-Eval has no rows to build a debug prompt.")
+            prompt, _ = _build_task(
+                rows[0], template, tokenizer, rng, "MM-Eval", language_override=lang
+            )
+        elif mreward_pairs:
+            mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
+            lang, display_lang = mreward_pairs[0]
+            dataset = _load_mreward_language(mreward_dir, lang)
+            rows = list(dataset)
+            if not rows:
+                raise ValueError("multilingual-reward-bench has no rows to build a debug prompt.")
+            prompt, _ = _build_task(
+                rows[0],
+                template,
+                tokenizer,
+                rng,
+                "multilingual-reward-bench",
+                language_override=display_lang,
+            )
+        else:
+            raise ValueError("No datasets loaded to build a debug prompt.")
+        print(prompt)
+        return
 
     raw_by_group: Dict[Tuple[str, str], List[dict]] = {}
     parsed_by_group: Dict[Tuple[str, str], List[dict]] = {}

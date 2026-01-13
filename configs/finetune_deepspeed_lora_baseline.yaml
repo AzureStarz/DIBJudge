@@ -2,7 +2,7 @@
 lm: model/Qwen3-4B
 
 # data config
-data_path: data/mr3_preprocessed.jsonl
+data_path: data/train_data/mr3_preprocessed.jsonl
 per_device_train_batch_size: 1
 num_workers: 0
 max_lm_len: 16384
@@ -11,8 +11,8 @@ append_eos: true
 # runtime config
 epochs: 3
 deepspeed_config: configs/deepspeed/ds_z2_config.json
-output_dir: outputs/deepspeed/lora_mR3_baseline
-log_dir: logs/deepspeed/lora_mR3_baseline
+output_dir: outputs/Qwen3-4B_mR3_baseline_vanilla_LoRA
+log_dir: logs/Qwen3-4B_mR3_baseline_vanilla_LoRA
 save_every_steps: 0
 save_at_end: true
 bf16: true

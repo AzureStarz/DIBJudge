@@ -9,6 +9,7 @@ import warnings
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
@@ -62,6 +63,82 @@ def _maybe_tqdm(iterable, rank: int, desc: str):
         return iterable
     total = len(iterable) if hasattr(iterable, "__len__") else None
     return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+
+
+class CheckpointedCausalLM(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, use_reentrant: bool = True) -> None:
+        super().__init__()
+        self.model = model
+        self.use_reentrant = bool(use_reentrant)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        if not self.training or not torch.is_grad_enabled():
+            return self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        if input_ids is None:
+            return self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        embed_layer = self.model.get_input_embeddings()
+        if embed_layer is None:
+            return self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        inputs_embeds = embed_layer(input_ids)
+        if not inputs_embeds.requires_grad:
+            inputs_embeds = inputs_embeds.detach().requires_grad_(True)
+        if labels is None:
+            def _run_logits(lm_embeds, lm_attention):
+                out = self.model(
+                    inputs_embeds=lm_embeds,
+                    attention_mask=lm_attention,
+                    labels=None,
+                    use_cache=False,
+                    **kwargs,
+                )
+                return out.logits
+
+            logits = checkpoint(
+                _run_logits,
+                inputs_embeds,
+                attention_mask,
+                use_reentrant=self.use_reentrant,
+            )
+            return {"loss": None, "logits": logits}
+
+        def _run(lm_embeds, lm_attention, lm_labels):
+            out = self.model(
+                inputs_embeds=lm_embeds,
+                attention_mask=lm_attention,
+                labels=lm_labels,
+                use_cache=False,
+                **kwargs,
+            )
+            return out.loss, out.logits
+
+        loss, logits = checkpoint(
+            _run,
+            inputs_embeds,
+            attention_mask,
+            labels,
+            use_reentrant=self.use_reentrant,
+        )
+        return {"loss": loss, "logits": logits}
+
+    def __getattr__(self, name: str):
+        if name in {"model", "use_reentrant"}:
+            return super().__getattr__(name)
+        return getattr(self.model, name)
 
 
 def _load_yaml_config(path: str, parser: argparse.ArgumentParser) -> dict:
@@ -210,6 +287,7 @@ def _save_hf_checkpoint(
     _rank0_print(rank, f"[hf] extracting LM from {checkpoint_dir} tag={tag}")
     raw_state = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
     state_dict = _normalize_state_dict(raw_state)
+    state_dict = _strip_prefix_if_present(state_dict, "model.")
 
     if args.use_lora:
         merged = _merge_lora_into_lm_state(state_dict, args, rank)
@@ -406,6 +484,12 @@ def main() -> None:
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument(
+        "--checkpoint-reentrant",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use reentrant activation checkpointing in the custom wrapper.",
+    )
+    parser.add_argument(
         "--torch-autocast",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -500,12 +584,15 @@ def main() -> None:
     )
 
     model = AutoModelForCausalLM.from_pretrained(args.lm)
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        if hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
     _maybe_resize_embeddings(model, tokenizer, "lm", rank)
     model = _maybe_apply_lora(model, args, rank)
+    if args.gradient_checkpointing:
+        model = CheckpointedCausalLM(model, use_reentrant=bool(args.checkpoint_reentrant))
+        _rank0_print(
+            rank,
+            "[stage done] custom checkpointing enabled "
+            f"(reentrant={bool(args.checkpoint_reentrant)})",
+        )
 
     optimizer_params = _build_optimizer_params(
         model,

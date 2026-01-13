@@ -51,55 +51,6 @@ def compute_proxy_losses(
     else:
         response_mask = None
 
-    domain_logits = outputs.get("domain_logits")
-    if domain_logits is None:
-        losses["domain_loss"] = outputs["lm_loss"].new_tensor(0.0)
-    else:
-        half = domain_logits.size(0) // 2
-        domain_labels = torch.cat(
-            [
-                torch.zeros(half, device=domain_logits.device, dtype=torch.long),
-                torch.ones(domain_logits.size(0) - half, device=domain_logits.device, dtype=torch.long),
-            ],
-            dim=0,
-        )
-        weight = None
-        counts = torch.bincount(domain_labels, minlength=2).float()
-        if torch.all(counts > 0):
-            weight = (counts.sum() / (2.0 * counts)).clamp(max=5.0)
-            weight = weight.to(domain_logits.device)
-        if response_mask is not None and domain_logits.size(0) == response_mask.numel() * 2:
-            domain_mask = response_mask.to(domain_logits.device).repeat(2)
-            if domain_mask.any():
-                masked_logits = domain_logits[domain_mask]
-                masked_labels = domain_labels[domain_mask]
-                counts = torch.bincount(masked_labels, minlength=2).float()
-                weight = None
-                if torch.all(counts > 0):
-                    weight = (counts.sum() / (2.0 * counts)).clamp(max=5.0)
-                    weight = weight.to(domain_logits.device)
-                losses["domain_loss"] = F.cross_entropy(
-                    masked_logits.float(), masked_labels, weight=weight
-                )
-            else:
-                losses["domain_loss"] = outputs["lm_loss"].new_tensor(0.0)
-        else:
-            losses["domain_loss"] = F.cross_entropy(domain_logits.float(), domain_labels, weight=weight)
-
-    position_logits = outputs.get("position_logits")
-    position_labels = batch.get("proxy_position_label")
-    if position_logits is None or position_labels is None:
-        losses["position_loss"] = outputs["lm_loss"].new_tensor(0.0)
-    else:
-        labels = position_labels.view(-1).to(position_logits.device).long()
-        mask = labels.ne(-100)
-        if response_mask is not None:
-            mask = mask & response_mask.to(position_logits.device)
-        if mask.any():
-            losses["position_loss"] = F.cross_entropy(position_logits[mask].float(), labels[mask])
-        else:
-            losses["position_loss"] = outputs["lm_loss"].new_tensor(0.0)
-
     low_recon_pred = outputs.get("low_recon_pred")
     low_recon_target = outputs.get("low_recon_target")
     if low_recon_pred is None or low_recon_target is None:
@@ -111,8 +62,6 @@ def compute_proxy_losses(
             losses["low_recon_loss"] = diff[mask].mean() if mask.any() else outputs["lm_loss"].new_tensor(0.0)
         else:
             losses["low_recon_loss"] = diff.mean()
-
-    losses["z_l2_loss"] = outputs.get("z_l2_loss", outputs["lm_loss"].new_tensor(0.0))
 
     length_logits = outputs.get("length_bin_logits")
     length_labels = batch.get("proxy_length_label")
