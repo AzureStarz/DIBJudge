@@ -1219,7 +1219,7 @@ def main() -> None:
         default=True,
     )
     parser.add_argument("--batch_size", type=int, default=8192)
-    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--max_tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)

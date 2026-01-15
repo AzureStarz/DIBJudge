@@ -43,8 +43,8 @@ require_both_responses: true # drop samples with empty response_B when response_
 max_training_samples: 10000 # cap the number of training samples (0 = no cap)
 per_device_train_batch_size: 1 # micro-batch size per GPU
 num_workers: 4 # dataloader worker processes
-max_response_len: 8192 # max token length for response branch inputs
-max_lm_len: 16384 # max token length for LM inputs
+max_response_len: 4096 # max token length for response branch inputs
+max_lm_len: 8192 # max token length for LM inputs
 prefilter_long_prompts: true # drop samples with prompt_len >= max_lm_len before training
 prefilter_long_prompts_log_samples: 0 # number of dropped prompt samples to log
 prefilter_long_prompts_preview: 120 # max characters to show for dropped prompt previews
@@ -62,17 +62,17 @@ proxy_soft_labels: true # use soft labels for proxy bin losses
 
 # runtime config
 epochs: 1 # number of training epochs
-deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
+deepspeed_config: configs/deepspeed/ds_z2_config.json # DeepSpeed json config path
 output_dir: outputs/default # checkpoint output directory
 log_dir: logs/default # log output directory
 save_every_steps: 0 # checkpoint save interval (0 = disabled)
 save_at_end: true # save a checkpoint at end of training
 bf16: true # enable bfloat16 training
 allow_tf32: true # enable TF32 matmul kernels for speed
-gradient_checkpointing: false # enable gradient checkpointing
+gradient_checkpointing: true # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
 lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
-compact_kl_chunk_size: 256 # optional chunk size for compact KL (0 = disabled)
+compact_kl_chunk_size: 128 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
 swanlab_run_name: default # SwanLab run name

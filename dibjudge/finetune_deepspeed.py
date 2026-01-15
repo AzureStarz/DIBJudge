@@ -665,6 +665,44 @@ def _save_state_dict(
     return path
 
 
+def _resolve_hf_save_dtype(args: argparse.Namespace) -> Optional[torch.dtype]:
+    raw = getattr(args, "hf_save_dtype", None)
+    if raw is None:
+        raw = "auto"
+    raw = str(raw).strip().lower()
+    if raw in {"", "none", "disable", "disabled"}:
+        return None
+    if raw == "auto":
+        return torch.bfloat16 if bool(getattr(args, "bf16", False)) else torch.float32
+    mapping = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    return mapping.get(raw)
+
+
+def _cast_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    dtype: Optional[torch.dtype],
+) -> Dict[str, torch.Tensor]:
+    if dtype is None:
+        return state_dict
+    casted: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if not torch.is_tensor(value):
+            casted[key] = value
+            continue
+        if value.is_floating_point():
+            casted[key] = value.detach().to(dtype=dtype).cpu()
+        else:
+            casted[key] = value.detach().cpu()
+    return casted
+
+
 def _save_lm_assets(output_dir: str, args: argparse.Namespace, rank: int) -> None:
     try:
         lm_tok = AutoTokenizer.from_pretrained(
@@ -896,6 +934,9 @@ def _save_hf_from_zero(
         _rank0_print(rank, "[warn] HF export skipped: no model states found.")
         return
     state_dict = _normalize_state_dict(raw_state)
+    save_dtype = _resolve_hf_save_dtype(args)
+    if save_dtype is not None:
+        _rank0_print(rank, f"[hf] saving checkpoint dtype={save_dtype}")
 
     dibjudge_state = {
         key: value for key, value in state_dict.items() if not key.startswith("judge_lm.")
@@ -962,7 +1003,8 @@ def _save_hf_from_zero(
                 _rank0_print(rank, f"[warn] missing keys while loading LM: {len(missing)}")
             if unexpected:
                 _rank0_print(rank, f"[warn] unexpected keys while loading LM: {len(unexpected)}")
-            lm_model.save_pretrained(lm_dir)
+            lm_state_to_save = _cast_state_dict(lm_state, save_dtype)
+            lm_model.save_pretrained(lm_dir, state_dict=lm_state_to_save)
             _save_lm_assets(lm_dir, args, rank)
     else:
         _rank0_print(rank, "[warn] no judge_lm weights found for LM export.")
@@ -1016,6 +1058,7 @@ def _save_hf_from_zero(
         payload["z_soft_prompt"] = not bool(args.disable_z_prompt_insertion)
         payload["use_compactor"] = not bool(args.disable_compactor)
         json.dump(payload, handle, indent=2)
+    dibjudge_state = _cast_state_dict(dibjudge_state, save_dtype)
     _save_state_dict(dibjudge_state, dibjudge_dir, rank)
     _save_encoder_tokenizer(dibjudge_dir, args, rank)
 
@@ -1705,6 +1748,11 @@ def main() -> None:
     parser.add_argument("--swanlab-run-name", default=None)
     parser.add_argument("--swanlab-tags", default=None)
     parser.add_argument("--swanlab-log-steps", type=int, default=10)
+    parser.add_argument(
+        "--hf-save-dtype",
+        default="auto",
+        help="HF export dtype (auto|float32|bfloat16|float16).",
+    )
     parser.add_argument("--config", default=None, help="YAML config file to load defaults from.")
     parser.add_argument(
         "--save-config",
@@ -2067,7 +2115,7 @@ def main() -> None:
     _rank0_print(rank, "[stage done] lora applied" if args.use_lora else "[stage done] lora skipped")
     if args.gradient_checkpointing:
         lm_trainable = any(param.requires_grad for param in model.judge_lm.parameters())
-        encoder_ckpt = str(args.encoder_trainable).lower() == "all"
+        encoder_ckpt = any(param.requires_grad for param in model.shared_encoder.parameters())
         model.set_gradient_checkpointing(
             encoder=encoder_ckpt,
             lm=lm_trainable,
@@ -2529,7 +2577,29 @@ def main() -> None:
             elif model_dtype is not None and total_loss.dtype != model_dtype:
                 total_loss = total_loss.to(model_dtype)
 
-            engine.backward(total_loss)
+            sequence_len = 0
+            lm_attention = batch.get("lm_attention_mask")
+            if torch.is_tensor(lm_attention):
+                sequence_len = int(lm_attention.size(-1))
+            else:
+                lm_ids = batch.get("lm_input_ids")
+                if torch.is_tensor(lm_ids):
+                    sequence_len = int(lm_ids.size(-1))
+
+            try:
+                engine.backward(total_loss)
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "out of memory" not in msg and "cublas_status_alloc_failed" not in msg:
+                    raise
+                exc_msg = str(exc).splitlines()[0] if exc else "CUDA out of memory"
+                print(
+                    f"[warn] OOM error occurred | sequence_len={sequence_len} | details={exc_msg}"
+                )
+                engine.zero_grad()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             if args.debug_aux_checks and accum_boundary:
                 total_params = [p for p in engine.module.parameters() if p.requires_grad]
                 total_norm = _param_grad_norm(total_params, total_loss.device)

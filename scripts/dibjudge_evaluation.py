@@ -1192,7 +1192,7 @@ def main() -> None:
         default=256,
         help="Batch size for building prompt embeddings (smaller uses less memory).",
     )
-    parser.add_argument("--max_tokens", type=int, default=16384)
+    parser.add_argument("--max_tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
