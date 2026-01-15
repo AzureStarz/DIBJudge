@@ -20,10 +20,15 @@ export NCCL_IB_DISABLE=1
 export NCCL_NVLS_DISABLE=1
 export NCCL_SHM_DISABLE=1
 export NCCL_P2P_LEVEL=LOC
-export OMP_NUM_THREADS=1
+export OMP_NUM_THREADS=8
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
+
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
+PADDING_SIDE="${PADDING_SIDE:-left}"
+DTYPE="${DTYPE:-bfloat16}"
+ALLOW_TF32="${ALLOW_TF32:-1}"
 
 module load amd/gcc_compiler/11.3.0
 num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -59,7 +64,11 @@ if [[ "$NUM_SHARDS" -le 1 ]]; then
     --output "$OUTPUT_PATH" \
     --batch-size 4 \
     --max-length 16384 \
-    --trust-remote-code
+    --trust-remote-code \
+    --attn-implementation "$ATTN_IMPL" \
+    --padding-side "$PADDING_SIDE" \
+    --dtype "$DTYPE" \
+    $( [[ "$ALLOW_TF32" == "1" ]] && printf '%s' "--allow-tf32" )
   exit 0
 fi
 
@@ -78,6 +87,10 @@ for ((i=0; i<NUM_SHARDS; i++)); do
         --batch-size 4 \
         --max-length 16384 \
         --trust-remote-code \
+        --attn-implementation "$ATTN_IMPL" \
+        --padding-side "$PADDING_SIDE" \
+        --dtype "$DTYPE" \
+        $( [[ "$ALLOW_TF32" == "1" ]] && printf '%s' "--allow-tf32" ) \
         --num-shards "$NUM_SHARDS" \
         --shard-index "$i" &
   else
@@ -89,6 +102,10 @@ for ((i=0; i<NUM_SHARDS; i++)); do
         --batch-size 4 \
         --max-length 16384 \
         --trust-remote-code \
+        --attn-implementation "$ATTN_IMPL" \
+        --padding-side "$PADDING_SIDE" \
+        --dtype "$DTYPE" \
+        $( [[ "$ALLOW_TF32" == "1" ]] && printf '%s' "--allow-tf32" ) \
         --num-shards "$NUM_SHARDS" \
         --shard-index "$i" &
   fi

@@ -8,13 +8,14 @@ import random
 import sys
 import warnings
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import EmbedsPrompt
 
+import eval_stats
 if __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -108,19 +109,83 @@ def _resolve_encoder_name(
     )
 
 
+def _resolve_attn_impl(config: Optional[dict], override: Optional[str]) -> Optional[str]:
+    if override:
+        value = str(override).strip()
+        return value.lower() if value else None
+    if config:
+        value = config.get("attn_implementation")
+        if value:
+            return str(value).strip().lower()
+    return None
+
+
+def _resolve_padding_side(
+    config: Optional[dict], override: Optional[str], attn_impl: Optional[str]
+) -> str:
+    if override:
+        return override
+    if config:
+        value = config.get("padding_side")
+        if value:
+            return str(value).strip().lower()
+    if attn_impl == "flash_attention_2":
+        return "left"
+    return "right"
+
+
 def _load_dibjudge_bundle(
     checkpoint: str,
     judge_encoder: Optional[str],
     device: torch.device,
     dtype: torch.dtype,
     trust_remote_code: bool,
+    attn_implementation: Optional[str],
 ) -> DIBJudgePromptBundle:
     config = _load_checkpoint_config(checkpoint)
     encoder_name = _resolve_encoder_name(config, judge_encoder, checkpoint)
     state = _load_checkpoint_state(checkpoint)
     return DIBJudgePromptBundle(
-        encoder_name, state, device, dtype, trust_remote_code, config=config
+        encoder_name,
+        state,
+        device,
+        dtype,
+        trust_remote_code,
+        config=config,
+        attn_implementation=attn_implementation,
     )
+
+
+def _prompt_has_embeds(prompt: object) -> bool:
+    if isinstance(prompt, dict):
+        return "prompt_embeds" in prompt
+    return hasattr(prompt, "prompt_embeds")
+
+
+def _extract_prompt_embeds(prompt: object) -> Optional[torch.Tensor]:
+    if isinstance(prompt, dict):
+        embeds = prompt.get("prompt_embeds")
+    else:
+        embeds = getattr(prompt, "prompt_embeds", None)
+    return embeds if torch.is_tensor(embeds) else None
+
+
+def _append_prompt_log(path: str, prompts: List[object], start_idx: int) -> int:
+    if not path:
+        return start_idx
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    next_idx = start_idx
+    with open(path, "a", encoding="utf-8") as handle:
+        for prompt in prompts:
+            if _prompt_has_embeds(prompt):
+                embeds = _extract_prompt_embeds(prompt)
+                shape = tuple(embeds.shape) if embeds is not None else None
+                payload = {"idx": next_idx, "type": "embeds", "shape": shape}
+            else:
+                payload = {"idx": next_idx, "type": "text", "prompt": str(prompt)}
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            next_idx += 1
+    return next_idx
 
 
 def _infer_branch_mlp_config(
@@ -152,12 +217,44 @@ class DIBJudgePromptBundle(torch.nn.Module):
         dtype: torch.dtype,
         trust_remote_code: bool,
         config: Optional[dict] = None,
+        attn_implementation: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.config = config or {}
-        self.shared_encoder = AutoModel.from_pretrained(
-            encoder_name, trust_remote_code=trust_remote_code
-        )
+        if attn_implementation:
+            try:
+                self.shared_encoder = AutoModel.from_pretrained(
+                    encoder_name,
+                    trust_remote_code=trust_remote_code,
+                    attn_implementation=attn_implementation,
+                    torch_dtype=dtype,
+                )
+            except TypeError:
+                warnings.warn(
+                    f"attn_implementation={attn_implementation} unsupported for {encoder_name}; "
+                    "falling back to default attention.",
+                    RuntimeWarning,
+                )
+                self.shared_encoder = AutoModel.from_pretrained(
+                    encoder_name,
+                    trust_remote_code=trust_remote_code,
+                    torch_dtype=dtype,
+                )
+            except ImportError as exc:
+                warnings.warn(
+                    f"attn_implementation={attn_implementation} unavailable for {encoder_name}: {exc}. "
+                    "Falling back to default attention.",
+                    RuntimeWarning,
+                )
+                self.shared_encoder = AutoModel.from_pretrained(
+                    encoder_name,
+                    trust_remote_code=trust_remote_code,
+                    torch_dtype=dtype,
+                )
+        else:
+            self.shared_encoder = AutoModel.from_pretrained(
+                encoder_name, trust_remote_code=trust_remote_code, torch_dtype=dtype
+            )
         self.shared_encoder.to(device)
         self.shared_encoder.eval()
         enc_hidden = getattr(self.shared_encoder.config, "hidden_size", None)
@@ -178,6 +275,9 @@ class DIBJudgePromptBundle(torch.nn.Module):
         layers, hidden_dim, _first_idx, dropout = _infer_branch_mlp_config(state, "task_mlp.")
         if hidden_dim <= 0:
             hidden_dim = 2 * enc_hidden
+        norm_type = "rms" if bool(self.config.get("use_rms_norm", False)) else "layernorm"
+        norm_eps = float(self.config.get("rms_norm_eps", 1e-6))
+        use_swiglu = bool(self.config.get("use_swiglu", False))
         self.task_mlp = BranchMLP(
             enc_hidden,
             z_dim,
@@ -185,6 +285,9 @@ class DIBJudgePromptBundle(torch.nn.Module):
             hidden_dim=hidden_dim,
             layers=layers,
             dropout=dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
         codebook = state.get("vq_task.codebook")
         if codebook is None:
@@ -247,6 +350,9 @@ class DIBJudgePromptBundle(torch.nn.Module):
                 hidden_dim=compact_hidden,
                 layers=compact_layers,
                 dropout=compact_dropout,
+                norm_type=norm_type,
+                norm_eps=norm_eps,
+                use_swiglu=use_swiglu,
             )
 
         shared_state = {
@@ -324,19 +430,30 @@ def _pad_pair(
     b_ids: torch.Tensor,
     b_mask: torch.Tensor,
     pad_id: int,
+    pad_side: str = "right",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if pad_side not in {"left", "right"}:
+        pad_side = "right"
     max_len = max(a_ids.size(1), b_ids.size(1))
     if a_ids.size(1) != max_len:
         padded = a_ids.new_full((a_ids.size(0), max_len), pad_id)
         padded_mask = a_mask.new_zeros((a_mask.size(0), max_len))
-        padded[:, : a_ids.size(1)] = a_ids
-        padded_mask[:, : a_mask.size(1)] = a_mask
+        if pad_side == "left":
+            padded[:, -a_ids.size(1) :] = a_ids
+            padded_mask[:, -a_mask.size(1) :] = a_mask
+        else:
+            padded[:, : a_ids.size(1)] = a_ids
+            padded_mask[:, : a_mask.size(1)] = a_mask
         a_ids, a_mask = padded, padded_mask
     if b_ids.size(1) != max_len:
         padded = b_ids.new_full((b_ids.size(0), max_len), pad_id)
         padded_mask = b_mask.new_zeros((b_mask.size(0), max_len))
-        padded[:, : b_ids.size(1)] = b_ids
-        padded_mask[:, : b_mask.size(1)] = b_mask
+        if pad_side == "left":
+            padded[:, -b_ids.size(1) :] = b_ids
+            padded_mask[:, -b_mask.size(1) :] = b_mask
+        else:
+            padded[:, : b_ids.size(1)] = b_ids
+            padded_mask[:, : b_mask.size(1)] = b_mask
         b_ids, b_mask = padded, padded_mask
     return a_ids, a_mask, b_ids, b_mask
 
@@ -415,7 +532,10 @@ def _build_prompt_embeds(
         pad_id = lm_tokenizer.pad_token_id
         if pad_id is None:
             pad_id = lm_tokenizer.eos_token_id or 0
-        a_ids, a_mask, b_ids, b_mask = _pad_pair(a_ids, a_mask, b_ids, b_mask, pad_id)
+        pad_side = getattr(lm_tokenizer, "padding_side", "right")
+        a_ids, a_mask, b_ids, b_mask = _pad_pair(
+            a_ids, a_mask, b_ids, b_mask, pad_id, pad_side=pad_side
+        )
         a_ids = a_ids.to(device)
         a_mask = a_mask.to(device)
         b_ids = b_ids.to(device)
@@ -522,6 +642,8 @@ def _build_prompt_embeds_batch(
     input_ids = enc["input_ids"]
     attention_mask = enc["attention_mask"]
     offsets = enc.get("offset_mapping")
+    pad_side = getattr(lm_tokenizer, "padding_side", "right")
+    left_padding = pad_side == "left"
 
     inputs_embeds = lm_embed(input_ids).to(device=device, dtype=dtype)
 
@@ -552,14 +674,15 @@ def _build_prompt_embeds_batch(
         length = int(attention_mask[i].sum().item())
         if length <= 0:
             length = inputs_embeds.size(1)
-        embeds = inputs_embeds[i, :length]
-        attn = attention_mask[i, :length].to(device=device)
+        start = inputs_embeds.size(1) - length if left_padding else 0
+        embeds = inputs_embeds[i, start : start + length]
+        attn = attention_mask[i, start : start + length].to(device=device)
         offsets_i = None
         if offsets is not None:
             if torch.is_tensor(offsets):
-                offsets_i = offsets[i, :length]
+                offsets_i = offsets[i, start : start + length]
             else:
-                offsets_i = offsets[i][:length]
+                offsets_i = offsets[i][start : start + length]
 
         response_types = _build_response_token_types(
             prompt, responses_a[i], responses_b[i], offsets_i, embeds.size(0)
@@ -591,7 +714,7 @@ def _build_prompt_embeds_batch(
             )
 
         if bundle is None or not use_compactor:
-            embeds_list.append(embeds)
+            embeds_list.append(embeds.detach().cpu())
             continue
 
         prompt_mask = attn.bool()
@@ -620,241 +743,47 @@ def _build_prompt_embeds_batch(
         mu_ids = torch.tensor([mu_id], device=lm_embed.weight.device)
         mu_embed = lm_embed(mu_ids).to(device=embeds.device, dtype=embeds.dtype).view(1, -1)
         masked_embeds = m.unsqueeze(-1) * embeds + (1.0 - m).unsqueeze(-1) * mu_embed
-        embeds_list.append(masked_embeds)
+        embeds_list.append(masked_embeds.detach().cpu())
     return embeds_list
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="DIBJudge evaluation with vLLM embeds.")
-    parser.add_argument("--model", required=True)
-    parser.add_argument(
-        "--checkpoint",
-        required=True,
-        help="Path to DIBJudge HF checkpoint directory or a state dict file.",
-    )
-    parser.add_argument(
-        "--judge-encoder",
-        default=None,
-        help="Fallback encoder name when checkpoint config is missing.",
-    )
-    parser.add_argument(
-        "--benchmark",
-        default="both",
-        choices=["MM-Eval", "multilingual-reward-bench", "both"],
-    )
-    parser.add_argument(
-        "--languages",
-        nargs="+",
-        default=None,
-        help="Languages to evaluate (default: all available languages per benchmark).",
-    )
-    parser.add_argument(
-        "--template_path",
-        default="configs/eval_config",
-        help="Directory containing template json files.",
-    )
-    parser.add_argument("--template", default=None, help="Template name or json path.")
-    parser.add_argument("--verdict-pattern-a", default=None)
-    parser.add_argument("--verdict-pattern-b", default=None)
-    parser.add_argument("--output_dir", default="results")
-    parser.add_argument(
-        "--use_vllm",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--batch_size", type=int, default=8192)
-    parser.add_argument(
-        "--embed-batch-size",
-        type=int,
-        default=256,
-        help="Batch size for building prompt embeddings (smaller uses less memory).",
-    )
-    parser.add_argument("--max_tokens", type=int, default=16384)
-    parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--top_k", type=int, default=20)
-    parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
-    parser.add_argument("--max_model_len", type=int, default=None)
-    parser.add_argument("--trust_remote_code", action="store_true")
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--enable-prompt-embeds",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable prompt embeddings in vLLM.",
-    )
-    parser.add_argument(
-        "--z-soft-prompt",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable z soft prompts (default: follow checkpoint config).",
-    )
-    parser.add_argument(
-        "--use-compactor",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable compact masking using predicted pi logits.",
-    )
-    parser.add_argument(
-        "--debug-prompt-only",
-        action="store_true",
-        help="Print one constructed prompt and exit without running evaluation.",
-    )
-    parser.add_argument(
-        "--reuse_results",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Reuse existing raw/parsed results in output_dir when available.",
-    )
-    args = parser.parse_args()
-
-    ckpt_config = _load_checkpoint_config(args.checkpoint)
-    use_compactor = bool(args.use_compactor)
-    if args.z_soft_prompt is None:
-        if ckpt_config is not None:
-            use_z_soft_prompt = bool(ckpt_config.get("z_soft_prompt", True))
-        else:
-            use_z_soft_prompt = True
-    else:
-        use_z_soft_prompt = bool(args.z_soft_prompt)
-    if use_z_soft_prompt and not args.enable_prompt_embeds and not args.debug_prompt_only:
-        raise ValueError("z soft prompt requires --enable-prompt-embeds.")
-    if use_compactor and not args.enable_prompt_embeds and not args.debug_prompt_only:
-        raise ValueError("compactor requires --enable-prompt-embeds.")
-
-    template, verdict_a, verdict_b = ve._load_template(
-        args.template_path,
-        args.template,
-        args.verdict_pattern_a,
-        args.verdict_pattern_b,
-    )
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    summary = {"benchmarks": {}}
-    table_rows: List[List[str]] = []
-    rng = random.Random(args.seed)
-
-    mm_grouped = None
-    mm_selected: List[str] = []
-    mreward_pairs: List[Tuple[str, str]] = []
-    expected_groups: List[Tuple[str, str]] = []
-    if args.benchmark in {"MM-Eval", "both"}:
-        mm_dir = os.path.join("data", "eval_data", "MM-Eval")
-        dataset = ve._load_mm_eval(mm_dir)
-        grouped = ve._group_by_language(dataset)
-        grouped = ve._filter_mm_eval_core_languages(grouped)
-        available = sorted(grouped.keys())
-        mm_selected = args.languages or available
-        missing = [lang for lang in mm_selected if lang not in grouped]
-        if missing:
-            raise ValueError(f"MM-Eval missing languages: {', '.join(missing)}")
-        mm_grouped = grouped
-        expected_groups.extend([("MM-Eval", lang) for lang in mm_selected])
-
-    if args.benchmark in {"multilingual-reward-bench", "both"}:
-        mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
-        available = ve._available_mreward_languages(mreward_dir)
-        if not available:
-            available = sorted(ve.SHORT_TO_CONFIG.values())
-        selected, missing = ve._resolve_mreward_languages(args.languages, available)
-        if missing:
-            raise ValueError(
-                "multilingual-reward-bench missing languages: " + ", ".join(missing)
-            )
-        mreward_pairs = [
-            (lang, ve.CONFIG_TO_SHORT.get(lang, lang)) for lang in selected
-        ]
-        expected_groups.extend(
-            [("multilingual-reward-bench", display) for _, display in mreward_pairs]
-        )
-
-    if not expected_groups:
-        raise ValueError("No evaluation prompts were built for the selected benchmarks.")
-
-    if args.debug_prompt_only:
-        lm_tokenizer = AutoTokenizer.from_pretrained(
-            args.model, use_fast=True, trust_remote_code=args.trust_remote_code
-        )
-        if lm_tokenizer.pad_token_id is None:
-            lm_tokenizer.pad_token = lm_tokenizer.eos_token
-        ve._PRINTED_TEST_PROMPT = True
-        prompt = None
-        if mm_grouped is not None:
-            lang = mm_selected[0] if mm_selected else next(iter(mm_grouped.keys()))
-            rows = mm_grouped[lang]
-            if not rows:
-                raise ValueError("MM-Eval has no rows to build a debug prompt.")
-            prompt, _ = ve._build_task(
-                rows[0], template, lm_tokenizer, rng, "MM-Eval", language_override=lang
-            )
-        elif mreward_pairs:
-            mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
-            lang, display_lang = mreward_pairs[0]
-            dataset = ve._load_mreward_language(mreward_dir, lang)
-            rows = list(dataset)
-            if not rows:
-                raise ValueError("multilingual-reward-bench has no rows to build a debug prompt.")
-            prompt, _ = ve._build_task(
-                rows[0],
-                template,
-                lm_tokenizer,
-                rng,
-                "multilingual-reward-bench",
-                language_override=display_lang,
-            )
-        else:
-            raise ValueError("No datasets loaded to build a debug prompt.")
-        print(prompt)
-        return
+def _prepare_seed_inputs(
+    args: argparse.Namespace,
+    seed: int,
+    template: Optional[Union[str, Dict[str, object]]],
+    mm_grouped: Optional[Dict[str, List[dict]]],
+    mm_selected: List[str],
+    mreward_pairs: List[Tuple[str, str]],
+    expected_groups: List[Tuple[str, str]],
+    use_z_soft_prompt: bool,
+    use_compactor: bool,
+    embed_resources: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    eval_stats.seed_everything(seed)
+    seed_output_dir = os.path.join(args.output_dir, f"seed_{seed}")
+    os.makedirs(seed_output_dir, exist_ok=True)
 
     raw_by_group: Dict[Tuple[str, str], List[dict]] = {}
     parsed_by_group: Dict[Tuple[str, str], List[dict]] = {}
     missing_groups = expected_groups
     if args.reuse_results:
         raw_by_group, parsed_by_group, missing_groups = ve._load_partial_results(
-            args.output_dir, expected_groups
+            seed_output_dir, expected_groups
         )
-    missing_set = set(missing_groups)
-    generated_groups: set[Tuple[str, str]] = set()
+
+    tasks: List[dict] = []
+    embed_prompts: List[Union[EmbedsPrompt, str]] = []
 
     if missing_groups:
-        if not args.use_vllm:
-            raise ValueError("DIBJudge evaluation requires --use_vllm for inference.")
+        if embed_resources is None:
+            raise ValueError("Embed resources are required to build prompts.")
+        lm_tokenizer = embed_resources["tokenizer"]
+        rng = random.Random(seed)
 
-        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-        device = torch.device(args.device)
-
-        lm_tokenizer = AutoTokenizer.from_pretrained(
-            args.model, use_fast=True, trust_remote_code=args.trust_remote_code
-        )
-        if lm_tokenizer.pad_token_id is None:
-            lm_tokenizer.pad_token = lm_tokenizer.eos_token
-
-        bundle: Optional[DIBJudgePromptBundle] = None
-        if use_z_soft_prompt or use_compactor:
-            bundle = _load_dibjudge_bundle(
-                args.checkpoint, args.judge_encoder, device, dtype, args.trust_remote_code
-            )
-
-        lm_for_embed = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            dtype=dtype,
-            device_map="cpu",
-            trust_remote_code=args.trust_remote_code,
-        )
-        lm_embed = lm_for_embed.get_input_embeddings()
-        lm_embed.eval()
-
-        tasks: List[dict] = []
         prompts: List[str] = []
         if mm_grouped is not None:
             for lang in mm_selected:
-                if ("MM-Eval", lang) not in missing_set:
+                if ("MM-Eval", lang) not in missing_groups:
                     continue
                 rows = mm_grouped[lang]
                 if args.limit:
@@ -867,6 +796,7 @@ def main() -> None:
                         rng,
                         "MM-Eval",
                         language_override=lang,
+                        seed_value=seed,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
@@ -876,7 +806,7 @@ def main() -> None:
                 "data", "eval_data", "multilingual-reward-bench"
             )
             for lang, display_lang in mreward_pairs:
-                if ("multilingual-reward-bench", display_lang) not in missing_set:
+                if ("multilingual-reward-bench", display_lang) not in missing_groups:
                     continue
                 dataset = ve._load_mreward_language(mreward_dir, lang)
                 rows = list(dataset)
@@ -890,73 +820,139 @@ def main() -> None:
                         rng,
                         "multilingual-reward-bench",
                         language_override=display_lang,
+                        seed_value=seed,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
 
-        embed_prompts: List[EmbedsPrompt] = []
-        embed_batch_size = max(1, int(args.embed_batch_size))
-        try:
-            from tqdm.auto import tqdm
+        if args.enable_prompt_embeds:
+            dtype = embed_resources["dtype"]
+            device = embed_resources["device"]
+            bundle = embed_resources.get("bundle")
+            lm_embed = embed_resources.get("lm_embed")
+            if lm_embed is None:
+                raise ValueError("Prompt embeds enabled but lm_embed is missing.")
 
-            iterator = tqdm(
-                range(0, len(prompts), embed_batch_size),
-                desc="build_prompt_embeds",
-                dynamic_ncols=True,
+            embed_batch_size = max(1, int(args.embed_batch_size))
+            try:
+                from tqdm.auto import tqdm
+
+                iterator = tqdm(
+                    range(0, len(prompts), embed_batch_size),
+                    desc="build_prompt_embeds",
+                    dynamic_ncols=True,
+                )
+            except ImportError:
+                iterator = range(0, len(prompts), embed_batch_size)
+            with torch.inference_mode():
+                for start in iterator:
+                    chunk = list(range(start, min(start + embed_batch_size, len(prompts))))
+                    chunk_prompts = [prompts[idx] for idx in chunk]
+                    chunk_user_prompts = [str(tasks[idx].get("prompt", "")) for idx in chunk]
+                    chunk_a = [str(tasks[idx]["answer_a"]) for idx in chunk]
+                    chunk_b = [str(tasks[idx]["answer_b"]) for idx in chunk]
+                    embeds_list = _build_prompt_embeds_batch(
+                        bundle,
+                        lm_embed,
+                        lm_tokenizer,
+                        chunk_prompts,
+                        chunk_user_prompts,
+                        chunk_a,
+                        chunk_b,
+                        args.max_model_len,
+                        device,
+                        dtype,
+                        use_z_soft_prompt,
+                        use_compactor,
+                    )
+                    embed_prompts.extend(
+                        EmbedsPrompt(prompt_embeds=embeds.detach().cpu())
+                        for embeds in embeds_list
+                    )
+        else:
+            embed_prompts = prompts
+
+    return {
+        "seed_output_dir": seed_output_dir,
+        "raw_by_group": raw_by_group,
+        "parsed_by_group": parsed_by_group,
+        "missing_groups": missing_groups,
+        "tasks": tasks,
+        "embed_prompts": embed_prompts,
+    }
+
+
+def _evaluate_seed(
+    args: argparse.Namespace,
+    seed: int,
+    template: Optional[Union[str, Dict[str, object]]],
+    verdict_a: str,
+    verdict_b: str,
+    mm_grouped: Optional[Dict[str, List[dict]]],
+    mm_selected: List[str],
+    mreward_pairs: List[Tuple[str, str]],
+    expected_groups: List[Tuple[str, str]],
+    use_z_soft_prompt: bool,
+    use_compactor: bool,
+    llm_handle: Optional[LLM],
+    prepared: Dict[str, object],
+) -> dict:
+    summary = {"seed": seed, "benchmarks": {}}
+
+    seed_output_dir = prepared["seed_output_dir"]
+    raw_by_group = prepared["raw_by_group"]
+    parsed_by_group = prepared["parsed_by_group"]
+    missing_groups = prepared["missing_groups"]
+    generated_groups: set[Tuple[str, str]] = set()
+
+    if missing_groups:
+        if not args.use_vllm:
+            raise ValueError("DIBJudge evaluation requires --use_vllm for inference.")
+
+        tasks = prepared["tasks"]
+        embed_prompts = prepared["embed_prompts"]
+
+        llm = llm_handle
+        created_llm = False
+        if llm is None:
+            llm = LLM(
+                model=args.model,
+                tensor_parallel_size=args.tensor_parallel_size,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_model_len=args.max_model_len,
+                dtype=args.dtype,
+                trust_remote_code=args.trust_remote_code,
+                seed=seed,
+                enable_prompt_embeds=args.enable_prompt_embeds,
             )
-        except ImportError:
-            iterator = range(0, len(prompts), embed_batch_size)
-        with torch.inference_mode():
-            for start in iterator:
-                chunk = list(range(start, min(start + embed_batch_size, len(prompts))))
-                chunk_prompts = [prompts[idx] for idx in chunk]
-                chunk_user_prompts = [str(tasks[idx].get("prompt", "")) for idx in chunk]
-                chunk_a = [str(tasks[idx]["answer_a"]) for idx in chunk]
-                chunk_b = [str(tasks[idx]["answer_b"]) for idx in chunk]
-                embeds_list = _build_prompt_embeds_batch(
-                    bundle,
-                    lm_embed,
-                    lm_tokenizer,
-                    chunk_prompts,
-                    chunk_user_prompts,
-                    chunk_a,
-                    chunk_b,
-                    args.max_model_len,
-                    device,
-                    dtype,
-                    use_z_soft_prompt,
-                    use_compactor,
-                )
-                embed_prompts.extend(
-                    EmbedsPrompt(prompt_embeds=embeds.cpu()) for embeds in embeds_list
-                )
+            created_llm = True
+        sampling_kwargs = {
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k if args.top_k is not None else -1,
+            "seed": seed,
+        }
+        try:
+            sampling = SamplingParams(**sampling_kwargs)
+        except TypeError:
+            sampling_kwargs.pop("seed", None)
+            sampling = SamplingParams(**sampling_kwargs)
 
-        if device.type == "cuda":
-            bundle.to("cpu")
-            del lm_embed
-            del lm_for_embed
-            torch.cuda.empty_cache()
-
-        llm = LLM(
-            model=args.model,
-            tensor_parallel_size=args.tensor_parallel_size,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            max_model_len=args.max_model_len,
-            dtype=args.dtype,
-            trust_remote_code=args.trust_remote_code,
-            seed=args.seed,
-            enable_prompt_embeds=args.enable_prompt_embeds,
-        )
-        sampling = SamplingParams(
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k if args.top_k is not None else -1,
-        )
+        prompt_log = None
+        prompt_log_idx = 0
+        if args.debug_vllm_prompts:
+            prompt_log = os.path.join(seed_output_dir, "vllm_prompts.jsonl")
+            with open(prompt_log, "w", encoding="utf-8") as handle:
+                handle.write("")
 
         completions: List[str] = []
         for chunk in ve._chunked(list(range(len(embed_prompts))), args.batch_size):
             batch_prompts = [embed_prompts[idx] for idx in chunk]
+            if prompt_log is not None:
+                prompt_log_idx = _append_prompt_log(
+                    prompt_log, batch_prompts, prompt_log_idx
+                )
             outputs = llm.generate(batch_prompts, sampling)
             for out in outputs:
                 text = ""
@@ -1005,113 +1001,587 @@ def main() -> None:
         parsed_by_group.update(new_parsed)
         generated_groups = set(missing_groups)
 
-        ve._shutdown_vllm(llm)
+        if created_llm:
+            ve._shutdown_vllm(llm)
 
     write_outputs = bool(generated_groups)
+    overall_flags: List[float] = []
+    benchmark_flags: Dict[str, List[float]] = {"MM-Eval": [], "multilingual-reward-bench": []}
+
     if args.benchmark in {"MM-Eval", "both"}:
         benchmark_rows = {}
         mm_total = 0
         mm_correct = 0
-        for lang in mm_selected:
+        for idx, lang in enumerate(mm_selected):
             parsed = parsed_by_group.get(("MM-Eval", lang))
             if not parsed:
                 continue
             raw = raw_by_group.get(("MM-Eval", lang), [])
             if write_outputs and ("MM-Eval", lang) in generated_groups:
-                raw_path = os.path.join(args.output_dir, f"mm_eval_{lang}_raw.jsonl")
-                parsed_path = os.path.join(args.output_dir, f"mm_eval_{lang}_parsed.jsonl")
+                raw_path = os.path.join(seed_output_dir, f"mm_eval_{lang}_raw.jsonl")
+                parsed_path = os.path.join(
+                    seed_output_dir, f"mm_eval_{lang}_parsed.jsonl"
+                )
                 ve._save_jsonl(raw_path, raw)
                 ve._save_jsonl(parsed_path, parsed)
-            total, correct, acc = ve._summarize(parsed)
-            mm_total += total
-            mm_correct += correct
-            benchmark_rows[lang] = {"total": total, "correct": correct, "accuracy": acc}
-            table_rows.append(
-                ["MM-Eval", str(lang), str(total), str(correct), f"{acc:.4f}"]
+            stats = ve._summarize_with_ci(
+                parsed, args.bootstrap_samples, args.bootstrap_confidence, seed + idx
             )
+            mm_total += int(stats["total"])
+            mm_correct += int(stats["correct"])
+            benchmark_rows[lang] = stats
+            flags = [1.0 if row.get("correct") else 0.0 for row in parsed]
+            benchmark_flags["MM-Eval"].extend(flags)
+            overall_flags.extend(flags)
         if mm_total:
-            benchmark_rows["_overall"] = {
+            overall = {
                 "total": mm_total,
                 "correct": mm_correct,
                 "accuracy": float(mm_correct) / mm_total,
             }
+            if args.bootstrap_samples > 0 and benchmark_flags["MM-Eval"]:
+                rng = random.Random(seed + 991)
+                ci = eval_stats.bootstrap_mean_ci(
+                    benchmark_flags["MM-Eval"],
+                    args.bootstrap_samples,
+                    args.bootstrap_confidence,
+                    rng,
+                )
+                if ci is not None:
+                    overall["accuracy_ci"] = {
+                        "low": ci[0],
+                        "high": ci[1],
+                        "confidence": args.bootstrap_confidence,
+                    }
+            benchmark_rows["_overall"] = overall
         summary["benchmarks"]["MM-Eval"] = benchmark_rows
 
     if args.benchmark in {"multilingual-reward-bench", "both"}:
         benchmark_rows = {}
         mr_total = 0
         mr_correct = 0
-        for _lang, display_lang in mreward_pairs:
+        for idx, (_lang, display_lang) in enumerate(mreward_pairs):
             parsed = parsed_by_group.get(("multilingual-reward-bench", display_lang))
             if not parsed:
                 continue
             raw = raw_by_group.get(("multilingual-reward-bench", display_lang), [])
             if write_outputs and ("multilingual-reward-bench", display_lang) in generated_groups:
-                raw_path = os.path.join(args.output_dir, f"mreward_{display_lang}_raw.jsonl")
+                raw_path = os.path.join(
+                    seed_output_dir, f"mreward_{display_lang}_raw.jsonl"
+                )
                 parsed_path = os.path.join(
-                    args.output_dir, f"mreward_{display_lang}_parsed.jsonl"
+                    seed_output_dir, f"mreward_{display_lang}_parsed.jsonl"
                 )
                 ve._save_jsonl(raw_path, raw)
                 ve._save_jsonl(parsed_path, parsed)
-            total, correct, acc = ve._summarize(parsed)
-            mr_total += total
-            mr_correct += correct
-            benchmark_rows[display_lang] = {
-                "total": total,
-                "correct": correct,
-                "accuracy": acc,
-            }
-            table_rows.append(
-                ["mreward", str(display_lang), str(total), str(correct), f"{acc:.4f}"]
+            stats = ve._summarize_with_ci(
+                parsed,
+                args.bootstrap_samples,
+                args.bootstrap_confidence,
+                seed + 1000 + idx,
             )
+            mr_total += int(stats["total"])
+            mr_correct += int(stats["correct"])
+            benchmark_rows[display_lang] = stats
+            flags = [1.0 if row.get("correct") else 0.0 for row in parsed]
+            benchmark_flags["multilingual-reward-bench"].extend(flags)
+            overall_flags.extend(flags)
         if mr_total:
-            benchmark_rows["_overall"] = {
+            overall = {
                 "total": mr_total,
                 "correct": mr_correct,
                 "accuracy": float(mr_correct) / mr_total,
             }
+            if args.bootstrap_samples > 0 and benchmark_flags["multilingual-reward-bench"]:
+                rng = random.Random(seed + 1991)
+                ci = eval_stats.bootstrap_mean_ci(
+                    benchmark_flags["multilingual-reward-bench"],
+                    args.bootstrap_samples,
+                    args.bootstrap_confidence,
+                    rng,
+                )
+                if ci is not None:
+                    overall["accuracy_ci"] = {
+                        "low": ci[0],
+                        "high": ci[1],
+                        "confidence": args.bootstrap_confidence,
+                    }
+            benchmark_rows["_overall"] = overall
         summary["benchmarks"]["multilingual-reward-bench"] = benchmark_rows
 
-    headers = ["Benchmark", "Language", "Total", "Correct", "Accuracy"]
-    print(ve._format_table(table_rows, headers))
-
-    overall_total = 0
-    overall_correct = 0
-    for benchmark in summary["benchmarks"].values():
-        for lang, stats in benchmark.items():
-            if lang == "_overall":
-                continue
-            overall_total += stats["total"]
-            overall_correct += stats["correct"]
+    overall_total = len(overall_flags)
+    overall_correct = int(sum(overall_flags))
     overall_acc = float(overall_correct) / overall_total if overall_total else 0.0
-    print("")
-    print(
-        f"Summary: ✅ {overall_correct} pass / ❌ {overall_total - overall_correct} fail"
-    )
-    print(f"Overall accuracy: {overall_acc:.4f}")
-
-    weighted_total = 0
-    weighted_correct = 0
-    for bench_name, bench in summary["benchmarks"].items():
-        stats = bench.get("_overall")
-        if not stats:
-            continue
-        weighted_total += stats["total"]
-        weighted_correct += stats["correct"]
-        bench_acc = float(stats["accuracy"])
-        print(f"{bench_name} weighted accuracy: {bench_acc:.4f}")
-    if weighted_total:
-        weighted_acc = float(weighted_correct) / weighted_total
-        print(f"Weighted average accuracy (benchmarks): {weighted_acc:.4f}")
-
     summary["overall"] = {
         "total": overall_total,
         "correct": overall_correct,
         "accuracy": overall_acc,
     }
-    summary_path = os.path.join(args.output_dir, "summary.json")
+    if args.bootstrap_samples > 0 and overall_flags:
+        rng = random.Random(seed + 7777)
+        ci = eval_stats.bootstrap_mean_ci(
+            overall_flags, args.bootstrap_samples, args.bootstrap_confidence, rng
+        )
+        if ci is not None:
+            summary["overall"]["accuracy_ci"] = {
+                "low": ci[0],
+                "high": ci[1],
+                "confidence": args.bootstrap_confidence,
+            }
+
+    summary_path = os.path.join(seed_output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
+    return summary
+
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="DIBJudge evaluation with vLLM embeds.")
+    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Path to DIBJudge HF checkpoint directory or a state dict file.",
+    )
+    parser.add_argument(
+        "--judge-encoder",
+        default=None,
+        help="Fallback encoder name when checkpoint config is missing.",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        default="flash_attention_2",
+        help="Attention implementation override for the shared encoder.",
+    )
+    parser.add_argument(
+        "--padding-side",
+        choices=["left", "right"],
+        default=None,
+        help="Tokenizer padding side override (defaults to checkpoint config).",
+    )
+    parser.add_argument(
+        "--benchmark",
+        default="both",
+        choices=["MM-Eval", "multilingual-reward-bench", "both"],
+    )
+    parser.add_argument(
+        "--languages",
+        nargs="+",
+        default=None,
+        help="Languages to evaluate (default: all available languages per benchmark).",
+    )
+    parser.add_argument(
+        "--template_path",
+        default="configs/eval_config",
+        help="Directory containing template json files.",
+    )
+    parser.add_argument("--template", default=None, help="Template name or json path.")
+    parser.add_argument("--verdict-pattern-a", default=None)
+    parser.add_argument("--verdict-pattern-b", default=None)
+    parser.add_argument("--output_dir", default="results")
+    parser.add_argument(
+        "--use_vllm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--batch_size", type=int, default=8192)
+    parser.add_argument(
+        "--embed-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for building prompt embeddings (smaller uses less memory).",
+    )
+    parser.add_argument("--max_tokens", type=int, default=16384)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--max_model_len", type=int, default=None)
+    parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seeds", nargs="+", type=int, default=None)
+    parser.add_argument("--num-seeds", type=int, default=3)
+    parser.add_argument("--seed-step", type=int, default=1)
+    parser.add_argument("--bootstrap-samples", type=int, default=0)
+    parser.add_argument("--bootstrap-confidence", type=float, default=0.95)
+    parser.add_argument("--alpha", type=float, default=0.05)
+    parser.add_argument("--compare-dir", default=None)
+    parser.add_argument("--compare-label", default="baseline")
+    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--enable-prompt-embeds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable prompt embeddings in vLLM.",
+    )
+    parser.add_argument(
+        "--z-soft-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable z soft prompts (default: follow checkpoint config).",
+    )
+    parser.add_argument(
+        "--use-compactor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable compact masking using predicted pi logits.",
+    )
+    parser.add_argument(
+        "--debug-prompt-only",
+        action="store_true",
+        help="Print one constructed prompt and exit without running evaluation.",
+    )
+    parser.add_argument(
+        "--debug-vllm-prompts",
+        action="store_true",
+        help="Write prompts sent to vLLM.generate into seed output directories.",
+    )
+    parser.add_argument(
+        "--reuse_results",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse existing raw/parsed results in output_dir when available.",
+    )
+    args = parser.parse_args()
+
+    ckpt_config = _load_checkpoint_config(args.checkpoint)
+    attn_impl = _resolve_attn_impl(ckpt_config, args.attn_implementation)
+    padding_side = _resolve_padding_side(ckpt_config, args.padding_side, attn_impl)
+    use_compactor = bool(args.use_compactor)
+    if args.z_soft_prompt is None:
+        if ckpt_config is not None:
+            use_z_soft_prompt = bool(ckpt_config.get("z_soft_prompt", True))
+        else:
+            use_z_soft_prompt = True
+    else:
+        use_z_soft_prompt = bool(args.z_soft_prompt)
+    if use_z_soft_prompt and not args.enable_prompt_embeds and not args.debug_prompt_only:
+        raise ValueError("z soft prompt requires --enable-prompt-embeds.")
+    if use_compactor and not args.enable_prompt_embeds and not args.debug_prompt_only:
+        raise ValueError("compactor requires --enable-prompt-embeds.")
+
+    template, verdict_a, verdict_b = ve._load_template(
+        args.template_path,
+        args.template,
+        args.verdict_pattern_a,
+        args.verdict_pattern_b,
+    )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    seeds = eval_stats.resolve_seeds(
+        args.seed, args.seeds, args.num_seeds, seed_step=args.seed_step
+    )
+
+    mm_grouped = None
+    mm_selected: List[str] = []
+    mreward_pairs: List[Tuple[str, str]] = []
+    expected_groups: List[Tuple[str, str]] = []
+    if args.benchmark in {"MM-Eval", "both"}:
+        mm_dir = os.path.join("data", "eval_data", "MM-Eval")
+        dataset = ve._load_mm_eval(mm_dir)
+        grouped = ve._group_by_language(dataset)
+        grouped = ve._filter_mm_eval_core_languages(grouped)
+        available = sorted(grouped.keys())
+        mm_selected = args.languages or available
+        missing = [lang for lang in mm_selected if lang not in grouped]
+        if missing:
+            raise ValueError(f"MM-Eval missing languages: {', '.join(missing)}")
+        mm_grouped = grouped
+        expected_groups.extend([("MM-Eval", lang) for lang in mm_selected])
+
+    if args.benchmark in {"multilingual-reward-bench", "both"}:
+        mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
+        available = ve._available_mreward_languages(mreward_dir)
+        if not available:
+            available = sorted(ve.SHORT_TO_CONFIG.values())
+        selected, missing = ve._resolve_mreward_languages(args.languages, available)
+        if missing:
+            raise ValueError(
+                "multilingual-reward-bench missing languages: " + ", ".join(missing)
+            )
+        mreward_pairs = [
+            (lang, ve.CONFIG_TO_SHORT.get(lang, lang)) for lang in selected
+        ]
+        expected_groups.extend(
+            [("multilingual-reward-bench", display) for _, display in mreward_pairs]
+        )
+
+    if not expected_groups:
+        raise ValueError("No evaluation prompts were built for the selected benchmarks.")
+
+    if args.debug_prompt_only:
+        lm_tokenizer = AutoTokenizer.from_pretrained(
+            args.model, use_fast=True, trust_remote_code=args.trust_remote_code
+        )
+        if lm_tokenizer.pad_token_id is None:
+            lm_tokenizer.pad_token = lm_tokenizer.eos_token
+        lm_tokenizer.padding_side = padding_side
+        ve._PRINTED_TEST_PROMPT = True
+        prompt = None
+        rng = random.Random(seeds[0])
+        if mm_grouped is not None:
+            lang = mm_selected[0] if mm_selected else next(iter(mm_grouped.keys()))
+            rows = mm_grouped[lang]
+            if not rows:
+                raise ValueError("MM-Eval has no rows to build a debug prompt.")
+            prompt, _ = ve._build_task(
+                rows[0],
+                template,
+                lm_tokenizer,
+                rng,
+                "MM-Eval",
+                language_override=lang,
+                seed_value=seeds[0],
+            )
+        elif mreward_pairs:
+            mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
+            lang, display_lang = mreward_pairs[0]
+            dataset = ve._load_mreward_language(mreward_dir, lang)
+            rows = list(dataset)
+            if not rows:
+                raise ValueError("multilingual-reward-bench has no rows to build a debug prompt.")
+            prompt, _ = ve._build_task(
+                rows[0],
+                template,
+                lm_tokenizer,
+                rng,
+                "multilingual-reward-bench",
+                language_override=display_lang,
+                seed_value=seeds[0],
+            )
+        else:
+            raise ValueError("No datasets loaded to build a debug prompt.")
+        print(prompt)
+        return
+
+    any_missing = not args.reuse_results
+    if args.reuse_results:
+        for seed in seeds:
+            seed_output_dir = os.path.join(args.output_dir, f"seed_{seed}")
+            _, _, missing_groups = ve._load_partial_results(
+                seed_output_dir, expected_groups
+            )
+            if missing_groups:
+                any_missing = True
+                break
+
+    embed_resources: Optional[Dict[str, object]] = None
+    prepared_by_seed: Dict[int, Dict[str, object]] = {}
+    if any_missing:
+        if not args.use_vllm:
+            raise ValueError("DIBJudge evaluation requires --use_vllm for inference.")
+        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+        device = torch.device(args.device)
+        lm_tokenizer = AutoTokenizer.from_pretrained(
+            args.model, use_fast=True, trust_remote_code=args.trust_remote_code
+        )
+        if lm_tokenizer.pad_token_id is None:
+            lm_tokenizer.pad_token = lm_tokenizer.eos_token
+        lm_tokenizer.padding_side = padding_side
+
+        bundle: Optional[DIBJudgePromptBundle] = None
+        lm_embed = None
+        lm_for_embed = None
+        if args.enable_prompt_embeds:
+            if use_z_soft_prompt or use_compactor:
+                bundle = _load_dibjudge_bundle(
+                    args.checkpoint,
+                    args.judge_encoder,
+                    device,
+                    dtype,
+                    args.trust_remote_code,
+                    attn_implementation=attn_impl,
+                )
+            lm_for_embed = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                dtype=dtype,
+                device_map="cpu",
+                trust_remote_code=args.trust_remote_code,
+            )
+            lm_embed = lm_for_embed.get_input_embeddings()
+            lm_embed.eval()
+
+        embed_resources = {
+            "dtype": dtype,
+            "device": device,
+            "tokenizer": lm_tokenizer,
+            "bundle": bundle,
+            "lm_embed": lm_embed,
+            "lm_for_embed": lm_for_embed,
+        }
+
+    for seed in seeds:
+        prepared_by_seed[seed] = _prepare_seed_inputs(
+            args,
+            seed,
+            template,
+            mm_grouped,
+            mm_selected,
+            mreward_pairs,
+            expected_groups,
+            use_z_soft_prompt,
+            use_compactor,
+            embed_resources,
+        )
+
+    if embed_resources is not None:
+        bundle = embed_resources.get("bundle")
+        if bundle is not None:
+            bundle.to("cpu")
+        if embed_resources.get("lm_embed") is not None:
+            del embed_resources["lm_embed"]
+        if embed_resources.get("lm_for_embed") is not None:
+            del embed_resources["lm_for_embed"]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    llm_handle = None
+    need_generation = any(
+        prepared["missing_groups"] for prepared in prepared_by_seed.values()
+    )
+    if need_generation:
+        llm_handle = LLM(
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            dtype=args.dtype,
+            trust_remote_code=args.trust_remote_code,
+            seed=seeds[0],
+            enable_prompt_embeds=args.enable_prompt_embeds,
+        )
+
+    seed_summaries: List[dict] = []
+    for seed in seeds:
+        print(f"Running evaluation for seed={seed}")
+        seed_summary = _evaluate_seed(
+            args,
+            seed,
+            template,
+            verdict_a,
+            verdict_b,
+            mm_grouped,
+            mm_selected,
+            mreward_pairs,
+            expected_groups,
+            use_z_soft_prompt,
+            use_compactor,
+            llm_handle,
+            prepared_by_seed[seed],
+        )
+        seed_summaries.append(seed_summary)
+
+    if llm_handle is not None:
+        ve._shutdown_vllm(llm_handle)
+
+    aggregate = ve._aggregate_seed_summaries(
+        seed_summaries,
+        args.bootstrap_samples,
+        args.bootstrap_confidence,
+        bootstrap_seed=seeds[0],
+    )
+
+    table_rows: List[List[str]] = []
+    for bench_name, bench in aggregate.get("benchmarks", {}).items():
+        for lang, stats in bench.items():
+            if lang == "_overall":
+                continue
+            total = int(stats.get("total", 0))
+            correct = stats.get("correct", {}).get("formatted", "0.0000 ± 0.0000")
+            accuracy = stats.get("accuracy", {}).get("formatted", "0.0000 ± 0.0000")
+            table_rows.append(
+                [bench_name, str(lang), str(total), str(correct), str(accuracy)]
+            )
+    headers = [
+        "Benchmark",
+        "Language",
+        "Total",
+        "Correct (mean ± std)",
+        "Accuracy (mean ± std)",
+    ]
+    print(ve._format_table(table_rows, headers))
+
+    overall_stats = aggregate.get("overall", {})
+    if overall_stats:
+        overall_acc = overall_stats.get("accuracy", {}).get("formatted", "0.0000 ± 0.0000")
+        print("")
+        print(f"Overall accuracy: {overall_acc} (n={len(seeds)})")
+        if args.bootstrap_samples > 0 and "accuracy_mean_ci" in overall_stats:
+            ci = overall_stats["accuracy_mean_ci"]
+            print(
+                f"Overall accuracy mean {ci['confidence']:.0%} CI: [{ci['low']:.4f}, {ci['high']:.4f}]"
+            )
+
+    for bench_name, bench in aggregate.get("benchmarks", {}).items():
+        stats = bench.get("_overall")
+        if not stats:
+            continue
+        bench_acc = stats.get("accuracy", {}).get("formatted", "0.0000 ± 0.0000")
+        print(f"{bench_name} weighted accuracy: {bench_acc}")
+        if args.bootstrap_samples > 0 and "accuracy_mean_ci" in stats:
+            ci = stats["accuracy_mean_ci"]
+            print(
+                f"{bench_name} accuracy mean {ci['confidence']:.0%} CI: [{ci['low']:.4f}, {ci['high']:.4f}]"
+            )
+
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(aggregate, handle, ensure_ascii=False, indent=2)
+
+    if args.compare_dir:
+        compare_summaries, missing = eval_stats.load_seed_summaries(
+            args.compare_dir, seeds
+        )
+        if missing:
+            print(f"[warn] missing comparison summaries for seeds: {missing}")
+        primary_by_seed = {summary["seed"]: summary for summary in seed_summaries}
+        compare_by_seed = {summary["seed"]: summary for summary in compare_summaries}
+        shared_seeds = sorted(set(primary_by_seed) & set(compare_by_seed))
+        tests: Dict[str, Dict[str, float]] = {}
+        if shared_seeds:
+            primary_overall = [
+                primary_by_seed[seed]["overall"]["accuracy"] for seed in shared_seeds
+            ]
+            compare_overall = [
+                compare_by_seed[seed]["overall"]["accuracy"] for seed in shared_seeds
+            ]
+            tests["overall.accuracy"] = eval_stats.paired_ttest(
+                primary_overall, compare_overall
+            )
+            for bench_name, bench in aggregate.get("benchmarks", {}).items():
+                if "_overall" not in bench:
+                    continue
+                primary_vals = []
+                compare_vals = []
+                for seed in shared_seeds:
+                    primary_bench = (
+                        primary_by_seed[seed].get("benchmarks", {}).get(bench_name, {})
+                    )
+                    compare_bench = (
+                        compare_by_seed[seed].get("benchmarks", {}).get(bench_name, {})
+                    )
+                    if "_overall" not in primary_bench or "_overall" not in compare_bench:
+                        continue
+                    primary_vals.append(primary_bench["_overall"]["accuracy"])
+                    compare_vals.append(compare_bench["_overall"]["accuracy"])
+                if primary_vals and compare_vals:
+                    tests[f"{bench_name}.accuracy"] = eval_stats.paired_ttest(
+                        primary_vals, compare_vals
+                    )
+        aggregate["paired_t_tests"] = {
+            "compare_dir": args.compare_dir,
+            "compare_label": args.compare_label,
+            "alpha": args.alpha,
+            "tests": tests,
+        }
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(aggregate, handle, ensure_ascii=False, indent=2)
+        ve._print_paired_tests(args.compare_label, tests, args.alpha)
 
 
 if __name__ == "__main__":

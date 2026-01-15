@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import warnings
 import os
@@ -243,6 +244,9 @@ def _collect_vq_task_samples(
     device: torch.device,
     seed: int,
     rank: int,
+    torch_dtype: Optional[torch.dtype] = None,
+    enable_autocast: bool = True,
+    world_size: int = 1,
 ) -> Optional[torch.Tensor]:
     if max_samples <= 0 or len(dataset) == 0:
         return None
@@ -250,11 +254,33 @@ def _collect_vq_task_samples(
     generator = torch.Generator()
     generator.manual_seed(int(seed))
     indices = torch.randperm(len(dataset), generator=generator).tolist()
+    if world_size > 1:
+        indices = indices[int(rank) :: int(world_size)]
     samples: List[torch.Tensor] = []
     total = 0
     batch_examples = []
     model_was_training = model.training
     model.eval()
+    amp_dtype = torch_dtype
+    if amp_dtype is None:
+        for param in model.shared_encoder.parameters():
+            amp_dtype = param.dtype
+            break
+    if enable_autocast and device.type == "cuda":
+        if amp_dtype not in (torch.float16, torch.bfloat16):
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    attn_impl = getattr(model.config, "attn_implementation", None)
+    if attn_impl == "flash_attention_2" and device.type == "cuda":
+        if amp_dtype not in (torch.float16, torch.bfloat16):
+            amp_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        model.shared_encoder = model.shared_encoder.to(device=device, dtype=amp_dtype)
+    use_autocast = bool(
+        enable_autocast
+        and device.type == "cuda"
+        and amp_dtype in (torch.float16, torch.bfloat16)
+    )
 
     def _random_subset(vectors: torch.Tensor, count: int) -> torch.Tensor:
         if count <= 0 or vectors.numel() == 0:
@@ -283,7 +309,12 @@ def _collect_vq_task_samples(
         return _random_subset(flat, count)
 
     try:
-        with torch.no_grad():
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+            if use_autocast
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), amp_ctx:
             for idx in indices:
                 batch_examples.append(dataset[idx])
                 if len(batch_examples) < batch_size:
@@ -361,7 +392,15 @@ def _grad_norm_from_loss(
 ) -> torch.Tensor:
     if not params:
         return loss.new_tensor(0.0)
-    grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    if not torch.is_tensor(loss) or not loss.requires_grad:
+        return loss.new_tensor(0.0)
+    try:
+        grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Direct calls to tensor.backward()" in message:
+            return loss.new_tensor(0.0)
+        raise
     total = loss.new_tensor(0.0)
     for grad in grads:
         if grad is None:
@@ -574,7 +613,26 @@ def _save_deepspeed_checkpoint(
     if rank == 0:
         print(f"[checkpoint] saving to {output_dir} tag={tag}", flush=True)
     # DeepSpeed requires all ranks to participate in checkpointing.
-    engine.save_checkpoint(output_dir, tag=tag)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        engine.save_checkpoint(output_dir, tag=tag)
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] deepspeed save_checkpoint failed: {exc}")
+        if rank != 0:
+            return
+        ckpt_dir = os.path.join(output_dir, tag) if tag else output_dir
+        os.makedirs(ckpt_dir, exist_ok=True)
+        state_path = os.path.join(ckpt_dir, "mp_rank_00_model_states.pt")
+        try:
+            torch.save({"module": engine.module.state_dict()}, state_path)
+            _rank0_print(
+                rank,
+                f"[warn] saved minimal model state (no optimizer) to {state_path}",
+            )
+        except Exception as save_exc:
+            _rank0_print(rank, f"[warn] fallback save failed: {save_exc}")
 
 
 def _normalize_state_dict(
@@ -636,6 +694,38 @@ def _save_encoder_tokenizer(output_dir: str, args: argparse.Namespace, rank: int
         _rank0_print(rank, f"[warn] failed to save judge encoder tokenizer: {exc}")
 
 
+def _has_lora_keys(state_dict: Dict[str, torch.Tensor]) -> bool:
+    return any("lora_" in key for key in state_dict)
+
+
+def _extract_lora_state_from_model(
+    model: torch.nn.Module, rank: int
+) -> Optional[Dict[str, torch.Tensor]]:
+    try:
+        from peft import get_peft_model_state_dict
+    except ImportError:
+        _rank0_print(rank, "[warn] peft is required to extract LoRA state.")
+        return None
+    if not hasattr(model, "peft_config"):
+        return None
+    try:
+        state = get_peft_model_state_dict(model)
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to extract LoRA adapter state: {exc}")
+        return None
+    return {key: value.detach().cpu() for key, value in state.items()}
+
+
+def _save_lora_adapter(model: torch.nn.Module, output_dir: str, rank: int) -> None:
+    if not hasattr(model, "peft_config"):
+        return
+    try:
+        model.save_pretrained(output_dir)
+        _rank0_print(rank, f"[hf] saved LoRA adapter: {output_dir}")
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to save LoRA adapter: {exc}")
+
+
 def _merge_lora_into_lm_state(
     lm_state: Dict[str, torch.Tensor],
     args: argparse.Namespace,
@@ -661,7 +751,8 @@ def _merge_lora_into_lm_state(
         task_type="CAUSAL_LM",
     )
     peft_model = get_peft_model(base, lora_cfg)
-    missing, unexpected = peft_model.load_state_dict(lm_state, strict=False)
+    remapped = _remap_state_dict(lm_state, set(peft_model.state_dict().keys()))
+    missing, unexpected = peft_model.load_state_dict(remapped, strict=False)
     if missing:
         _rank0_print(rank, f"[warn] missing keys while loading LoRA LM: {len(missing)}")
     if unexpected:
@@ -684,11 +775,79 @@ def _strip_prefix_if_present(
     return state_dict
 
 
+def _apply_prefix_strip(
+    state_dict: Dict[str, torch.Tensor], prefix: str
+) -> Dict[str, torch.Tensor]:
+    stripped: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            stripped[key[len(prefix) :]] = value
+        else:
+            stripped[key] = value
+    return stripped
+
+
+def _count_matches(keys: Iterable[str], model_keys: set[str]) -> int:
+    return sum(1 for key in keys if key in model_keys)
+
+
+def _remap_state_dict(
+    state_dict: Dict[str, torch.Tensor], model_keys: set[str]
+) -> Dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    best = state_dict
+    best_matches = _count_matches(best.keys(), model_keys)
+    for prefix in ("module.", "model.", "base_model.", "base_model.model."):
+        candidate = _apply_prefix_strip(state_dict, prefix)
+        matches = _count_matches(candidate.keys(), model_keys)
+        if matches > best_matches:
+            best = candidate
+            best_matches = matches
+    return best
+
+
+def _load_state_dict_from_ds_checkpoint(
+    checkpoint_dir: str, tag: str, rank: int
+) -> Optional[Dict[str, torch.Tensor]]:
+    ckpt_dir = os.path.join(checkpoint_dir, tag) if tag else checkpoint_dir
+    if not os.path.isdir(ckpt_dir):
+        return None
+    preferred = ("mp_rank_00_model_states.pt", "mp_rank_0_model_states.pt")
+    candidates = []
+    for name in os.listdir(ckpt_dir):
+        if name.endswith("_model_states.pt"):
+            candidates.append(os.path.join(ckpt_dir, name))
+    for name in preferred:
+        path = os.path.join(ckpt_dir, name)
+        if path in candidates:
+            candidates.remove(path)
+            candidates.insert(0, path)
+            break
+    if not candidates:
+        return None
+    path = candidates[0]
+    try:
+        state = torch.load(path, map_location="cpu")
+    except (OSError, RuntimeError) as exc:
+        _rank0_print(rank, f"[warn] failed to load DS model state {path}: {exc}")
+        return None
+    if isinstance(state, dict):
+        for key in ("module", "model", "state_dict", "module_state_dict"):
+            value = state.get(key)
+            if isinstance(value, dict):
+                return value
+    if isinstance(state, dict):
+        return state
+    return None
+
+
 def _save_hf_checkpoint(
     checkpoint_dir: str,
     tag: str,
     args: argparse.Namespace,
     rank: int,
+    engine: Optional["deepspeed.DeepSpeedEngine"] = None,
 ) -> None:
     output_dir = os.path.join(checkpoint_dir, f"hf-{tag}")
     _save_hf_from_zero(
@@ -697,6 +856,7 @@ def _save_hf_checkpoint(
         output_dir=output_dir,
         args=args,
         rank=rank,
+        engine=engine,
     )
 
 
@@ -706,6 +866,7 @@ def _save_hf_from_zero(
     output_dir: str,
     args: argparse.Namespace,
     rank: int,
+    engine: Optional["deepspeed.DeepSpeedEngine"] = None,
 ) -> None:
     if rank != 0:
         return
@@ -721,10 +882,18 @@ def _save_hf_from_zero(
 
     os.makedirs(output_dir, exist_ok=True)
     _rank0_print(rank, f"[hf] extracting DIBJudge from {checkpoint_dir} tag={tag}")
-    try:
-        raw_state = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
-    except FileNotFoundError as exc:
-        _rank0_print(rank, f"[warn] HF export skipped: {exc}")
+    raw_state = None
+    zero_stage = _resolve_zero_stage(args.deepspeed_config)
+    if zero_stage in (0, 1, 2) and engine is not None:
+        raw_state = engine.module.state_dict()
+    if raw_state is None:
+        try:
+            raw_state = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
+        except FileNotFoundError as exc:
+            _rank0_print(rank, f"[warn] HF export fallback (no ZeRO states): {exc}")
+            raw_state = _load_state_dict_from_ds_checkpoint(checkpoint_dir, tag, rank)
+    if raw_state is None:
+        _rank0_print(rank, "[warn] HF export skipped: no model states found.")
         return
     state_dict = _normalize_state_dict(raw_state)
 
@@ -737,7 +906,19 @@ def _save_hf_from_zero(
             for key, value in state_dict.items()
             if key.startswith("judge_lm.")
         }
-        if lm_state:
+        if not lm_state:
+            _rank0_print(rank, "[warn] no judge_lm weights found for LoRA merge.")
+        if lm_state and not _has_lora_keys(lm_state):
+            _rank0_print(
+                rank,
+                "[warn] judge_lm state has no lora_ keys; trying live adapter weights.",
+            )
+        if (not lm_state or not _has_lora_keys(lm_state)) and engine is not None:
+            live_lora = _extract_lora_state_from_model(engine.module.judge_lm, rank)
+            if live_lora and _has_lora_keys(live_lora):
+                lm_state = live_lora
+                _rank0_print(rank, "[hf] using live LoRA adapter weights for merge.")
+        if lm_state and _has_lora_keys(lm_state):
             merged = _merge_lora_into_lm_state(lm_state, args, rank)
             if merged is not None:
                 state_dict = {
@@ -746,8 +927,8 @@ def _save_hf_from_zero(
                 for key, value in merged.items():
                     state_dict[f"judge_lm.{key}"] = value
                 lm_state = merged
-        else:
-            _rank0_print(rank, "[warn] no judge_lm weights found for LoRA merge.")
+        elif lm_state:
+            _rank0_print(rank, "[warn] skipping LoRA merge: no adapter weights found.")
         dibjudge_state = {
             key: value for key, value in state_dict.items() if not key.startswith("judge_lm.")
         }
@@ -762,10 +943,10 @@ def _save_hf_from_zero(
     dibjudge_dir = os.path.join(output_dir, "dibjudge")
     os.makedirs(lm_dir, exist_ok=True)
     os.makedirs(dibjudge_dir, exist_ok=True)
+    if args.use_lora and engine is not None:
+        _save_lora_adapter(engine.module.judge_lm, os.path.join(lm_dir, "lora"), rank)
 
     if lm_state:
-        lm_state = _strip_prefix_if_present(lm_state, "base_model.model.")
-        lm_state = _strip_prefix_if_present(lm_state, "base_model.")
         try:
             lm_model = AutoModelForCausalLM.from_pretrained(
                 args.lm, local_files_only=True
@@ -773,6 +954,9 @@ def _save_hf_from_zero(
         except Exception as exc:
             _rank0_print(rank, f"[warn] failed to load base model for LM export: {exc}")
         else:
+            lm_state = _strip_prefix_if_present(lm_state, "base_model.model.")
+            lm_state = _strip_prefix_if_present(lm_state, "base_model.")
+            lm_state = _remap_state_dict(lm_state, set(lm_model.state_dict().keys()))
             missing, unexpected = lm_model.load_state_dict(lm_state, strict=False)
             if missing:
                 _rank0_print(rank, f"[warn] missing keys while loading LM: {len(missing)}")
@@ -786,6 +970,12 @@ def _save_hf_from_zero(
     config = DIBJudgeConfig(
         judge_encoder_name=args.judge_encoder,
         judge_lm_name=args.lm,
+        attn_implementation=args.attn_implementation,
+        padding_side=args.padding_side,
+        torch_dtype=args.torch_dtype,
+        use_rms_norm=args.use_rms_norm,
+        rms_norm_eps=args.rms_norm_eps,
+        use_swiglu=args.use_swiglu,
         z_latent_dim=args.z_latent_dim,
         z_prompt_len=args.z_prompt_len,
         bias_prompt_len=args.bias_prompt_len,
@@ -815,12 +1005,16 @@ def _save_hf_from_zero(
         compact_head_layers=args.compact_head_layers,
         compact_head_dropout=args.compact_head_dropout,
         compact_pi_init=args.compact_pi_init,
+        lm_loss_chunk_size=args.lm_loss_chunk_size,
+        compact_kl_chunk_size=args.compact_kl_chunk_size,
         proxy_length_classes=getattr(args, "proxy_length_classes", DIBJudgeConfig.proxy_length_classes),
     )
     config_path = os.path.join(dibjudge_dir, "config.json")
     with open(config_path, "w", encoding="utf-8") as handle:
         payload = asdict(config)
         payload["model_type"] = "dibjudge"
+        payload["z_soft_prompt"] = not bool(args.disable_z_prompt_insertion)
+        payload["use_compactor"] = not bool(args.disable_compactor)
         json.dump(payload, handle, indent=2)
     _save_state_dict(dibjudge_state, dibjudge_dir, rank)
     _save_encoder_tokenizer(dibjudge_dir, args, rank)
@@ -843,6 +1037,18 @@ def _set_lm_trainable(model: DIBJudgeModel, trainable: bool, rank: int) -> None:
         param.requires_grad = trainable
     state = "trainable" if trainable else "frozen"
     _rank0_print(rank, f"[stage done] judge_lm {state}")
+
+
+def _freeze_non_lora_lm_params(model: DIBJudgeModel, rank: int) -> None:
+    frozen = 0
+    for name, param in model.judge_lm.named_parameters():
+        if "lora_" in name:
+            continue
+        if param.requires_grad:
+            param.requires_grad = False
+            frozen += param.numel()
+    if frozen > 0:
+        _rank0_print(rank, f"[stage done] froze {frozen:,} non-LoRA LM params")
 
 
 def _set_shared_encoder_trainable(model: DIBJudgeModel, mode: str, rank: int) -> bool:
@@ -918,8 +1124,49 @@ def _maybe_apply_lora(model: DIBJudgeModel, args: argparse.Namespace) -> None:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=target,
+        task_type="CAUSAL_LM",
     )
     model.judge_lm = get_peft_model(model.judge_lm, lora_cfg)
+
+
+def _validate_lora(model: DIBJudgeModel, args: argparse.Namespace, rank: int) -> None:
+    if not args.use_lora:
+        return
+    targets = [name.strip() for name in args.lora_targets.split(",") if name.strip()]
+    matched = {name: 0 for name in targets}
+    for name, _ in model.judge_lm.named_modules():
+        for target in targets:
+            if name.endswith(target):
+                matched[target] += 1
+    missing = [name for name, count in matched.items() if count == 0]
+    if missing:
+        _rank0_print(
+            rank,
+            "[warn] LoRA targets not found in LM modules:",
+            ", ".join(missing),
+        )
+    lora_params = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if "lora_" in name
+    ]
+    lora_count = sum(param.numel() for _, param in lora_params)
+    if lora_count == 0:
+        raise RuntimeError(
+            "LoRA enabled but no lora_ parameters were created. "
+            "Check --lora-targets against the LM module names."
+        )
+    frozen = [name for name, param in lora_params if not param.requires_grad]
+    if frozen:
+        _rank0_print(
+            rank,
+            f"[warn] {len(frozen)} LoRA params are frozen; check optimizer setup.",
+        )
+    trainable = sum(param.numel() for _, param in lora_params if param.requires_grad)
+    _rank0_print(
+        rank,
+        f"[lora] params={lora_count:,} trainable={trainable:,} targets={matched}",
+    )
 
 
 def _build_optimizer_params(
@@ -988,6 +1235,41 @@ def _build_optimizer_params(
     return param_groups
 
 
+def _build_optimizer(
+    optimizer_params: List[Dict[str, object]],
+    args: argparse.Namespace,
+    rank: int,
+    zero_stage: Optional[int],
+) -> torch.optim.Optimizer:
+    use_low_precision = bool(args.bf16) or str(getattr(args, "torch_dtype", "")).lower() in {
+        "float16",
+        "bfloat16",
+    }
+    if zero_stage == 0 and args.use_lora and use_low_precision:
+        try:
+            from deepspeed.ops.adam import FusedAdam
+        except ImportError as exc:
+            _rank0_print(
+                rank,
+                "[warn] DeepSpeed FusedAdam unavailable; "
+                f"falling back to AdamW ({exc}).",
+            )
+        else:
+            _rank0_print(
+                rank,
+                "[stage done] using DeepSpeed FusedAdam (FP32 optimizer states) "
+                "for ZeRO-0 LoRA stability",
+            )
+            return FusedAdam(optimizer_params, adam_w_mode=True)
+    if zero_stage == 0 and args.use_lora and use_low_precision:
+        _rank0_print(
+            rank,
+            "[warn] ZeRO-0 + low-precision params + AdamW can underflow LoRA updates; "
+            "consider enabling FusedAdam.",
+        )
+    return torch.optim.AdamW(optimizer_params)
+
+
 def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default=None)
@@ -1001,6 +1283,12 @@ def main() -> None:
         help="Optional JSONL file with proxy labels aligned to --data-path.",
     )
     parser.add_argument(
+        "--require-both-responses",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop samples with empty response_B when the response_B field is present.",
+    )
+    parser.add_argument(
         "--max-training-samples",
         type=int,
         default=0,
@@ -1008,6 +1296,41 @@ def main() -> None:
     )
     parser.add_argument("--judge-encoder", default=None)
     parser.add_argument("--lm", default=None)
+    parser.add_argument(
+        "--attn-implementation",
+        default="flash_attention_2",
+        help="Attention implementation for both encoder and LM (e.g., flash_attention_2, sdpa, eager).",
+    )
+    parser.add_argument(
+        "--padding-side",
+        default=None,
+        choices=["left", "right"],
+        help="Tokenizer padding side; defaults to left when using flash_attention_2.",
+    )
+    parser.add_argument(
+        "--use-rms-norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use RMSNorm in custom heads instead of LayerNorm.",
+    )
+    parser.add_argument(
+        "--rms-norm-eps",
+        type=float,
+        default=1e-6,
+        help="RMSNorm epsilon for custom heads.",
+    )
+    parser.add_argument(
+        "--use-swiglu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use SwiGLU activations in custom MLP heads.",
+    )
+    parser.add_argument(
+        "--allow-tf32",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable TF32 matmul kernels for speed (Ampere+).",
+    )
     parser.add_argument("--z-latent-dim", type=int, default=256)
     parser.add_argument("--z-prompt-len", type=int, default=16)
     parser.add_argument("--bias-prompt-len", type=int, default=8)
@@ -1063,6 +1386,12 @@ def main() -> None:
         help="Batch size for VQ init forward passes (0 = per_device_train_batch_size).",
     )
     parser.add_argument(
+        "--vq-init-autocast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable autocast during VQ codebook initialization.",
+    )
+    parser.add_argument(
         "--vq-init-spherical",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1089,6 +1418,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Freeze LM parameters when LoRA is disabled.",
+    )
+    parser.add_argument(
+        "--freeze-lm-when-lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze non-LoRA LM parameters when LoRA is enabled.",
     )
     parser.add_argument("--bias-proxy-hidden", type=int, default=0)
     parser.add_argument("--bias-proxy-layers", type=int, default=-1)
@@ -1175,7 +1510,19 @@ def main() -> None:
         help="Initialize compact head bias so sigmoid(pi) ~= this value.",
     )
     parser.add_argument("--kl-weight-max", type=float, default=1.0)
+    parser.add_argument(
+        "--compact-kl-chunk-size",
+        type=int,
+        default=0,
+        help="Optional chunk size for compact KL computation (0 = disabled).",
+    )
     parser.add_argument("--z-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lm-loss-chunk-size",
+        type=int,
+        default=0,
+        help="Optional chunk size for causal LM loss to reduce peak memory (0 = disabled).",
+    )
     parser.add_argument("--lambda-bias", type=float, default=1.0)
     parser.add_argument("--low-recon-weight", type=float, default=0.5)
     parser.add_argument("--nll-bin-weight", type=float, default=0.5)
@@ -1378,6 +1725,14 @@ def main() -> None:
     missing = [name for name in required if not getattr(args, name)]
     if missing:
         parser.error(f"Missing required arguments (or YAML keys): {', '.join(missing)}")
+    attn_impl = str(args.attn_implementation or "").strip().lower()
+    if attn_impl in {"", "none", "disable", "disabled"}:
+        attn_impl = ""
+    args.attn_implementation = attn_impl or None
+    if args.attn_implementation == "flash_attention_2":
+        args.torch_dtype = "bfloat16" if args.bf16 else "float16"
+    else:
+        args.torch_dtype = None
     if args.debug_lm_sample_max_tokens is None or args.debug_lm_sample_max_tokens <= 0:
         args.debug_lm_sample_max_tokens = int(args.max_lm_len)
 
@@ -1392,6 +1747,11 @@ def main() -> None:
         warnings.filterwarnings("default")
     else:
         warnings.filterwarnings("ignore")
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
     if args.debug_checkpoint_warning:
         log_base = args.log_dir or args.output_dir or "."
         log_path = os.path.join(log_base, "checkpoint_warn_rank0.log")
@@ -1414,6 +1774,16 @@ def main() -> None:
         judge_tok.pad_token = judge_tok.eos_token
     if lm_tok.pad_token_id is None:
         lm_tok.pad_token = lm_tok.eos_token
+    if args.padding_side:
+        padding_side = args.padding_side
+    else:
+        padding_side = "left" if args.attn_implementation == "flash_attention_2" else None
+    if padding_side:
+        judge_tok.padding_side = padding_side
+        lm_tok.padding_side = padding_side
+    else:
+        padding_side = lm_tok.padding_side
+    args.padding_side = padding_side
 
     mu_id = lm_tok.convert_tokens_to_ids(".")
     if mu_id is None or mu_id == lm_tok.unk_token_id:
@@ -1433,7 +1803,9 @@ def main() -> None:
         ttr_bins = list(ProxyTaskConfig().ttr_bins)
 
     dataset = DIBJudgeDataset.from_jsonl(
-        args.data_path, proxy_cache_path=args.proxy_cache_path
+        args.data_path,
+        proxy_cache_path=args.proxy_cache_path,
+        require_both_responses=bool(args.require_both_responses),
     )
     max_samples = int(args.max_training_samples)
     if max_samples > 0 and len(dataset) > max_samples:
@@ -1503,6 +1875,7 @@ def main() -> None:
         shuffle=(sampler is None),
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
         collate_fn=collator,
     )
     _rank0_print(rank, "[stage done] dataloader ready")
@@ -1526,7 +1899,10 @@ def main() -> None:
                 if torch.is_tensor(lm_mask):
                     take = int(lm_mask[0].sum().item())
                 take = min(take, max_tokens)
-                ids = lm_ids[0, :take].tolist()
+                if lm_tok.padding_side == "left":
+                    ids = lm_ids[0, -take:].tolist()
+                else:
+                    ids = lm_ids[0, :take].tolist()
                 decoded = lm_tok.decode(ids, skip_special_tokens=False)
                 _rank0_print(
                     rank,
@@ -1546,6 +1922,11 @@ def main() -> None:
     model = DIBJudgeModel.init_from_backbones(
         judge_encoder_name=args.judge_encoder,
         judge_lm_name=args.lm,
+        attn_implementation=args.attn_implementation,
+        padding_side=args.padding_side,
+        use_rms_norm=args.use_rms_norm,
+        rms_norm_eps=args.rms_norm_eps,
+        use_swiglu=args.use_swiglu,
         z_latent_dim=args.z_latent_dim,
         z_prompt_len=args.z_prompt_len,
         bias_prompt_len=args.bias_prompt_len,
@@ -1574,6 +1955,8 @@ def main() -> None:
         compact_head_layers=args.compact_head_layers,
         compact_head_dropout=args.compact_head_dropout,
         compact_pi_init=args.compact_pi_init,
+        lm_loss_chunk_size=args.lm_loss_chunk_size,
+        compact_kl_chunk_size=args.compact_kl_chunk_size,
         proxy_nll_classes=max(2, len(nll_bins) - 1),
         proxy_ttr_classes=max(2, len(ttr_bins) - 1),
         proxy_length_classes=max(2, len(length_bins) - 1),
@@ -1583,36 +1966,88 @@ def main() -> None:
     skip_encoder_checkpointing = _set_shared_encoder_trainable(
         model, args.encoder_trainable, rank
     )
-    vq_init_samples = _resolve_vq_init_samples(args, len(dataset), rank)
+    if args.disable_z_prompt_insertion:
+        vq_init_samples = 0
+        args.vq_init_samples = 0
+        args.vq_task_weight = 0.0
+        args.vq_align_weight = 0.0
+        args.vq_usage_weight = 0.0
+        args.disentangle_weight = 0.0
+        args.vq_align_samples = 0
+        _rank0_print(
+            rank,
+            "[stage done] disable_z_prompt_insertion=true; skipping VQ init/losses/align",
+        )
+    else:
+        vq_init_samples = _resolve_vq_init_samples(args, len(dataset), rank)
     args.vq_init_samples = vq_init_samples
     if vq_init_samples > 0:
-        if rank == 0:
-            init_batch_size = (
-                int(args.vq_init_batch_size)
-                if int(args.vq_init_batch_size) > 0
-                else int(args.per_device_train_batch_size)
-            )
-            samples = _collect_vq_task_samples(
-                model=model,
-                dataset=dataset,
-                collator=collator,
-                max_samples=int(vq_init_samples),
-                batch_size=init_batch_size,
-                device=device,
-                seed=int(args.vq_init_seed),
-                rank=rank,
-            )
-            if samples is not None:
-                model.vq_task.initialize_codebook(
-                    samples.to(device),
-                    max_samples=int(vq_init_samples),
-                    seed=int(args.vq_init_seed),
-                    spherical=bool(args.vq_init_spherical),
+        vq_init_dtype = None
+        if args.vq_init_autocast:
+            vq_init_dtype = torch.bfloat16 if args.bf16 else torch.float16
+        init_batch_size = (
+            int(args.vq_init_batch_size)
+            if int(args.vq_init_batch_size) > 0
+            else int(args.per_device_train_batch_size)
+        )
+        per_rank_target = int(math.ceil(float(vq_init_samples) / float(max(1, world_size))))
+        samples = _collect_vq_task_samples(
+            model=model,
+            dataset=dataset,
+            collator=collator,
+            max_samples=per_rank_target,
+            batch_size=init_batch_size,
+            device=device,
+            seed=int(args.vq_init_seed),
+            rank=rank,
+            torch_dtype=vq_init_dtype,
+            enable_autocast=bool(args.vq_init_autocast),
+            world_size=world_size,
+        )
+        merged_samples = samples
+        if dist.is_initialized() and world_size > 1:
+            local = samples
+            if local is None:
+                local = torch.zeros(
+                    (0, model.vq_task.dim),
+                    device=device,
+                    dtype=model.vq_task.codebook.dtype,
                 )
-                _rank0_print(rank, "[stage done] VQ codebook initialized with kmeans++")
-            del samples
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+            else:
+                local = local.to(device=device, dtype=model.vq_task.codebook.dtype)
+            local_size = torch.tensor([local.size(0)], device=device, dtype=torch.long)
+            size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+            dist.all_gather(size_list, local_size)
+            max_size = max(int(size.item()) for size in size_list)
+            if local.size(0) < max_size:
+                pad = torch.zeros(
+                    (max_size - local.size(0), local.size(1)),
+                    device=device,
+                    dtype=local.dtype,
+                )
+                local = torch.cat([local, pad], dim=0)
+            gather_list = [torch.zeros_like(local) for _ in range(world_size)]
+            dist.all_gather(gather_list, local)
+            merged_samples = None
+            if rank == 0:
+                chunks = []
+                for tensor, size in zip(gather_list, size_list):
+                    size_int = int(size.item())
+                    if size_int > 0:
+                        chunks.append(tensor[:size_int].cpu())
+                if chunks:
+                    merged = torch.cat(chunks, dim=0)
+                    if merged.size(0) > vq_init_samples:
+                        merged = merged[:vq_init_samples]
+                    merged_samples = merged
+        if rank == 0 and merged_samples is not None:
+            model.vq_task.initialize_codebook(
+                merged_samples.to(device),
+                max_samples=int(vq_init_samples),
+                seed=int(args.vq_init_seed),
+                spherical=bool(args.vq_init_spherical),
+            )
+            _rank0_print(rank, "[stage done] VQ codebook initialized with kmeans++")
         if dist.is_initialized() and world_size > 1:
             dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
             with torch.no_grad():
@@ -1624,6 +2059,9 @@ def main() -> None:
             torch.cuda.empty_cache()
     _rank0_print(rank, "[stage done] model initialized")
     _maybe_apply_lora(model, args)
+    if args.use_lora and args.freeze_lm_when_lora:
+        _freeze_non_lora_lm_params(model, rank)
+    _validate_lora(model, args, rank)
     if args.freeze_lm_when_no_lora and not args.use_lora:
         _set_lm_trainable(model, False, rank)
     _rank0_print(rank, "[stage done] lora applied" if args.use_lora else "[stage done] lora skipped")
@@ -1656,7 +2094,8 @@ def main() -> None:
         weight_decay=args.weight_decay,
         head_weight_decay=args.head_weight_decay,
     )
-    optimizer = torch.optim.AdamW(optimizer_params)
+    zero_stage = _resolve_zero_stage(args.deepspeed_config)
+    optimizer = _build_optimizer(optimizer_params, args, rank, zero_stage)
 
     steps_per_epoch = math.ceil(len(dataset) / max(1, args.per_device_train_batch_size))
     if world_size > 1:
@@ -1723,6 +2162,7 @@ def main() -> None:
         model_dtype = torch.bfloat16 if args.bf16 else torch.float32
     encoder_params: List[torch.nn.Parameter] = []
     lm_params: List[torch.nn.Parameter] = []
+    lora_params: List[torch.nn.Parameter] = []
     if args.debug_aux_checks:
         for name, param in engine.module.named_parameters():
             if not param.requires_grad:
@@ -1731,6 +2171,8 @@ def main() -> None:
                 encoder_params.append(param)
             elif name.startswith("judge_lm."):
                 lm_params.append(param)
+                if args.use_lora and "lora_" in name:
+                    lora_params.append(param)
 
     use_amp = bool(args.torch_autocast)
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -1804,6 +2246,11 @@ def main() -> None:
             "vq_usage_loss": 0.0,
             "disentangle_loss": 0.0,
             "vq_task_perplexity": 0.0,
+            "vq_task_perplexity_ema": 0.0,
+            "vq_task_active_codes": 0.0,
+            "vq_task_active_fraction": 0.0,
+            "vq_task_usage_entropy": 0.0,
+            "vq_task_unique_codes": 0.0,
             "vq_task_dead_fraction": 0.0,
             "vq_task_avg_distance": 0.0,
             "nll_bin_loss": 0.0,
@@ -1852,8 +2299,8 @@ def main() -> None:
                 kl_weight = _piecewise_linear(
                     progress,
                     [
-                        (0.0, 0.0),
-                        (0.2, 0.0),
+                        (0.0, 0.1 * float(args.kl_weight_max)),
+                        (0.2, 0.1 * float(args.kl_weight_max)),
                         (0.5, float(args.kl_weight_max)),
                         (1.0, float(args.kl_weight_max)),
                     ],
@@ -1908,13 +2355,13 @@ def main() -> None:
                 kl_weight = 0.0
                 mask_group_scale = 0.0
             z_dropout = float(args.z_dropout)
-            batch["compact_prior"] = torch.tensor(keep_ratio, device=device, dtype=torch.float32)
-            batch["z_task_dropout"] = torch.tensor(z_dropout, device=device, dtype=torch.float32)
-            batch["compact_mask_scale"] = torch.tensor(
-                mask_group_scale, device=device, dtype=torch.float32
-            )
+            batch["compact_prior"] = keep_ratio
+            batch["z_task_dropout"] = z_dropout
+            batch["compact_mask_scale"] = mask_group_scale
             batch["disable_compactor"] = disable_compactor
             batch["disable_z_prompt_insertion"] = disable_z_prompt_insertion
+            batch["compute_compact_kl"] = kl_weight > 0.0
+            batch["enable_low_recon"] = float(args.low_recon_weight) > 0.0
 
             diag_metrics: Dict[str, float] = {}
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
@@ -2049,6 +2496,8 @@ def main() -> None:
                 lm_lm_grad = _grad_norm_from_loss(lm_term, lm_params)
                 lm_bias_grad = _grad_norm_from_loss(bias_term, lm_params)
                 lm_comp_grad = _grad_norm_from_loss(compression_term, lm_params)
+                if args.use_lora:
+                    lora_lm_grad = _grad_norm_from_loss(lm_term, lora_params)
                 aux_enc = enc_bias_grad + enc_comp_grad
                 aux_lm = lm_bias_grad + lm_comp_grad
                 diag_metrics.update(
@@ -2067,6 +2516,10 @@ def main() -> None:
                         ),
                     }
                 )
+                if args.use_lora:
+                    diag_metrics["diag/grad_norm/lm/lora"] = float(
+                        lora_lm_grad.item()
+                    )
             elif args.debug_aux_checks and step % args.debug_aux_checks_interval == 0:
                 diag_metrics["diag/grad_norm/skipped_checkpointing"] = 1.0
 
@@ -2094,6 +2547,10 @@ def main() -> None:
                         total_norm > args.max_grad_norm + 1e-6 if args.max_grad_norm > 0 else 0.0
                     ),
                 }
+                if args.use_lora:
+                    last_update_diag["diag/grad_norm_total/lora"] = _param_grad_norm(
+                        lora_params, total_loss.device
+                    )
             engine.step()
 
 
@@ -2106,6 +2563,11 @@ def main() -> None:
             totals["vq_usage_loss"] += vq_usage_loss.item()
             totals["disentangle_loss"] += disentangle_loss.item()
             totals["vq_task_perplexity"] += float(outputs.get("vq_task_perplexity", 0.0))
+            totals["vq_task_perplexity_ema"] += float(outputs.get("vq_task_perplexity_ema", 0.0))
+            totals["vq_task_active_codes"] += float(outputs.get("vq_task_active_codes", 0.0))
+            totals["vq_task_active_fraction"] += float(outputs.get("vq_task_active_fraction", 0.0))
+            totals["vq_task_usage_entropy"] += float(outputs.get("vq_task_usage_entropy", 0.0))
+            totals["vq_task_unique_codes"] += float(outputs.get("vq_task_unique_codes", 0.0))
             totals["vq_task_dead_fraction"] += float(outputs.get("vq_task_dead_fraction", 0.0))
             totals["vq_task_avg_distance"] += float(outputs.get("vq_task_avg_distance", 0.0))
             totals["nll_bin_loss"] += nll_bin_loss.item()
@@ -2193,7 +2655,12 @@ def main() -> None:
                             "vq/task_commitment_loss": float(outputs.get("vq_task_commitment_loss", 0.0)),
                             "vq/task_codebook_loss": float(outputs.get("vq_task_codebook_loss", 0.0)),
                             "vq/task_perplexity": float(outputs.get("vq_task_perplexity", 0.0)),
+                            "vq/task_perplexity_ema": float(outputs.get("vq_task_perplexity_ema", 0.0)),
                             "vq/task_usage_loss": float(outputs.get("vq_task_usage_loss", 0.0)),
+                            "vq/task_active_codes": float(outputs.get("vq_task_active_codes", 0.0)),
+                            "vq/task_active_fraction": float(outputs.get("vq_task_active_fraction", 0.0)),
+                            "vq/task_usage_entropy": float(outputs.get("vq_task_usage_entropy", 0.0)),
+                            "vq/task_unique_codes": float(outputs.get("vq_task_unique_codes", 0.0)),
                             "vq/task_dead_fraction": float(outputs.get("vq_task_dead_fraction", 0.0)),
                             "vq/task_avg_distance": float(outputs.get("vq_task_avg_distance", 0.0)),
                             "nll_bin_loss": nll_bin_loss.item(),
@@ -2268,6 +2735,7 @@ def main() -> None:
                     tag=f"step-{optim_step}",
                     args=args,
                     rank=rank,
+                    engine=engine,
                 )
             step += 1
 
@@ -2296,6 +2764,7 @@ def main() -> None:
                 tag=f"epoch-{epoch}",
                 args=args,
                 rank=rank,
+                engine=engine,
             )
     if swanlab_client is not None and rank == 0:
         finish_swanlab(swanlab_client)

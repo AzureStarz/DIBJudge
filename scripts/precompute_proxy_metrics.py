@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import warnings
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -73,7 +74,7 @@ def _maybe_tqdm(iterable, total: Optional[int], desc: str):
 def _compute_nll(
     model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     logits = outputs.logits
     if logits.size(1) < 2:
         return logits.new_zeros((logits.size(0),))
@@ -91,17 +92,70 @@ def _compute_nll(
     return loss.sum(dim=1) / denom
 
 
-def _token_metrics(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> List[Dict[str, float]]:
+def _token_metrics(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    padding_side: str,
+) -> List[Dict[str, float]]:
     metrics: List[Dict[str, float]] = []
+    pad_side = str(padding_side or "right").lower()
     lengths = attention_mask.sum(dim=1).tolist()
     for row, length in enumerate(lengths):
         length = int(length)
         if length <= 0:
             metrics.append({"length": 0.0, "ttr": 0.0})
             continue
-        ids = input_ids[row, :length].tolist()
+        if pad_side == "left":
+            ids = input_ids[row, -length:].tolist()
+        else:
+            ids = input_ids[row, :length].tolist()
         metrics.append({"length": float(length), "ttr": float(len(set(ids)) / float(length))})
     return metrics
+
+
+def _resolve_torch_dtype(value: Optional[str]) -> Optional[torch.dtype]:
+    if value is None:
+        return None
+    mapping = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    return mapping.get(value)
+
+
+def _load_causal_lm(
+    name: str,
+    attn_implementation: Optional[str],
+    torch_dtype: Optional[torch.dtype],
+    trust_remote_code: bool,
+    device: str,
+) -> torch.nn.Module:
+    kwargs: Dict[str, object] = {"trust_remote_code": trust_remote_code}
+    if torch_dtype is not None:
+        kwargs["torch_dtype"] = torch_dtype
+    use_flash = attn_implementation == "flash_attention_2"
+    if attn_implementation:
+        kwargs["attn_implementation"] = attn_implementation
+    if use_flash and device.startswith("cuda") and torch.cuda.is_available():
+        kwargs["device_map"] = "cuda"
+        kwargs["low_cpu_mem_usage"] = True
+    try:
+        model = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+    except (TypeError, ValueError, ImportError) as exc:
+        if attn_implementation:
+            warnings.warn(
+                f"attn_implementation={attn_implementation} unavailable for {name}: {exc}. "
+                "Falling back to default attention.",
+                RuntimeWarning,
+            )
+        kwargs.pop("attn_implementation", None)
+        kwargs.pop("device_map", None)
+        kwargs.pop("low_cpu_mem_usage", None)
+        model = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+    model.eval()
+    model.to(device)
+    return model
 
 
 def _prepare_tasks(
@@ -181,6 +235,22 @@ def main() -> None:
         choices=["float16", "bfloat16", "float32"],
         help="Torch dtype for the LM.",
     )
+    parser.add_argument(
+        "--attn-implementation",
+        default=None,
+        help="Attention backend for the LM (e.g., flash_attention_2, sdpa, eager).",
+    )
+    parser.add_argument(
+        "--padding-side",
+        default="right",
+        choices=["left", "right"],
+        help="Tokenizer padding side used during batching.",
+    )
+    parser.add_argument(
+        "--allow-tf32",
+        action="store_true",
+        help="Enable TF32 matmul on CUDA for faster inference.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--max-samples", type=int, default=0)
     args = parser.parse_args()
@@ -194,28 +264,28 @@ def main() -> None:
     device = args.device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = None
-    if args.dtype == "float16":
-        torch_dtype = torch.float16
-    elif args.dtype == "bfloat16":
-        torch_dtype = torch.bfloat16
-    elif args.dtype == "float32":
-        torch_dtype = torch.float32
+    torch_dtype = _resolve_torch_dtype(args.dtype)
+    attn_impl = str(args.attn_implementation or "").strip() or None
+    if attn_impl == "flash_attention_2" and device.startswith("cuda") and torch_dtype is None:
+        torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     if device.startswith("cpu") and torch_dtype in {torch.float16, torch.bfloat16}:
         torch_dtype = torch.float32
+    if args.allow_tf32 and device.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     tokenizer = AutoTokenizer.from_pretrained(args.lm, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    tokenizer.padding_side = args.padding_side
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = _load_causal_lm(
         args.lm,
+        attn_impl,
         torch_dtype=torch_dtype,
         trust_remote_code=args.trust_remote_code,
+        device=device,
     )
-    model.eval()
-    model.to(device)
 
     with open(output_path, "w", encoding="utf-8") as out_handle:
         start_idx = 0
@@ -296,7 +366,7 @@ def _process_chunk(
         )
         input_ids = enc["input_ids"].to(device)
         attention_mask = enc["attention_mask"].to(device)
-        metrics = _token_metrics(input_ids, attention_mask)
+        metrics = _token_metrics(input_ids, attention_mask, tokenizer.padding_side)
 
         need_nll = any(task["need_nll"] for task in batch_tasks)
         nll_values: List[float] = [0.0] * len(batch_tasks)

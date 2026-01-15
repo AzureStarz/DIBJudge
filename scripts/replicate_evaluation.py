@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import glob
 import hashlib
 import json
 import os
 import random
 import re
+import time
 from collections import defaultdict
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
 
+import aiohttp
 from datasets import load_dataset
 import eval_stats
 
@@ -41,18 +44,61 @@ DEFAULT_VERDICT_B = "[[B]]"
 QWEN3_SYSTEM_PREFIX = "You are Qwen3, an AI assistant that reasons, thinks, and answers strictly in English."
 _PRINTED_TEST_PROMPT = False
 
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
+REPLICATE_BASE_URL = "https://api.replicate.com/v1/models"
+REPLICATE_TERMINAL_STATES = {"succeeded", "failed", "canceled"}
+DEFAULT_REPLICATE_CONCURRENCY = 1
+DEFAULT_REPLICATE_DEFER_SECONDS = 60
+DEFAULT_REPLICATE_POLL_DELAY = 30.0
+DEFAULT_REPLICATE_MAX_WAIT_SECONDS = 10800
+DEFAULT_REPLICATE_RETRIES = 3
+DEFAULT_REPLICATE_RETRY_DELAY = 10.0
+DEFAULT_REPLICATE_CONNECT_TIMEOUT = 30
+DEFAULT_REPLICATE_TOTAL_TIMEOUT = 300
+DEFAULT_REPLICATE_MAX_RESUBMITS = 1
+DEFAULT_REPLICATE_SUBMIT_DELAY = 0.1
+DEFAULT_REPLICATE_KEEPALIVE_MINUTES = 1.0
+DEFAULT_REPLICATE_KEEPALIVE_DURING_SUBMIT = False
+DEFAULT_REPLICATE_ROLLING_BATCH_SIZE = 100
+ENV_PROXY = (
+    os.environ.get("REPLICATE_PROXY")
+    or os.environ.get("HTTPS_PROXY")
+    or os.environ.get("HTTP_PROXY")
+)
+
 
 class _SafeDict(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
 
 
-def _chunked(items: Sequence[str], size: int) -> Iterable[List[str]]:
+T = TypeVar("T")
+
+
+def _chunked(items: Sequence[T], size: int) -> Iterable[List[T]]:
     if size <= 0:
         yield list(items)
         return
     for idx in range(0, len(items), size):
         yield list(items[idx : idx + size])
+
+
+def _print_progress(prefix: str, done: int, total: int, width: int = 30) -> None:
+    total = max(total, 1)
+    done = min(done, total)
+    filled = int(width * done / total)
+    bar = "#" * filled + "-" * (width - filled)
+    pct = int(100 * done / total)
+    print(f"\r{prefix} [{bar}] {done}/{total} ({pct}%)", end="", flush=True)
+
+
+def _prediction_get_url(item: Dict[str, object]) -> Optional[str]:
+    prediction = item.get("prediction") or {}
+    urls = prediction.get("urls") or {}
+    get_url = urls.get("get")
+    if not get_url and prediction.get("id"):
+        get_url = f"https://api.replicate.com/v1/predictions/{prediction['id']}"
+    return get_url
 
 
 def _format_table(rows: List[List[str]], headers: List[str]) -> str:
@@ -119,14 +165,13 @@ def _load_template(
     return template, verdict_a, verdict_b
 
 
-def _render_default_prompt(
-    tokenizer,
+def _render_default_prompt_parts(
     question: str,
     answer_a: str,
     answer_b: str,
     src_lang: str,
     tgt_lang: str,
-) -> str:
+) -> Tuple[str, str, List[Dict[str, str]]]:
     system_prompt = DEFAULT_SYSTEM_PROMPT.format(src_lang=src_lang, tgt_lang=tgt_lang)
     user_prompt = DEFAULT_USER_PROMPT.format(
         question=question, answer_a=answer_a, answer_b=answer_b
@@ -135,21 +180,14 @@ def _render_default_prompt(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    if tokenizer is not None:
-        apply = getattr(tokenizer, "apply_chat_template", None)
-        if callable(apply):
-            try:
-                return apply(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=True,
-                )
-            except TypeError:
-                try:
-                    return apply(messages, tokenize=False, add_generation_prompt=True)
-                except TypeError:
-                    return apply(messages, tokenize=False)
+    return system_prompt, user_prompt, messages
+
+
+def _format_prompt_for_debug(
+    messages: List[Dict[str, str]],
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
     return system_prompt + "\n\n" + user_prompt
 
 
@@ -189,17 +227,10 @@ def _safe_format_template(template: str, payload: Dict[str, object]) -> str:
     return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
 
 
-def _get_reproducible_rubric_str(
-    rubric_list: Sequence[object],
-    row_id: object,
-    seed_value: Optional[object] = None,
-) -> str:
+def _get_reproducible_rubric_str(rubric_list: Sequence[object], seed_value: object) -> str:
     if not rubric_list:
         return ""
-    if seed_value is None:
-        seed_text = str(row_id)
-    else:
-        seed_text = f"{seed_value}:{row_id}"
+    seed_text = str(seed_value)
     digest = hashlib.sha256(seed_text.encode("utf-8")).hexdigest()
     idx = int(digest, 16) % len(rubric_list)
     rubric = rubric_list[idx]
@@ -235,21 +266,17 @@ def _select_mr3_template_type(
     return "general"
 
 
-def _render_mr3_prompt(
-    tokenizer,
+def _render_mr3_prompt_parts(
     templated_dict: Dict[str, object],
     template_type: str,
     question: str,
     answer_a: str,
     answer_b: str,
     row_id: object,
-    seed_value: Optional[object],
-) -> str:
+) -> Tuple[str, str, List[Dict[str, str]]]:
     instruction_msg = str(templated_dict.get("instruction_msg") or "Instruction")
     rubric_list = templated_dict.get(template_type, {}).get("rubric_list", [])
-    shuffled_rubric = _get_reproducible_rubric_str(
-        rubric_list, row_id, seed_value=seed_value
-    )
+    shuffled_rubric = _get_reproducible_rubric_str(rubric_list, row_id)
     task_description = templated_dict.get(template_type, {}).get("task_description", "")
     tags = templated_dict.get("tags", {})
     schema = templated_dict.get(template_type, {}).get("schema")
@@ -277,22 +304,7 @@ def _render_mr3_prompt(
         {"role": "system", "content": developer_text},
         {"role": "user", "content": user_text},
     ]
-    if tokenizer is not None:
-        apply = getattr(tokenizer, "apply_chat_template", None)
-        if callable(apply):
-            try:
-                return apply(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=True,
-                )
-            except TypeError:
-                try:
-                    return apply(messages, tokenize=False, add_generation_prompt=True)
-                except TypeError:
-                    return apply(messages, tokenize=False)
-    return developer_text + "\n\n" + user_text
+    return developer_text, user_text, messages
 
 
 def _load_mm_eval(local_dir: str):
@@ -402,12 +414,10 @@ def _resolve_mreward_languages(
 def _build_task(
     row: dict,
     template: Optional[Union[str, Dict[str, object]]],
-    tokenizer,
     rng: random.Random,
     benchmark: str,
     language_override: Optional[str] = None,
-    seed_value: Optional[int] = None,
-) -> Tuple[str, dict]:
+) -> Tuple[Dict[str, object], dict]:
     question = str(row.get("prompt", ""))
     chosen = str(row.get("chosen", ""))
     rejected = str(row.get("rejected", ""))
@@ -425,24 +435,29 @@ def _build_task(
     if template:
         if isinstance(template, dict):
             template_type = _select_mr3_template_type(template, benchmark, row)
-            prompt = _render_mr3_prompt(
-                tokenizer,
+            system_prompt, user_prompt, messages = _render_mr3_prompt_parts(
                 template,
                 template_type,
                 question,
                 answer_a,
                 answer_b,
                 row.get("id"),
-                seed_value,
             )
         else:
-            prompt = _render_template_prompt(
+            system_prompt = ""
+            user_prompt = _render_template_prompt(
                 template, question, answer_a, answer_b, src_lang, tgt_lang
             )
+            messages = [{"role": "user", "content": user_prompt}]
     else:
-        prompt = _render_default_prompt(
-            tokenizer, question, answer_a, answer_b, src_lang, tgt_lang
+        system_prompt, user_prompt, messages = _render_default_prompt_parts(
+            question, answer_a, answer_b, src_lang, tgt_lang
         )
+    prompt_payload = {
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "messages": messages,
+    }
     meta = {
         "benchmark": benchmark,
         "id": row.get("id"),
@@ -459,171 +474,528 @@ def _build_task(
     }
     global _PRINTED_TEST_PROMPT
     if not _PRINTED_TEST_PROMPT:
-        print("[test] final_prompt:\n", prompt)
+        debug_prompt = _format_prompt_for_debug(messages, system_prompt, user_prompt)
+        print("[test] final_prompt:\n", debug_prompt)
         _PRINTED_TEST_PROMPT = True
-    return prompt, meta
+    return prompt_payload, meta
 
 
-def _write_prompt_log(path: str, prompts: List[str]) -> None:
-    if not path:
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        for idx, prompt in enumerate(prompts):
-            payload = {"idx": idx, "prompt": prompt}
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def _run_vllm(
-    model: str,
-    tensor_parallel_size: int,
-    gpu_memory_utilization: float,
-    max_model_len: Optional[int],
-    trust_remote_code: bool,
-    seed: Optional[int] = None,
-) -> Tuple["LLM", object]:
-    from vllm import LLM
-
-    kwargs = {
-        "model": model,
-        "tensor_parallel_size": tensor_parallel_size,
-        "gpu_memory_utilization": gpu_memory_utilization,
-        "max_model_len": max_model_len,
-        "trust_remote_code": trust_remote_code,
+def _replicate_input_from_prompt(
+    prompt_payload: Dict[str, object],
+    args: argparse.Namespace,
+    seed: Optional[int],
+) -> Dict[str, object]:
+    user_prompt = str(prompt_payload.get("user_prompt") or "")
+    system_prompt = str(prompt_payload.get("system_prompt") or "")
+    messages = prompt_payload.get("messages")
+    payload: Dict[str, object] = {
+        args.prompt_key: user_prompt,
+        args.system_message_key: system_prompt,
     }
+    if isinstance(messages, list):
+        payload["messages"] = messages
+    if args.temperature is not None:
+        payload["temperature"] = args.temperature
+    if args.top_p is not None:
+        payload["top_p"] = args.top_p
+    if args.top_k is not None:
+        payload["top_k"] = args.top_k
+    if args.max_tokens is not None:
+        payload["max_tokens"] = args.max_tokens
+        payload["max_output_tokens"] = args.max_tokens
+        payload["max_completion_tokens"] = args.max_tokens
     if seed is not None:
-        kwargs["seed"] = seed
-    try:
-        llm = LLM(**kwargs)
-    except TypeError:
-        kwargs.pop("seed", None)
-        llm = LLM(**kwargs)
-    return llm, llm.get_tokenizer()
+        payload["seed"] = seed
+    payload.setdefault("thinking_budget", args.thinking_budget)
+    return payload
 
 
-def _shutdown_vllm(llm) -> None:
-    if llm is None:
-        return
-    for attr in ("shutdown", "close"):
-        fn = getattr(llm, attr, None)
-        if callable(fn):
-            try:
-                fn()
-                return
-            except Exception:
-                pass
-    engine = getattr(llm, "engine", None) or getattr(llm, "_engine", None)
-    if engine is None:
-        return
-    for attr in ("shutdown", "close"):
-        fn = getattr(engine, attr, None)
-        if callable(fn):
-            try:
-                fn()
-                return
-            except Exception:
-                pass
+def _output_to_text(output: object) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, list):
+        if all(isinstance(chunk, str) for chunk in output):
+            return "".join(output)
+        return json.dumps(output, ensure_ascii=False)
+    return str(output)
 
 
-def _generate_vllm(
-    llm: "LLM",
-    prompts: List[str],
-    batch_size: int,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    seed: Optional[int] = None,
-) -> List[str]:
-    from vllm import SamplingParams
-
-    sampling_kwargs = {
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k if top_k is not None else -1,
-    }
-    if seed is not None:
-        sampling_kwargs["seed"] = seed
-    try:
-        sampling_params = SamplingParams(**sampling_kwargs)
-    except TypeError:
-        sampling_kwargs.pop("seed", None)
-        sampling_params = SamplingParams(**sampling_kwargs)
-    outputs: List[str] = []
-    for chunk in _chunked(prompts, batch_size):
-        results = llm.generate(chunk, sampling_params)
-        for out in results:
-            if not out.outputs:
-                outputs.append("")
-            else:
-                outputs.append(out.outputs[0].text)
-    return outputs
-
-
-def _init_transformers(
+async def _submit_prediction(
+    session: aiohttp.ClientSession,
     model: str,
-    trust_remote_code: bool,
-):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    item: Dict[str, object],
+    max_retries: int,
+    retry_delay: float,
+    proxy: Optional[str],
+) -> Dict[str, object]:
+    if not REPLICATE_API_TOKEN:
+        return {
+            "id": item.get("id"),
+            "custom_id": item.get("custom_id"),
+            "input": item.get("input"),
+            "error": "Missing REPLICATE_API_TOKEN",
+            "status": "failed",
+        }
 
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model_obj = AutoModelForCausalLM.from_pretrained(
-        model, dtype=torch.float16, device_map="auto", trust_remote_code=trust_remote_code
+    headers = {
+        "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"input": item.get("input", {})}
+
+    for attempt in range(max_retries):
+        try:
+            async with session.post(
+                f"{REPLICATE_BASE_URL}/{model}/predictions",
+                headers=headers,
+                json=payload,
+                proxy=proxy,
+            ) as resp:
+                if resp.status not in (200, 201):
+                    error_text = await resp.text()
+                    if attempt == max_retries - 1:
+                        return {
+                            "id": item.get("id"),
+                            "custom_id": item.get("custom_id"),
+                            "input": item.get("input"),
+                            "error": f"HTTP {resp.status}: {error_text}",
+                            "status": "failed",
+                        }
+                    await asyncio.sleep(retry_delay * (2**attempt))
+                    continue
+                prediction = await resp.json()
+                return {
+                    "id": item.get("id"),
+                    "custom_id": item.get("custom_id"),
+                    "input": item.get("input"),
+                    "prediction": prediction,
+                    "status": "success",
+                }
+        except Exception as exc:
+            if attempt == max_retries - 1:
+                return {
+                    "id": item.get("id"),
+                    "custom_id": item.get("custom_id"),
+                    "input": item.get("input"),
+                    "error": str(exc),
+                    "status": "failed",
+                }
+            await asyncio.sleep(retry_delay * (2**attempt))
+
+    return {
+        "id": item.get("id"),
+        "custom_id": item.get("custom_id"),
+        "input": item.get("input"),
+        "error": "Unexpected retry exhaustion",
+        "status": "failed",
+    }
+
+
+async def _submit_batch(
+    session: aiohttp.ClientSession,
+    model: str,
+    batch: List[Dict[str, object]],
+    max_retries: int,
+    retry_delay: float,
+    proxy: Optional[str],
+) -> List[Dict[str, object]]:
+    tasks = [
+        _submit_prediction(
+            session=session,
+            model=model,
+            item=item,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            proxy=proxy,
+        )
+        for item in batch
+    ]
+    return await asyncio.gather(*tasks)
+
+
+async def _submit_all_predictions(
+    requests: List[Dict[str, object]],
+    args: argparse.Namespace,
+) -> List[Dict[str, object]]:
+    connector = aiohttp.TCPConnector(limit=args.replicate_concurrency)
+    timeout = aiohttp.ClientTimeout(
+        total=args.replicate_total_timeout, connect=args.replicate_connect_timeout
     )
-    model_obj.eval()
-    return model_obj, tokenizer
-
-
-def _init_tokenizer_only(model: str, trust_remote_code: bool):
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
-
-
-def _generate_transformers(
-    model_obj,
-    tokenizer,
-    prompts: List[str],
-    batch_size: int,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    seed: Optional[int] = None,
-):
-    import torch
-
-    outputs: List[str] = []
-    with torch.inference_mode():
-        if seed is not None:
-            torch.manual_seed(seed)
-        for chunk in _chunked(prompts, batch_size):
-            enc = tokenizer(
-                chunk,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-            ).to(model_obj.device)
-            gen = model_obj.generate(
-                **enc,
-                max_new_tokens=max_tokens,
-                do_sample=temperature > 0,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k if top_k is not None else 0,
+    results: List[Dict[str, object]] = []
+    proxy = args.replicate_proxy or ENV_PROXY
+    total = len(requests)
+    completed = 0
+    pending_for_keepalive: List[Dict[str, object]] = []
+    keepalive_interval = max(args.replicate_keepalive_minutes * 60.0, 0.0)
+    last_keepalive = time.monotonic()
+    if total:
+        _print_progress("[replicate submit]", completed, total)
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout, trust_env=True
+    ) as session:
+        for batch in _chunked(requests, args.replicate_concurrency):
+            batch_results = await _submit_batch(
+                session=session,
+                model=args.model,
+                batch=batch,
+                max_retries=args.replicate_retries,
+                retry_delay=args.replicate_retry_delay,
+                proxy=proxy,
             )
-            text = tokenizer.batch_decode(
-                gen[:, enc["input_ids"].size(1) :], skip_special_tokens=True
+            results.extend(batch_results)
+            pending_for_keepalive.extend(
+                [item for item in batch_results if item.get("status") == "success"]
             )
-            outputs.extend(text)
-    return outputs
+            completed += len(batch)
+            if total:
+                _print_progress("[replicate submit]", completed, total)
+            if (
+                args.replicate_keepalive_during_submit
+                and keepalive_interval > 0
+                and pending_for_keepalive
+                and (time.monotonic() - last_keepalive) >= keepalive_interval
+            ):
+                print("")
+                print(
+                    f"[info] Keepalive polling {len(pending_for_keepalive)} submissions during submit."
+                )
+                keepalive_results = await _keepalive_round_with_session(
+                    session,
+                    pending_for_keepalive,
+                    args,
+                    "[replicate keepalive]",
+                )
+                next_pending: List[Dict[str, object]] = []
+                for idx, item in enumerate(pending_for_keepalive):
+                    status = keepalive_results[idx].get("status")
+                    if status not in REPLICATE_TERMINAL_STATES:
+                        next_pending.append(item)
+                pending_for_keepalive = next_pending
+                last_keepalive = time.monotonic()
+            if args.replicate_submit_delay:
+                await asyncio.sleep(args.replicate_submit_delay)
+    if total:
+        print("")
+    return results
+
+
+async def _poll_prediction(
+    session: aiohttp.ClientSession,
+    item: Dict[str, object],
+    poll_delay: float,
+    max_wait_seconds: float,
+    proxy: Optional[str],
+) -> Dict[str, object]:
+    get_url = _prediction_get_url(item)
+    if not get_url:
+        return {
+            "id": item.get("id"),
+            "custom_id": item.get("custom_id"),
+            "input": item.get("input"),
+            "error": "Missing prediction GET url",
+            "status": "failed",
+        }
+
+    headers = {
+        "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+        "Accept": "application/json",
+    }
+    start = time.monotonic()
+    delay = poll_delay
+    last_payload: Optional[Dict[str, object]] = None
+
+    while True:
+        try:
+            async with session.get(get_url, headers=headers, proxy=proxy) as resp:
+                if resp.status == 404:
+                    return {
+                        "id": item.get("id"),
+                        "custom_id": item.get("custom_id"),
+                        "input": item.get("input"),
+                        "error": "Prediction expired or not found",
+                        "status": "expired",
+                    }
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    last_payload = {
+                        "error": f"HTTP {resp.status}: {error_text}",
+                        "status": "failed",
+                    }
+                else:
+                    last_payload = await resp.json()
+                    if last_payload.get("status") in REPLICATE_TERMINAL_STATES:
+                        output_text = _output_to_text(last_payload.get("output"))
+                        status = (
+                            "success"
+                            if last_payload.get("status") == "succeeded"
+                            else "failed"
+                        )
+                        result = {
+                            "id": item.get("id"),
+                            "custom_id": item.get("custom_id"),
+                            "input": item.get("input"),
+                            "prediction": last_payload,
+                            "output": output_text,
+                            "status": status,
+                        }
+                        if status != "success":
+                            result["error"] = last_payload.get("error")
+                        return result
+        except Exception as exc:
+            last_payload = {"error": str(exc), "status": "failed"}
+
+        if time.monotonic() - start >= max_wait_seconds:
+            return {
+                "id": item.get("id"),
+                "custom_id": item.get("custom_id"),
+                "input": item.get("input"),
+                "prediction": last_payload,
+                "error": "Prediction polling timed out",
+                "status": "timeout",
+            }
+
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.2, 300.0)
+
+
+async def _fetch_batch(
+    session: aiohttp.ClientSession,
+    batch: List[Dict[str, object]],
+    poll_delay: float,
+    max_wait_seconds: float,
+    proxy: Optional[str],
+) -> List[Dict[str, object]]:
+    tasks = [
+        _poll_prediction(
+            session=session,
+            item=item,
+            poll_delay=poll_delay,
+            max_wait_seconds=max_wait_seconds,
+            proxy=proxy,
+        )
+        for item in batch
+    ]
+    return await asyncio.gather(*tasks)
+
+
+async def _fetch_all_predictions(
+    submissions: List[Dict[str, object]],
+    args: argparse.Namespace,
+) -> List[Dict[str, object]]:
+    connector = aiohttp.TCPConnector(limit=args.replicate_concurrency)
+    timeout = aiohttp.ClientTimeout(
+        total=args.replicate_total_timeout, connect=args.replicate_connect_timeout
+    )
+    results: List[Dict[str, object]] = []
+    proxy = args.replicate_proxy or ENV_PROXY
+    total = len(submissions)
+    completed = 0
+    if total:
+        _print_progress("[replicate fetch]", completed, total)
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout, trust_env=True
+    ) as session:
+        for batch in _chunked(submissions, args.replicate_concurrency):
+            batch_results = await _fetch_batch(
+                session=session,
+                batch=batch,
+                poll_delay=args.replicate_poll_delay,
+                max_wait_seconds=args.replicate_max_wait_seconds,
+                proxy=proxy,
+            )
+            results.extend(batch_results)
+            completed += len(batch)
+            if total:
+                _print_progress("[replicate fetch]", completed, total)
+    if total:
+        print("")
+    return results
+
+
+async def _keepalive_ping(
+    session: aiohttp.ClientSession,
+    item: Dict[str, object],
+    proxy: Optional[str],
+) -> Dict[str, object]:
+    get_url = _prediction_get_url(item)
+    if not get_url:
+        return {"status": "error", "error": "Missing prediction GET url"}
+
+    headers = {
+        "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+        "Accept": "application/json",
+    }
+    try:
+        async with session.get(get_url, headers=headers, proxy=proxy) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                return {"status": "error", "error": f"HTTP {resp.status}: {error_text}"}
+            payload = await resp.json()
+            return {"status": payload.get("status"), "prediction": payload}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+async def _keepalive_round(
+    submissions: List[Dict[str, object]],
+    args: argparse.Namespace,
+) -> List[Dict[str, object]]:
+    connector = aiohttp.TCPConnector(limit=args.replicate_concurrency)
+    timeout = aiohttp.ClientTimeout(
+        total=args.replicate_total_timeout, connect=args.replicate_connect_timeout
+    )
+    proxy = args.replicate_proxy or ENV_PROXY
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout, trust_env=True
+    ) as session:
+        return await _keepalive_round_with_session(
+            session, submissions, args, "[replicate keepalive]"
+        )
+
+
+async def _keepalive_round_with_session(
+    session: aiohttp.ClientSession,
+    submissions: List[Dict[str, object]],
+    args: argparse.Namespace,
+    prefix: str,
+) -> List[Dict[str, object]]:
+    results: List[Dict[str, object]] = []
+    total = len(submissions)
+    completed = 0
+    if total:
+        _print_progress(prefix, completed, total)
+    proxy = args.replicate_proxy or ENV_PROXY
+    for batch in _chunked(submissions, args.replicate_concurrency):
+        tasks = [
+            _keepalive_ping(session=session, item=item, proxy=proxy) for item in batch
+        ]
+        batch_results = await asyncio.gather(*tasks)
+        results.extend(batch_results)
+        completed += len(batch)
+        if total:
+            _print_progress(prefix, completed, total)
+    if total:
+        print("")
+    return results
+
+
+def _defer_then_fetch(
+    submissions: List[Dict[str, object]],
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    if args.replicate_defer_seconds > 0:
+        if args.replicate_keepalive_minutes > 0:
+            interval = max(args.replicate_keepalive_minutes * 60.0, 1.0)
+            end_time = time.monotonic() + args.replicate_defer_seconds
+            pending = [item for item in submissions if item.get("status") == "success"]
+            while pending and time.monotonic() < end_time:
+                print(f"[info] Keepalive polling {len(pending)} predictions.")
+                keepalive_results = asyncio.run(_keepalive_round(pending, args))
+                next_pending: List[Dict[str, object]] = []
+                for idx, item in enumerate(pending):
+                    status = keepalive_results[idx].get("status")
+                    if status not in REPLICATE_TERMINAL_STATES:
+                        next_pending.append(item)
+                pending = next_pending
+                if not pending:
+                    break
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(interval, remaining))
+        else:
+            print(
+                f"[info] Sleeping {args.replicate_defer_seconds:.0f}s before fetching Replicate results."
+            )
+            time.sleep(args.replicate_defer_seconds)
+
+    results = asyncio.run(_fetch_all_predictions(submissions, args))
+
+    resubmit_round = 0
+    while resubmit_round < args.replicate_max_resubmits:
+        expired = [item for item in results if item.get("status") == "expired"]
+        if not expired:
+            break
+        resubmit_round += 1
+        print(f"[warn] Resubmitting {len(expired)} expired Replicate requests.")
+        resubmissions = asyncio.run(_submit_all_predictions(expired, args))
+        submissions.extend(resubmissions)
+        results = [item for item in results if item.get("status") != "expired"]
+        results.extend(asyncio.run(_fetch_all_predictions(resubmissions, args)))
+
+    return results, submissions
+
+
+def _generate_replicate(
+    prompts: List[Dict[str, object]],
+    args: argparse.Namespace,
+    seed: Optional[int],
+    submission_path: Optional[str] = None,
+    result_path: Optional[str] = None,
+) -> List[str]:
+    # Replicate inference replaces vLLM/transformers: submit now, defer fetch, then poll.
+    if not REPLICATE_API_TOKEN:
+        raise RuntimeError("Missing REPLICATE_API_TOKEN for Replicate inference.")
+    requests: List[Dict[str, object]] = []
+    for idx, prompt in enumerate(prompts):
+        input_payload = _replicate_input_from_prompt(prompt, args, seed)
+        requests.append(
+            {
+                "id": idx,
+                "custom_id": f"task_{idx}",
+                "input": input_payload,
+            }
+        )
+
+    all_submissions: List[Dict[str, object]] = []
+    all_results: List[Dict[str, object]] = []
+
+    if args.replicate_rolling_batch_size and args.replicate_rolling_batch_size > 0:
+        for batch in _chunked(requests, args.replicate_rolling_batch_size):
+            submissions = asyncio.run(_submit_all_predictions(batch, args))
+            failed_submissions = [
+                item for item in submissions if item.get("status") != "success"
+            ]
+            if failed_submissions:
+                print(f"[warn] {len(failed_submissions)} Replicate submissions failed.")
+                if len(failed_submissions) == len(submissions):
+                    raise RuntimeError(
+                        "All Replicate submissions failed; aborting fetch."
+                    )
+            results, submissions = _defer_then_fetch(submissions, args)
+            all_submissions.extend(submissions)
+            all_results.extend(results)
+    else:
+        submissions = asyncio.run(_submit_all_predictions(requests, args))
+        failed_submissions = [
+            item for item in submissions if item.get("status") != "success"
+        ]
+        if failed_submissions:
+            print(f"[warn] {len(failed_submissions)} Replicate submissions failed.")
+            if len(failed_submissions) == len(submissions):
+                raise RuntimeError("All Replicate submissions failed; aborting fetch.")
+        results, submissions = _defer_then_fetch(submissions, args)
+        all_submissions.extend(submissions)
+        all_results.extend(results)
+
+    if submission_path:
+        _save_jsonl(submission_path, all_submissions)
+    if result_path:
+        _save_jsonl(result_path, all_results)
+
+    completions = [""] * len(prompts)
+    failures = 0
+    for item in all_results:
+        idx = item.get("id")
+        if idx is None or not isinstance(idx, int):
+            continue
+        if item.get("status") == "success":
+            completions[idx] = str(item.get("output") or "")
+        else:
+            failures += 1
+    if failures:
+        print(f"[warn] {failures} Replicate results failed or timed out.")
+    return completions
 
 
 def _build_records(
@@ -692,6 +1064,11 @@ def _result_paths(output_dir: str, benchmark: str, lang: str) -> Tuple[str, str]
     raw_path = os.path.join(output_dir, f"{prefix}_{lang}_raw.jsonl")
     parsed_path = os.path.join(output_dir, f"{prefix}_{lang}_parsed.jsonl")
     return raw_path, parsed_path
+
+
+def _sanitize_path_component(value: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value.strip())
+    return safe or "model"
 
 
 def _parsed_from_raw(raw_rows: List[dict]) -> Optional[List[dict]]:
@@ -938,12 +1315,6 @@ def _evaluate_seed(
     mm_selected: List[str],
     mreward_pairs: List[Tuple[str, str]],
     expected_groups: List[Tuple[str, str]],
-    tokenizer: Optional[object],
-    generate_fn: Optional[
-        Callable[
-            [List[str], int, int, float, float, int, Optional[int]], List[str]
-        ]
-    ],
 ) -> dict:
     eval_stats.seed_everything(seed)
     seed_output_dir = os.path.join(args.output_dir, f"seed_{seed}")
@@ -963,11 +1334,8 @@ def _evaluate_seed(
     generated_groups: set[Tuple[str, str]] = set()
 
     if missing_groups:
-        if tokenizer is None or generate_fn is None:
-            raise ValueError("Generation requested but no model was initialized.")
-
         tasks: List[dict] = []
-        prompts: List[str] = []
+        prompts: List[Dict[str, object]] = []
         if mm_grouped is not None:
             for lang in mm_selected:
                 if ("MM-Eval", lang) not in missing_set:
@@ -979,19 +1347,15 @@ def _evaluate_seed(
                     prompt, meta = _build_task(
                         row,
                         template,
-                        tokenizer,
                         rng,
                         "MM-Eval",
                         language_override=lang,
-                        seed_value=seed,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
 
         if mreward_pairs:
-            mreward_dir = os.path.join(
-                "data", "eval_data", "multilingual-reward-bench"
-            )
+            mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
             for lang, display_lang in mreward_pairs:
                 if ("multilingual-reward-bench", display_lang) not in missing_set:
                     continue
@@ -1005,36 +1369,29 @@ def _evaluate_seed(
                     prompt, meta = _build_task(
                         row,
                         template,
-                        tokenizer,
                         rng,
                         "multilingual-reward-bench",
                         language_override=display_lang,
-                        seed_value=seed,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
 
-        if args.debug_vllm_prompts:
-            prompt_log = os.path.join(seed_output_dir, "vllm_prompts.jsonl")
-            _write_prompt_log(prompt_log, prompts)
-
-        completions = generate_fn(
+        submission_path = os.path.join(seed_output_dir, "replicate_submissions.jsonl")
+        result_path = os.path.join(seed_output_dir, "replicate_results.jsonl")
+        # Replicate inference: submit, wait, then fetch results asynchronously.
+        completions = _generate_replicate(
             prompts,
-            args.batch_size,
-            args.max_tokens,
-            args.temperature,
-            args.top_p,
-            args.top_k,
+            args,
             seed,
+            submission_path=submission_path,
+            result_path=result_path,
         )
         if len(completions) != len(tasks):
             raise RuntimeError(
                 f"Expected {len(tasks)} completions, received {len(completions)}."
             )
 
-        new_raw, new_parsed = _build_records(
-            tasks, completions, verdict_a, verdict_b
-        )
+        new_raw, new_parsed = _build_records(tasks, completions, verdict_a, verdict_b)
         raw_by_group.update(new_raw)
         parsed_by_group.update(new_parsed)
         generated_groups = set(missing_groups)
@@ -1191,8 +1548,10 @@ def _print_paired_tests(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Vanilla LLM evaluation with vLLM.")
-    parser.add_argument("--model", required=True)
+    parser = argparse.ArgumentParser(
+        description="Replicate-backed LLM evaluation (deferred fetch)."
+    )
+    parser.add_argument("--model", required=True, help="Replicate model name.")
     parser.add_argument(
         "--benchmark",
         default="both",
@@ -1213,20 +1572,102 @@ def main() -> None:
     parser.add_argument("--verdict-pattern-a", default=None)
     parser.add_argument("--verdict-pattern-b", default=None)
     parser.add_argument("--output_dir", default="results")
-    parser.add_argument(
-        "--use_vllm",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--batch_size", type=int, default=8192)
-    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--max_tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
-    parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
-    parser.add_argument("--max_model_len", type=int, default=None)
-    parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--thinking-budget", type=int, default=0)
+    parser.add_argument(
+        "--prompt-key",
+        default="prompt",
+        help="Replicate input key for the user prompt.",
+    )
+    parser.add_argument(
+        "--system-message-key",
+        default="system_instruction",
+        help="Replicate input key for the system message.",
+    )
+    parser.add_argument(
+        "--replicate-concurrency",
+        type=int,
+        default=DEFAULT_REPLICATE_CONCURRENCY,
+        help="Max concurrent Replicate requests.",
+    )
+    parser.add_argument(
+        "--replicate-defer-seconds",
+        type=float,
+        default=DEFAULT_REPLICATE_DEFER_SECONDS,
+        help="Seconds to wait before fetching Replicate results.",
+    )
+    parser.add_argument(
+        "--replicate-poll-delay",
+        type=float,
+        default=DEFAULT_REPLICATE_POLL_DELAY,
+        help="Initial seconds between Replicate polls.",
+    )
+    parser.add_argument(
+        "--replicate-max-wait-seconds",
+        type=float,
+        default=DEFAULT_REPLICATE_MAX_WAIT_SECONDS,
+        help="Max seconds to wait per Replicate prediction.",
+    )
+    parser.add_argument(
+        "--replicate-retries",
+        type=int,
+        default=DEFAULT_REPLICATE_RETRIES,
+        help="Max retries when submitting Replicate predictions.",
+    )
+    parser.add_argument(
+        "--replicate-retry-delay",
+        type=float,
+        default=DEFAULT_REPLICATE_RETRY_DELAY,
+        help="Base retry delay in seconds for Replicate submissions.",
+    )
+    parser.add_argument(
+        "--replicate-proxy",
+        default=None,
+        help="Optional HTTP proxy for Replicate requests.",
+    )
+    parser.add_argument(
+        "--replicate-connect-timeout",
+        type=float,
+        default=DEFAULT_REPLICATE_CONNECT_TIMEOUT,
+    )
+    parser.add_argument(
+        "--replicate-total-timeout",
+        type=float,
+        default=DEFAULT_REPLICATE_TOTAL_TIMEOUT,
+    )
+    parser.add_argument(
+        "--replicate-max-resubmits",
+        type=int,
+        default=DEFAULT_REPLICATE_MAX_RESUBMITS,
+        help="Resubmit on expired predictions up to this many times.",
+    )
+    parser.add_argument(
+        "--replicate-submit-delay",
+        type=float,
+        default=DEFAULT_REPLICATE_SUBMIT_DELAY,
+        help="Delay between Replicate submission batches.",
+    )
+    parser.add_argument(
+        "--replicate-rolling-batch-size",
+        type=int,
+        default=DEFAULT_REPLICATE_ROLLING_BATCH_SIZE,
+        help="Submit/defer/fetch per chunk (0 disables rolling batches).",
+    )
+    parser.add_argument(
+        "--replicate-keepalive-minutes",
+        type=float,
+        default=DEFAULT_REPLICATE_KEEPALIVE_MINUTES,
+        help="Polling interval in minutes during defer period (0 disables keepalive).",
+    )
+    parser.add_argument(
+        "--replicate-keepalive-during-submit",
+        action="store_true",
+        default=DEFAULT_REPLICATE_KEEPALIVE_DURING_SUBMIT,
+        help="Run keepalive polling while submissions are still in progress.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
@@ -1243,17 +1684,18 @@ def main() -> None:
         help="Print one constructed prompt and exit without running evaluation.",
     )
     parser.add_argument(
-        "--debug-vllm-prompts",
-        action="store_true",
-        help="Write prompts sent to vLLM.generate into seed output directories.",
-    )
-    parser.add_argument(
         "--reuse_results",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Reuse existing raw/parsed results in output_dir when available.",
     )
     args = parser.parse_args()
+
+    if args.prompt_key == args.system_message_key:
+        raise ValueError("--prompt-key and --system-message-key must differ.")
+
+    model_dir_name = _sanitize_path_component(args.model)
+    args.output_dir = os.path.join(args.output_dir, model_dir_name)
 
     template, verdict_a, verdict_b = _load_template(
         args.template_path,
@@ -1304,32 +1746,17 @@ def main() -> None:
         raise ValueError("No evaluation prompts were built for the selected benchmarks.")
 
     if args.debug_prompt_only:
-        tokenizer = None
-        if args.model:
-            try:
-                tokenizer = _init_tokenizer_only(
-                    args.model, trust_remote_code=args.trust_remote_code
-                )
-            except Exception as exc:
-                print(f"[warn] failed to load tokenizer: {exc}")
-                tokenizer = None
         global _PRINTED_TEST_PROMPT
         _PRINTED_TEST_PROMPT = True
-        prompt = None
+        prompt_payload = None
         rng = random.Random(seeds[0])
         if mm_grouped is not None:
             lang = mm_selected[0] if mm_selected else next(iter(mm_grouped.keys()))
             rows = mm_grouped[lang]
             if not rows:
                 raise ValueError("MM-Eval has no rows to build a debug prompt.")
-            prompt, _ = _build_task(
-                rows[0],
-                template,
-                tokenizer,
-                rng,
-                "MM-Eval",
-                language_override=lang,
-                seed_value=seeds[0],
+            prompt_payload, _ = _build_task(
+                rows[0], template, rng, "MM-Eval", language_override=lang
             )
         elif mreward_pairs:
             mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
@@ -1338,94 +1765,24 @@ def main() -> None:
             rows = list(dataset)
             if not rows:
                 raise ValueError("multilingual-reward-bench has no rows to build a debug prompt.")
-            prompt, _ = _build_task(
+            prompt_payload, _ = _build_task(
                 rows[0],
                 template,
-                tokenizer,
                 rng,
                 "multilingual-reward-bench",
                 language_override=display_lang,
-                seed_value=seeds[0],
             )
         else:
             raise ValueError("No datasets loaded to build a debug prompt.")
-        print(prompt)
+        if prompt_payload is None:
+            raise ValueError("Failed to build a debug prompt.")
+        debug_prompt = _format_prompt_for_debug(
+            prompt_payload.get("messages", []),
+            str(prompt_payload.get("system_prompt") or ""),
+            str(prompt_payload.get("user_prompt") or ""),
+        )
+        print(debug_prompt)
         return
-
-    any_missing = not args.reuse_results
-    if args.reuse_results:
-        for seed in seeds:
-            seed_output_dir = os.path.join(args.output_dir, f"seed_{seed}")
-            _, _, missing_groups = _load_partial_results(
-                seed_output_dir, expected_groups
-            )
-            if missing_groups:
-                any_missing = True
-                break
-
-    llm_handle = None
-    model_obj = None
-    tokenizer = None
-    generate_fn = None
-    if any_missing:
-        if args.use_vllm:
-            llm_handle, tokenizer = _run_vllm(
-                args.model,
-                args.tensor_parallel_size,
-                args.gpu_memory_utilization,
-                args.max_model_len,
-                args.trust_remote_code,
-                seed=seeds[0],
-            )
-
-            def _generate(
-                prompts: List[str],
-                batch_size: int,
-                max_tokens: int,
-                temperature: float,
-                top_p: float,
-                top_k: int,
-                sample_seed: Optional[int],
-            ) -> List[str]:
-                return _generate_vllm(
-                    llm_handle,
-                    prompts,
-                    batch_size,
-                    max_tokens,
-                    temperature,
-                    top_p,
-                    top_k,
-                    seed=sample_seed,
-                )
-
-            generate_fn = _generate
-        else:
-            model_obj, tokenizer = _init_transformers(
-                args.model, trust_remote_code=args.trust_remote_code
-            )
-
-            def _generate(
-                prompts: List[str],
-                batch_size: int,
-                max_tokens: int,
-                temperature: float,
-                top_p: float,
-                top_k: int,
-                sample_seed: Optional[int],
-            ) -> List[str]:
-                return _generate_transformers(
-                    model_obj,
-                    tokenizer,
-                    prompts,
-                    batch_size,
-                    max_tokens,
-                    temperature,
-                    top_p,
-                    top_k,
-                    seed=sample_seed,
-                )
-
-            generate_fn = _generate
 
     seed_summaries: List[dict] = []
     for seed in seeds:
@@ -1440,13 +1797,8 @@ def main() -> None:
             mm_selected,
             mreward_pairs,
             expected_groups,
-            tokenizer,
-            generate_fn,
         )
         seed_summaries.append(seed_summary)
-
-    if args.use_vllm and llm_handle is not None:
-        _shutdown_vllm(llm_handle)
 
     aggregate = _aggregate_seed_summaries(
         seed_summaries,

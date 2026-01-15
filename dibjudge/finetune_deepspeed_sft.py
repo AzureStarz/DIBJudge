@@ -54,6 +54,40 @@ def _maybe_resize_embeddings(
         _rank0_print(rank, f"[stage done] resized {name} embeddings {vocab_size} -> {tok_size}")
 
 
+def _load_causal_lm(
+    name: str,
+    attn_implementation: Optional[str],
+    local_files_only: bool = False,
+    torch_dtype: Optional[torch.dtype] = None,
+) -> torch.nn.Module:
+    if not attn_implementation:
+        return AutoModelForCausalLM.from_pretrained(
+            name, local_files_only=local_files_only, torch_dtype=torch_dtype
+        )
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            name,
+            attn_implementation=attn_implementation,
+            local_files_only=local_files_only,
+            torch_dtype=torch_dtype,
+        )
+    except TypeError:
+        warnings.warn(
+            f"attn_implementation={attn_implementation} unsupported for {name}; "
+            "falling back to default attention.",
+            RuntimeWarning,
+        )
+    except ImportError as exc:
+        warnings.warn(
+            f"attn_implementation={attn_implementation} unavailable for {name}: {exc}. "
+            "Falling back to default attention.",
+            RuntimeWarning,
+        )
+    return AutoModelForCausalLM.from_pretrained(
+        name, local_files_only=local_files_only
+    )
+
+
 def _maybe_tqdm(iterable, rank: int, desc: str):
     if rank != 0:
         return iterable
@@ -63,6 +97,80 @@ def _maybe_tqdm(iterable, rank: int, desc: str):
         return iterable
     total = len(iterable) if hasattr(iterable, "__len__") else None
     return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+
+
+def _resolve_torch_dtype(value: Optional[object]) -> Optional[torch.dtype]:
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        name = value.strip().lower()
+        if not name:
+            return None
+        mapping = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        return mapping.get(name)
+    return None
+
+
+def _preview_text(text: str, limit: int = 120) -> str:
+    if not text:
+        return ""
+    text = text.replace("\n", "\\n")
+    return text[:limit]
+
+
+def _prefilter_long_prompts(
+    dataset: DIBJudgeDataset,
+    tokenizer,
+    max_lm_len: int,
+    rank: int,
+    log_samples: int = 3,
+    preview_len: int = 120,
+) -> DIBJudgeDataset:
+    if max_lm_len <= 0 or len(dataset) == 0:
+        return dataset
+    max_check_len = max_lm_len + 1
+    kept: List[DIBJudgeExample] = []
+    dropped: List[Tuple[int, int, str]] = []
+    for idx, ex in enumerate(dataset):
+        prompt = ex.judge_prompt or ""
+        enc = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_check_len,
+        )
+        prompt_len = len(enc.get("input_ids", []))
+        if prompt_len >= max_lm_len:
+            dropped.append((idx, prompt_len, prompt))
+        else:
+            kept.append(ex)
+    if rank == 0:
+        total = len(kept) + len(dropped)
+        ratio = (len(dropped) / total) if total else 0.0
+        _rank0_print(
+            rank,
+            "[data] prefilter_long_prompts dropped "
+            f"{len(dropped)}/{total} ({ratio:.2%}) with max_lm_len={max_lm_len}",
+        )
+        log_samples = max(0, int(log_samples))
+        for idx, (orig_idx, prompt_len, prompt) in enumerate(dropped[:log_samples]):
+            preview = _preview_text(prompt, limit=preview_len)
+            _rank0_print(
+                rank,
+                "[data] prefilter_long_prompts sample "
+                f"{idx + 1}: idx={orig_idx} prompt_tokens={prompt_len} "
+                f"prompt='{preview}'",
+            )
+    return DIBJudgeDataset(kept)
 
 
 class CheckpointedCausalLM(torch.nn.Module):
@@ -218,7 +326,12 @@ def _merge_lora_into_lm_state(
         _rank0_print(rank, "[warn] peft is required to merge LoRA weights.")
         return None
     try:
-        base = AutoModelForCausalLM.from_pretrained(args.lm, local_files_only=True)
+        base = _load_causal_lm(
+            args.lm,
+            args.attn_implementation,
+            local_files_only=True,
+            torch_dtype=_resolve_torch_dtype(args.torch_dtype),
+        )
     except Exception as exc:
         _rank0_print(rank, f"[warn] failed to load base model for LoRA merge: {exc}")
         return None
@@ -297,7 +410,12 @@ def _save_hf_checkpoint(
     state_dict = _strip_prefix_if_present(state_dict, "base_model.model.")
     state_dict = _strip_prefix_if_present(state_dict, "base_model.")
     try:
-        model = AutoModelForCausalLM.from_pretrained(args.lm, local_files_only=True)
+        model = _load_causal_lm(
+            args.lm,
+            args.attn_implementation,
+            local_files_only=True,
+            torch_dtype=_resolve_torch_dtype(args.torch_dtype),
+        )
     except Exception as exc:
         _rank0_print(rank, f"[warn] failed to load base model for HF export: {exc}")
         return
@@ -395,22 +513,44 @@ def _warmup_steps_from_ratio(total_steps: int, ratio: Optional[float], warmup_st
 
 
 class SFTCollator:
-    def __init__(self, tokenizer, max_length: Optional[int], append_eos: bool) -> None:
+    def __init__(
+        self,
+        tokenizer,
+        max_length: Optional[int],
+        append_eos: bool,
+        filter_truncated: bool = False,
+        min_target_tokens: int = 0,
+        drop_truncated: bool = False,
+        drop_min_target_tokens: int = 0,
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length if max_length and max_length > 0 else None
         self.append_eos = append_eos
         self.pad_id = tokenizer.pad_token_id
         if self.pad_id is None:
             self.pad_id = tokenizer.eos_token_id or 0
+        self.padding_side = getattr(self.tokenizer, "padding_side", "right")
+        if self.padding_side not in {"left", "right"}:
+            self.padding_side = "right"
         self.eos_id = tokenizer.eos_token_id or self.pad_id
+        self.filter_truncated = bool(filter_truncated)
+        self.min_target_tokens = max(0, int(min_target_tokens))
+        self.drop_truncated = bool(drop_truncated)
+        self.drop_min_target_tokens = max(0, int(drop_min_target_tokens))
 
-    def _encode_pair(self, ex: DIBJudgeExample) -> Tuple[List[int], List[int]]:
+    def _encode_pair(
+        self, ex: DIBJudgeExample
+    ) -> Tuple[List[int], List[int], bool, int]:
         prompt = ex.judge_prompt or ""
         output = ex.output or ""
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         output_ids = self.tokenizer.encode(output, add_special_tokens=False)
+        prompt_len = len(prompt_ids)
         if self.append_eos and (not output_ids or output_ids[-1] != self.eos_id):
             output_ids.append(self.eos_id)
+        prompt_overflow = (
+            self.max_length is not None and prompt_len >= self.max_length
+        )
         if self.max_length is not None:
             total_len = len(prompt_ids) + len(output_ids)
             if total_len > self.max_length:
@@ -427,15 +567,61 @@ class SFTCollator:
         if not input_ids:
             input_ids = [self.pad_id]
             labels = [-100]
-        return input_ids, labels
+        return input_ids, labels, prompt_overflow, len(output_ids)
 
     def __call__(self, batch: List[DIBJudgeExample]) -> Dict[str, torch.Tensor]:
         sequences: List[List[int]] = []
         labels: List[List[int]] = []
+        prompt_overflow: List[bool] = []
+        target_lengths: List[int] = []
         for ex in batch:
-            seq, lab = self._encode_pair(ex)
+            seq, lab, overflow, target_len = self._encode_pair(ex)
             sequences.append(seq)
             labels.append(lab)
+            prompt_overflow.append(overflow)
+            target_lengths.append(target_len)
+        drop_count = 0
+        drop_seen = len(sequences)
+        drop_maxlen_count = 0
+        drop_min_target_count = 0
+        drop_all_fallback = False
+        if self.drop_truncated or self.drop_min_target_tokens > 0:
+            drop = []
+            for idx in range(drop_seen):
+                drop_max = self.drop_truncated and prompt_overflow[idx]
+                drop_min = (
+                    self.drop_min_target_tokens > 0
+                    and target_lengths[idx] < self.drop_min_target_tokens
+                )
+                drop_maxlen_count += int(drop_max)
+                drop_min_target_count += int(drop_min)
+                drop.append(drop_max or drop_min)
+            drop_count = sum(1 for flag in drop if flag)
+            if drop_count:
+                keep = [not flag for flag in drop]
+                sequences = [seq for seq, keep_item in zip(sequences, keep) if keep_item]
+                labels = [lab for lab, keep_item in zip(labels, keep) if keep_item]
+                prompt_overflow = [
+                    ov for ov, keep_item in zip(prompt_overflow, keep) if keep_item
+                ]
+                target_lengths = [
+                    tl for tl, keep_item in zip(target_lengths, keep) if keep_item
+                ]
+                if not sequences:
+                    drop_all_fallback = True
+                    sequences = [[self.pad_id]]
+                    labels = [[-100]]
+                    prompt_overflow = [False]
+                    target_lengths = [0]
+        if self.filter_truncated or self.min_target_tokens > 0:
+            for idx in range(len(labels)):
+                filter_flag = False
+                if self.filter_truncated and prompt_overflow[idx]:
+                    filter_flag = True
+                if self.min_target_tokens > 0 and target_lengths[idx] < self.min_target_tokens:
+                    filter_flag = True
+                if filter_flag:
+                    labels[idx] = [-100] * len(labels[idx])
         max_len = max((len(seq) for seq in sequences), default=1)
         batch_size = len(sequences)
         input_ids = torch.full((batch_size, max_len), self.pad_id, dtype=torch.long)
@@ -443,13 +629,26 @@ class SFTCollator:
         label_ids = torch.full((batch_size, max_len), -100, dtype=torch.long)
         for idx, seq in enumerate(sequences):
             length = len(seq)
-            input_ids[idx, :length] = torch.tensor(seq, dtype=torch.long)
-            attention_mask[idx, :length] = 1
-            label_ids[idx, :length] = torch.tensor(labels[idx], dtype=torch.long)
+            if self.padding_side == "left":
+                start = max_len - length
+                input_ids[idx, start:] = torch.tensor(seq, dtype=torch.long)
+                attention_mask[idx, start:] = 1
+                label_ids[idx, start:] = torch.tensor(labels[idx], dtype=torch.long)
+            else:
+                input_ids[idx, :length] = torch.tensor(seq, dtype=torch.long)
+                attention_mask[idx, :length] = 1
+                label_ids[idx, :length] = torch.tensor(labels[idx], dtype=torch.long)
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": label_ids,
+            "debug_lm_drop_count": torch.tensor(drop_count, dtype=torch.long),
+            "debug_lm_drop_seen": torch.tensor(drop_seen, dtype=torch.long),
+            "debug_lm_drop_maxlen_count": torch.tensor(drop_maxlen_count, dtype=torch.long),
+            "debug_lm_drop_min_target_count": torch.tensor(drop_min_target_count, dtype=torch.long),
+            "debug_lm_drop_all_fallback": torch.tensor(
+                1 if drop_all_fallback else 0, dtype=torch.long
+            ),
         }
 
 
@@ -461,6 +660,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DeepSpeed SFT baseline with AutoModelForCausalLM.")
     parser.add_argument("--data-path", default=None)
     parser.add_argument("--lm", default=None)
+    parser.add_argument(
+        "--attn-implementation",
+        default="flash_attention_2",
+        help="Attention implementation for the LM (e.g., flash_attention_2, sdpa, eager).",
+    )
+    parser.add_argument(
+        "--padding-side",
+        default=None,
+        choices=["left", "right"],
+        help="Tokenizer padding side; defaults to left when using flash_attention_2.",
+    )
+    parser.add_argument(
+        "--allow-tf32",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable TF32 matmul kernels for speed (Ampere+).",
+    )
     parser.add_argument("--deepspeed-config", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--log-dir", default=None)
@@ -480,6 +696,48 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Append EOS token to the SFT target.",
+    )
+    parser.add_argument(
+        "--prefilter-long-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pre-tokenize prompts and drop samples with prompt_len >= max_lm_len.",
+    )
+    parser.add_argument(
+        "--prefilter-long-prompts-log-samples",
+        type=int,
+        default=3,
+        help="Number of dropped prompt samples to log when prefiltering.",
+    )
+    parser.add_argument(
+        "--prefilter-long-prompts-preview",
+        type=int,
+        default=120,
+        help="Max characters to show for dropped prompt previews.",
+    )
+    parser.add_argument(
+        "--filter-lm-truncated",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mask labels for samples where prompt hits max length.",
+    )
+    parser.add_argument(
+        "--min-target-tokens",
+        type=int,
+        default=0,
+        help="Mask labels for samples with fewer than this many target tokens.",
+    )
+    parser.add_argument(
+        "--drop-lm-truncated",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Hard-drop samples where prompt hits max length.",
+    )
+    parser.add_argument(
+        "--drop-min-target-tokens",
+        type=int,
+        default=0,
+        help="Hard-drop samples with fewer than this many target tokens.",
     )
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
@@ -538,6 +796,14 @@ def main() -> None:
     missing = [name for name in required if not getattr(args, name)]
     if missing:
         parser.error(f"Missing required arguments (or YAML keys): {', '.join(missing)}")
+    attn_impl = str(args.attn_implementation or "").strip().lower()
+    if attn_impl in {"", "none", "disable", "disabled"}:
+        attn_impl = ""
+    args.attn_implementation = attn_impl or None
+    if args.attn_implementation == "flash_attention_2":
+        args.torch_dtype = "bfloat16" if args.bf16 else "float16"
+    else:
+        args.torch_dtype = None
 
     import deepspeed
 
@@ -550,6 +816,11 @@ def main() -> None:
         warnings.filterwarnings("default")
     else:
         warnings.filterwarnings("ignore")
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
 
     if not args.no_save_config and args.save_config is None and args.config is None:
         args.save_config = os.path.join("configs", "finetune_deepspeed_sft_baseline.yaml")
@@ -564,15 +835,41 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.lm, **tok_kwargs)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if args.padding_side:
+        padding_side = args.padding_side
+    else:
+        padding_side = "left" if args.attn_implementation == "flash_attention_2" else None
+    if padding_side:
+        tokenizer.padding_side = padding_side
+    else:
+        padding_side = tokenizer.padding_side
+    args.padding_side = padding_side
 
     dataset = DIBJudgeDataset.from_jsonl(args.data_path)
     _rank0_print(rank, "[stage done] dataset loaded")
+    if args.prefilter_long_prompts:
+        dataset = _prefilter_long_prompts(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            max_lm_len=int(args.max_lm_len),
+            rank=rank,
+            log_samples=int(args.prefilter_long_prompts_log_samples),
+            preview_len=int(args.prefilter_long_prompts_preview),
+        )
     sampler = (
         DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
         if world_size > 1
         else None
     )
-    collator = SFTCollator(tokenizer, max_length=args.max_lm_len, append_eos=args.append_eos)
+    collator = SFTCollator(
+        tokenizer,
+        max_length=args.max_lm_len,
+        append_eos=args.append_eos,
+        filter_truncated=bool(args.filter_lm_truncated),
+        min_target_tokens=int(args.min_target_tokens),
+        drop_truncated=bool(args.drop_lm_truncated),
+        drop_min_target_tokens=int(args.drop_min_target_tokens),
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.per_device_train_batch_size,
@@ -581,9 +878,15 @@ def main() -> None:
         num_workers=args.num_workers,
         collate_fn=collator,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(args.lm)
+    load_dtype = _resolve_torch_dtype(args.torch_dtype)
+    model = _load_causal_lm(
+        args.lm, args.attn_implementation, torch_dtype=load_dtype
+    )
+    if args.attn_implementation == "flash_attention_2" and device.type == "cuda":
+        model = model.to(device)
     _maybe_resize_embeddings(model, tokenizer, "lm", rank)
     model = _maybe_apply_lora(model, args, rank)
     if args.gradient_checkpointing:
@@ -712,7 +1015,14 @@ def main() -> None:
         epoch_loader = _maybe_tqdm(loader, rank, f"epoch {epoch}")
         tqdm_enabled = hasattr(epoch_loader, "set_postfix")
         tqdm_every = args.swanlab_log_steps if args.swanlab_log_steps > 0 else 50
-        totals = {"loss": 0.0, "steps": 0}
+        totals = {
+            "loss": 0.0,
+            "steps": 0,
+            "lm_drop_count": 0.0,
+            "lm_drop_seen": 0.0,
+            "lm_drop_maxlen": 0.0,
+            "lm_drop_min_target": 0.0,
+        }
         for batch in epoch_loader:
             step_start = time.perf_counter()
             step += 1
@@ -725,6 +1035,18 @@ def main() -> None:
 
             totals["loss"] += float(loss.item())
             totals["steps"] += 1
+            drop_count = batch.get("debug_lm_drop_count")
+            drop_seen = batch.get("debug_lm_drop_seen")
+            drop_maxlen = batch.get("debug_lm_drop_maxlen_count")
+            drop_min_target = batch.get("debug_lm_drop_min_target_count")
+            if torch.is_tensor(drop_count):
+                totals["lm_drop_count"] += float(drop_count.item())
+            if torch.is_tensor(drop_seen):
+                totals["lm_drop_seen"] += float(drop_seen.item())
+            if torch.is_tensor(drop_maxlen):
+                totals["lm_drop_maxlen"] += float(drop_maxlen.item())
+            if torch.is_tensor(drop_min_target):
+                totals["lm_drop_min_target"] += float(drop_min_target.item())
             if tqdm_enabled and step % tqdm_every == 0:
                 epoch_loader.set_postfix(loss=f"{loss.item():.4f}")
             if (
@@ -736,6 +1058,11 @@ def main() -> None:
                 batch_size = int(batch["input_ids"].size(0))
                 token_count = int(batch["attention_mask"].sum().item())
                 lr_values = [group.get("lr", 0.0) for group in optimizer.param_groups]
+                drop_ratio = 0.0
+                if torch.is_tensor(drop_count) and torch.is_tensor(drop_seen):
+                    seen = float(drop_seen.item())
+                    if seen > 0:
+                        drop_ratio = float(drop_count.item()) / seen
                 log_swanlab(
                     swanlab_client,
                     {
@@ -744,6 +1071,19 @@ def main() -> None:
                         "tokens": token_count,
                         "tokens_per_sec": float(token_count / step_time),
                         "samples_per_sec": float(batch_size / step_time),
+                        "data/lm_drop_count": float(drop_count.item())
+                        if torch.is_tensor(drop_count)
+                        else 0.0,
+                        "data/lm_drop_seen": float(drop_seen.item())
+                        if torch.is_tensor(drop_seen)
+                        else 0.0,
+                        "data/lm_drop_ratio": drop_ratio,
+                        "data/lm_drop_maxlen_count": float(drop_maxlen.item())
+                        if torch.is_tensor(drop_maxlen)
+                        else 0.0,
+                        "data/lm_drop_min_target_count": float(drop_min_target.item())
+                        if torch.is_tensor(drop_min_target)
+                        else 0.0,
                     },
                     step=step,
                 )
@@ -758,7 +1098,15 @@ def main() -> None:
                 )
 
         avg_loss = totals["loss"] / max(1, totals["steps"])
-        _rank0_print(rank, f"[epoch {epoch}] loss={avg_loss:.4f}")
+        seen = totals.get("lm_drop_seen", 0.0)
+        drop_ratio = (totals.get("lm_drop_count", 0.0) / seen) if seen else 0.0
+        _rank0_print(
+            rank,
+            f"epoch={epoch} avg_loss={avg_loss:.4f} "
+            f"lm_drop_ratio={drop_ratio:.4f} "
+            f"lm_drop_maxlen_ratio={(totals.get('lm_drop_maxlen', 0.0) / seen) if seen else 0.0:.4f} "
+            f"lm_drop_min_target_ratio={(totals.get('lm_drop_min_target', 0.0) / seen) if seen else 0.0:.4f}",
+        )
         if swanlab_client is not None:
             log_swanlab(
                 swanlab_client,

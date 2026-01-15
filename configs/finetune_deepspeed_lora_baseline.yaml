@@ -1,5 +1,10 @@
 # model config
 lm: model/Qwen3-4B
+attn_implementation: flash_attention_2
+padding_side: left
+use_rms_norm: false
+rms_norm_eps: 1.0e-6
+use_swiglu: false
 
 # data config
 data_path: data/train_data/mr3_preprocessed.jsonl
@@ -7,6 +12,13 @@ per_device_train_batch_size: 1
 num_workers: 0
 max_lm_len: 16384
 append_eos: true
+prefilter_long_prompts: false # drop samples with prompt_len >= max_lm_len before training
+prefilter_long_prompts_log_samples: 3 # number of dropped prompt samples to log
+prefilter_long_prompts_preview: 120 # max characters to show for dropped prompt previews
+filter_lm_truncated: false # mask labels when prompt hits max length
+min_target_tokens: 0 # mask labels when target tokens < this threshold
+drop_lm_truncated: false # hard-drop samples when prompt hits max length
+drop_min_target_tokens: 0 # hard-drop samples when target tokens < this threshold
 
 # runtime config
 epochs: 3
@@ -16,8 +28,11 @@ log_dir: logs/Qwen3-4B_mR3_baseline_vanilla_LoRA
 save_every_steps: 0
 save_at_end: true
 bf16: true
+allow_tf32: false
 gradient_checkpointing: true
 torch_autocast: false
+lm_loss_chunk_size: 0 # optional chunk size for causal LM loss (0 = disabled)
+compact_kl_chunk_size: 0 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true
 swanlab_project: dibjudge
 swanlab_run_name: Qwen3-4B_mR3_baseline_vanilla_LoRA

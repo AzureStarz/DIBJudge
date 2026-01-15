@@ -59,10 +59,14 @@ class DIBJudgeDataset(Dataset):
 
     @classmethod
     def from_jsonl(
-        cls, path: str, proxy_cache_path: Optional[str] = None
+        cls,
+        path: str,
+        proxy_cache_path: Optional[str] = None,
+        require_both_responses: bool = False,
     ) -> "DIBJudgeDataset":
         samples: List[DIBJudgeExample] = []
-        filtered_empty = 0
+        filtered_empty_a = 0
+        filtered_empty_b = 0
         cache_path = proxy_cache_path or _infer_proxy_cache_path(path)
         if proxy_cache_path:
             cache_path = proxy_cache_path
@@ -89,8 +93,13 @@ class DIBJudgeDataset(Dataset):
                         )
                 if cache_raw is not None:
                     _merge_proxy_cache(raw, cache_raw)
-                if not _has_response(_coerce_optional_text(raw.get("response_A"))):
-                    filtered_empty += 1
+                response_a = _coerce_optional_text(raw.get("response_A"))
+                if not _has_response(response_a):
+                    filtered_empty_a += 1
+                    continue
+                response_b = _coerce_optional_text(raw.get("response_B"))
+                if require_both_responses and "response_B" in raw and not _has_response(response_b):
+                    filtered_empty_b += 1
                     continue
                 if _missing_proxy_fields(raw):
                     missing_proxy = True
@@ -105,9 +114,14 @@ class DIBJudgeDataset(Dataset):
                     "Proxy cache has extra entries; ensure it matches the dataset order.",
                     RuntimeWarning,
                 )
-        if filtered_empty:
+        if filtered_empty_a:
             warnings.warn(
-                f"Filtered {filtered_empty} samples with empty response_A.",
+                f"Filtered {filtered_empty_a} samples with empty response_A.",
+                RuntimeWarning,
+            )
+        if require_both_responses and filtered_empty_b:
+            warnings.warn(
+                f"Filtered {filtered_empty_b} samples with empty response_B.",
                 RuntimeWarning,
             )
         if missing_proxy:
@@ -415,7 +429,10 @@ def _pad_sequences(
     sequences: List[List[int]],
     pad_id: int,
     max_length: Optional[int],
+    pad_side: str = "right",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if pad_side not in {"left", "right"}:
+        pad_side = "right"
     max_len = max((len(seq) for seq in sequences), default=0)
     if max_length is not None:
         max_len = min(max_len, max_length)
@@ -426,8 +443,12 @@ def _pad_sequences(
         if not seq:
             continue
         length = len(seq)
-        batch[idx, :length] = torch.tensor(seq, dtype=torch.long)
-        mask[idx, :length] = 1
+        if pad_side == "left":
+            batch[idx, -length:] = torch.tensor(seq, dtype=torch.long)
+            mask[idx, -length:] = 1
+        else:
+            batch[idx, :length] = torch.tensor(seq, dtype=torch.long)
+            mask[idx, :length] = 1
     return batch, mask
 
 
@@ -456,6 +477,9 @@ class DIBJudgeCollator:
         self.pad_id = self.tokenizer.pad_token_id
         if self.pad_id is None:
             self.pad_id = self.tokenizer.eos_token_id or 0
+        self.padding_side = getattr(self.tokenizer, "padding_side", "right")
+        if self.padding_side not in {"left", "right"}:
+            self.padding_side = "right"
         self.proxy_config = proxy_config or ProxyTaskConfig()
         self.enable_proxy_labels = bool(enable_proxy_labels)
         self.debug_spike = bool(debug_spike)
@@ -547,11 +571,13 @@ class DIBJudgeCollator:
             base_sequences,
             self.pad_id,
             self.max_response_len,
+            pad_side=self.padding_side,
         )
         original_response_mask, _ = _pad_sequences(
             response_masks,
             0,
             self.max_response_len,
+            pad_side=self.padding_side,
         )
         need_meta = (
             self.debug_spike
@@ -763,69 +789,6 @@ class DIBJudgeCollator:
                 debug_info["prompt_preview"] = []
                 debug_info["output_preview"] = []
 
-        full_texts = [p + t for p, t in zip(prompts, targets)]
-        full_enc = self.tokenizer(
-            full_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_lm_len,
-            return_tensors="pt",
-            return_offsets_mapping=True,
-            return_special_tokens_mask=True,
-            add_special_tokens=True,
-        )
-        eos_id = self.tokenizer.eos_token_id
-        if eos_id is not None:
-            input_ids = full_enc["input_ids"]
-            attention_mask = full_enc["attention_mask"]
-            max_len = input_ids.size(1)
-            pad_id = self.tokenizer.pad_token_id
-            if pad_id is None:
-                pad_id = eos_id or 0
-            extended = False
-            for i in range(input_ids.size(0)):
-                length = int(attention_mask[i].sum().item())
-                if length <= 0:
-                    continue
-                last_idx = length - 1
-                if input_ids[i, last_idx].item() == eos_id:
-                    continue
-                if length >= max_len and not extended:
-                    # Extend tensors so we can append EOS without overwriting tokens.
-                    input_ids = torch.cat(
-                        [input_ids, input_ids.new_full((input_ids.size(0), 1), pad_id)],
-                        dim=1,
-                    )
-                    attention_mask = torch.cat(
-                        [
-                            attention_mask,
-                            attention_mask.new_zeros((attention_mask.size(0), 1)),
-                        ],
-                        dim=1,
-                    )
-                    max_len = input_ids.size(1)
-                    extended = True
-                if length < max_len:
-                    input_ids[i, length] = eos_id
-                    attention_mask[i, length] = 1
-            full_enc["input_ids"] = input_ids
-            full_enc["attention_mask"] = attention_mask
-            if extended:
-                special_tokens_mask = full_enc.get("special_tokens_mask")
-                if torch.is_tensor(special_tokens_mask):
-                    full_enc["special_tokens_mask"] = torch.cat(
-                        [
-                            special_tokens_mask,
-                            special_tokens_mask.new_zeros(
-                                (special_tokens_mask.size(0), 1)
-                            ),
-                        ],
-                        dim=1,
-                    )
-        special_mask = full_enc.get("special_tokens_mask")
-        if torch.is_tensor(special_mask):
-            special_mask = special_mask.tolist()
-
         prompt_enc = self.tokenizer(
             prompts,
             padding=True,
@@ -838,23 +801,142 @@ class DIBJudgeCollator:
         prompt_offsets = prompt_enc.pop("offset_mapping", None)
         if torch.is_tensor(prompt_offsets):
             prompt_offsets = prompt_offsets.tolist()
+        prompt_attention = prompt_enc.get("attention_mask")
+        padding_side = getattr(self.tokenizer, "padding_side", "right")
+        left_padding = padding_side == "left"
+
+        full_texts = [prompt + target for prompt, target in zip(prompts, targets)]
+        full_enc = self.tokenizer(
+            full_texts,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_lm_len,
+            return_offsets_mapping=True,
+        )
+        full_ids_list = full_enc.get("input_ids", [])
+        full_offsets = full_enc.get("offset_mapping", None)
+        if full_offsets is None:
+            full_offsets = [None] * len(full_ids_list)
+
+        def _target_start_from_offsets(
+            offsets: Optional[Sequence[Tuple[int, int]]],
+            prompt_len_chars: int,
+            default_len: int,
+        ) -> int:
+            if not offsets:
+                return default_len
+            for idx, (start, end) in enumerate(offsets):
+                if start == end == 0:
+                    continue
+                if end > prompt_len_chars:
+                    return idx
+            return default_len
+
+        full_sequences: List[List[int]] = []
+        special_masks: List[List[int]] = []
+        truncated_flags: List[bool] = []
+        target_starts: List[int] = []
+        eos_id = self.tokenizer.eos_token_id
+        for i in range(len(batch)):
+            base_ids = full_ids_list[i] if i < len(full_ids_list) else []
+            offsets_i = full_offsets[i] if i < len(full_offsets) else None
+            prompt_len_chars = len(prompts[i])
+            target_start = _target_start_from_offsets(
+                offsets_i, prompt_len_chars, len(base_ids)
+            )
+            has_target = target_start < len(base_ids)
+            combined_ids = base_ids
+            special_prefix = 0
+            if hasattr(self.tokenizer, "build_inputs_with_special_tokens"):
+                try:
+                    combined_ids = self.tokenizer.build_inputs_with_special_tokens(base_ids)
+                    span = _find_subseq(combined_ids, base_ids)
+                    if span is None:
+                        combined_ids = base_ids
+                    else:
+                        special_prefix = span[0]
+                except Exception:
+                    combined_ids = base_ids
+            target_start = min(target_start + special_prefix, len(combined_ids))
+            truncated = False
+            if self.max_lm_len is not None and len(combined_ids) > self.max_lm_len:
+                combined_ids = combined_ids[: self.max_lm_len]
+                target_start = min(target_start, len(combined_ids))
+                truncated = True
+            has_target = has_target and target_start < len(combined_ids)
+            if eos_id is not None and combined_ids:
+                if has_target and combined_ids[-1] != eos_id:
+                    if self.max_lm_len is None or len(combined_ids) < self.max_lm_len:
+                        combined_ids = combined_ids + [int(eos_id)]
+                    else:
+                        truncated = True
+            if hasattr(self.tokenizer, "get_special_tokens_mask"):
+                try:
+                    special_mask = self.tokenizer.get_special_tokens_mask(
+                        combined_ids, already_has_special_tokens=True
+                    )
+                except Exception:
+                    special_mask = [0] * len(combined_ids)
+            else:
+                special_mask = [0] * len(combined_ids)
+            full_sequences.append(combined_ids)
+            special_masks.append(special_mask)
+            truncated_flags.append(truncated)
+            target_starts.append(target_start)
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = eos_id or 0
+        input_ids, attention_mask = _pad_sequences(
+            full_sequences,
+            pad_id,
+            None,
+            pad_side=padding_side,
+        )
+        padded_special_mask, _ = _pad_sequences(
+            special_masks,
+            0,
+            input_ids.size(1),
+            pad_side=padding_side,
+        )
+        special_mask = padded_special_mask.tolist()
+        full_enc = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "special_tokens_mask": padded_special_mask,
+        }
 
         labels = full_enc["input_ids"].clone()
         response_types = torch.zeros_like(labels)
+        full_attention = full_enc.get("attention_mask")
         for i, ex in enumerate(batch):
             has_b = _has_response(ex.response_b)
-            prompt_len = int(prompt_enc["attention_mask"][i].sum().item())
-            prompt_len = min(prompt_len, labels.size(1))
+            prompt_len_raw = int(prompt_attention[i].sum().item())
+            prompt_len = min(prompt_len_raw, labels.size(1))
+            pad_len = 0
+            prompt_pad = 0
+            if left_padding and torch.is_tensor(full_attention):
+                pad_len = int(full_attention[i].size(0) - full_attention[i].sum().item())
+            if left_padding and torch.is_tensor(prompt_attention):
+                prompt_pad = int(prompt_attention[i].size(0) - prompt_len_raw)
             lead_special = 0
             if special_mask is not None:
-                for flag in special_mask[i]:
+                for flag in special_mask[i][pad_len:]:
                     if flag == 1:
                         lead_special += 1
                     else:
                         break
-            prompt_len = min(prompt_len + lead_special, labels.size(1))
+            prompt_start = min(pad_len + lead_special, labels.size(1))
+            prompt_len = min(prompt_len, labels.size(1) - prompt_start)
+            prompt_end = prompt_start + prompt_len
             # Mask prompt tokens so loss is only on the target continuation.
-            labels[i, :prompt_len] = -100
+            target_start = target_starts[i] if i < len(target_starts) else prompt_len
+            target_start = min(target_start, labels.size(1) - pad_len)
+            target_start = pad_len + target_start
+            if target_start >= labels.size(1):
+                labels[i, :] = -100
+            else:
+                labels[i, :target_start] = -100
 
             prompt = prompts[i]
             span_a = _find_response_span(prompt, ex.response_a)
@@ -865,17 +947,27 @@ class DIBJudgeCollator:
                 )
             used_token_fallback = False
             if prompt_offsets is not None and (span_a or span_b):
-                for tok_idx, (start, end) in enumerate(prompt_offsets[i][:prompt_len]):
+                offsets_i = prompt_offsets[i]
+                if left_padding:
+                    offsets_i = offsets_i[prompt_pad : prompt_pad + prompt_len]
+                else:
+                    offsets_i = offsets_i[:prompt_len]
+                for tok_idx, (start, end) in enumerate(offsets_i):
                     if start == end == 0:
                         continue
                     if span_a and start < span_a[1] and end > span_a[0]:
-                        response_types[i, lead_special + tok_idx] = 1
+                        response_types[i, prompt_start + tok_idx] = 1
                     elif span_b and start < span_b[1] and end > span_b[0]:
-                        response_types[i, lead_special + tok_idx] = 2
+                        response_types[i, prompt_start + tok_idx] = 2
             else:
                 used_token_fallback = True
-                prompt_ids = prompt_enc["input_ids"][i][:prompt_len].tolist()
-                lead = lead_special
+                prompt_ids = prompt_enc["input_ids"][i]
+                if left_padding:
+                    prompt_ids = prompt_ids[prompt_pad : prompt_pad + prompt_len]
+                else:
+                    prompt_ids = prompt_ids[:prompt_len]
+                prompt_ids = prompt_ids.tolist()
+                lead = prompt_start
                 resp_a_ids = _encode_ids(self.tokenizer, ex.response_a, self.max_lm_len)
                 resp_b_ids = (
                     _encode_ids(self.tokenizer, ex.response_b or "", self.max_lm_len)
@@ -897,12 +989,7 @@ class DIBJudgeCollator:
                     end = min(response_types.size(1), lead + span_b_ids[1])
                     response_types[i, start:end] = 2
 
-            truncated = False
-            if hasattr(full_enc, "encodings") and full_enc.encodings:
-                try:
-                    truncated = bool(full_enc.encodings[i].truncated)
-                except (AttributeError, IndexError):
-                    truncated = False
+            truncated = truncated_flags[i] if i < len(truncated_flags) else False
             lm_tokens = int(full_enc["attention_mask"][i].sum().item())
             prompt_tokens = int(prompt_enc["attention_mask"][i].sum().item())
             if response_types[i].eq(1).sum().item() == 0:

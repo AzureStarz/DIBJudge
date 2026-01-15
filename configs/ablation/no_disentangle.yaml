@@ -62,20 +62,20 @@ proxy_soft_labels: true # use soft labels for proxy bin losses
 
 # runtime config
 epochs: 1 # number of training epochs
-deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
-output_dir: outputs/default # checkpoint output directory
-log_dir: logs/default # log output directory
+deepspeed_config: configs/deepspeed/ds_z2_config.json # DeepSpeed json config path
+output_dir: outputs/no_disentangle # checkpoint output directory
+log_dir: logs/no_disentangle # log output directory
 save_every_steps: 0 # checkpoint save interval (0 = disabled)
 save_at_end: true # save a checkpoint at end of training
 bf16: true # enable bfloat16 training
 allow_tf32: true # enable TF32 matmul kernels for speed
-gradient_checkpointing: false # enable gradient checkpointing
+gradient_checkpointing: true # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
-lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
-compact_kl_chunk_size: 256 # optional chunk size for compact KL (0 = disabled)
+lm_loss_chunk_size: 0 # optional chunk size for causal LM loss (0 = disabled)
+compact_kl_chunk_size: 0 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
-swanlab_run_name: default # SwanLab run name
+swanlab_run_name: no_disentangle # SwanLab run name
 swanlab_tags: null # SwanLab tags list or null
 swanlab_log_steps: 1 # SwanLab logging interval
 
@@ -138,4 +138,4 @@ low_recon_weight: 0.5 # weight for low-level reconstruction loss
 nll_bin_weight: 0.5 # weight for NLL bin loss
 ttr_bin_weight: 0.5 # weight for TTR bin loss
 length_bin_weight: 0.5 # weight for length bin loss
-disentangle_weight: 0.5 # global scale for disentanglement loss
+disentangle_weight: 0.0 # global scale for disentanglement loss

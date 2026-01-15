@@ -30,11 +30,6 @@ Examples:
 EOF
 }
 
-# (optional) NCCL / OMP settings
-# export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-# export NCCL_DEBUG=warn
-# export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-3}
-
 # Defaults (can be overridden by env or flags)
 MODEL="${DIBJUDGE_MODEL:-outputs/deepspeed/debug/hf-epoch-1/lm}"
 CHECKPOINT="${DIBJUDGE_CHECKPOINT:-outputs/deepspeed/debug/hf-epoch-1/dibjudge}"
@@ -129,12 +124,8 @@ singularity exec --nv \
     conda activate ${CONDA_ENV}
 
     # NCCL configs
-    export NCCL_P2P_DISABLE=1
-    export NCCL_IB_DISABLE=1
-    export NCCL_NVLS_DISABLE=1
-    export NCCL_SHM_DISABLE=1
-    export NCCL_P2P_LEVEL=LOC
-    export OMP_NUM_THREADS=8
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
 
     num_gpus=\$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
     echo \"Detected \${num_gpus} GPUs\"

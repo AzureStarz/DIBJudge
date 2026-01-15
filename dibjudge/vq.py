@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -17,7 +17,12 @@ class VQOutput:
     commitment_loss: torch.Tensor
     codebook_loss: torch.Tensor
     perplexity: torch.Tensor
+    perplexity_ema: torch.Tensor
     usage_loss: torch.Tensor
+    active_codes: torch.Tensor
+    active_fraction: torch.Tensor
+    usage_entropy: torch.Tensor
+    unique_codes: torch.Tensor
     dead_fraction: torch.Tensor
     avg_distance: torch.Tensor
 
@@ -109,19 +114,21 @@ class VectorQuantizerEMA(nn.Module):
         return per_codebook.mean()
 
     def _ema_update(
-        self, flat_inputs: torch.Tensor, encodings: torch.Tensor
+        self,
+        flat_inputs: torch.Tensor,
+        counts: torch.Tensor,
+        sums: torch.Tensor,
     ) -> Optional[torch.Tensor]:
         if not self.use_ema:
             return None
-        if encodings.numel() == 0:
+        if flat_inputs.numel() == 0:
             return flat_inputs.new_tensor(0.0)
         with torch.no_grad():
             if self.is_pq:
                 self.ema_cluster_size.mul_(self.decay).add_(
-                    encodings.sum(0), alpha=1 - self.decay
+                    counts, alpha=1 - self.decay
                 )
-                dw = torch.einsum("nmk,nmd->mkd", encodings, flat_inputs)
-                self.ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+                self.ema_w.mul_(self.decay).add_(sums, alpha=1 - self.decay)
 
                 n = self.ema_cluster_size.sum(dim=1, keepdim=True)
                 cluster_size = (
@@ -156,10 +163,9 @@ class VectorQuantizerEMA(nn.Module):
                     self.codebook.copy_(codebook)
             else:
                 self.ema_cluster_size.mul_(self.decay).add_(
-                    encodings.sum(0), alpha=1 - self.decay
+                    counts, alpha=1 - self.decay
                 )
-                dw = encodings.t() @ flat_inputs
-                self.ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+                self.ema_w.mul_(self.decay).add_(sums, alpha=1 - self.decay)
 
                 n = self.ema_cluster_size.sum()
                 cluster_size = (
@@ -189,6 +195,45 @@ class VectorQuantizerEMA(nn.Module):
                 else:
                     self.codebook.copy_(codebook)
         return dead_fraction
+
+    def _accumulate_counts_and_sums(
+        self, indices: torch.Tensor, flat_inputs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        counts = torch.zeros(
+            self.num_codes, device=flat_inputs.device, dtype=flat_inputs.dtype
+        )
+        sums = torch.zeros(
+            self.num_codes, self.dim, device=flat_inputs.device, dtype=flat_inputs.dtype
+        )
+        if indices.numel() > 0:
+            ones = torch.ones_like(indices, dtype=flat_inputs.dtype)
+            counts.index_add_(0, indices, ones)
+            sums.index_add_(0, indices, flat_inputs)
+        return counts, sums
+
+    def _accumulate_counts_and_sums_pq(
+        self, indices: torch.Tensor, pq_inputs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        counts = torch.zeros(
+            self.num_codebooks,
+            self.num_codes,
+            device=pq_inputs.device,
+            dtype=pq_inputs.dtype,
+        )
+        sums = torch.zeros(
+            self.num_codebooks,
+            self.num_codes,
+            self.sub_dim,
+            device=pq_inputs.device,
+            dtype=pq_inputs.dtype,
+        )
+        for idx in range(self.num_codebooks):
+            ids = indices[:, idx]
+            if ids.numel() > 0:
+                ones = torch.ones_like(ids, dtype=pq_inputs.dtype)
+                counts[idx].index_add_(0, ids, ones)
+                sums[idx].index_add_(0, ids, pq_inputs[:, idx, :])
+        return counts, sums
 
     def alignment_loss(self, token_embeddings: torch.Tensor, sample_size: int) -> torch.Tensor:
         if sample_size <= 0 or token_embeddings.numel() == 0:
@@ -300,20 +345,20 @@ class VectorQuantizerEMA(nn.Module):
             flat_inputs = pq_inputs.reshape(-1, self.dim)
             distances = self._distance_pq(pq_inputs)
             indices = distances.argmin(dim=2)
-            encodings = F.one_hot(indices, self.num_codes).type_as(pq_inputs)
             quantized_flat = self._embed_pq(indices).reshape(-1, self.dim)
+            counts, sums = self._accumulate_counts_and_sums_pq(indices, pq_inputs)
         else:
             if self.normalize_inputs:
                 flat_inputs = F.normalize(flat_inputs, dim=1, eps=1e-6)
             distances = self._distance(flat_inputs)
             indices = distances.argmin(dim=1)
-            encodings = F.one_hot(indices, self.num_codes).type_as(flat_inputs)
             quantized_flat = F.embedding(indices, self.codebook)
+            counts, sums = self._accumulate_counts_and_sums(indices, flat_inputs)
 
         dead_fraction = None
         if self.training:
             dead_fraction = self._ema_update(
-                pq_inputs if self.is_pq else flat_inputs, encodings
+                pq_inputs if self.is_pq else flat_inputs, counts, sums
             )
 
         codebook_loss = (flat_inputs.detach() - quantized_flat).pow(2).mean()
@@ -323,7 +368,12 @@ class VectorQuantizerEMA(nn.Module):
         inputs_for_st = flat_inputs.view_as(inputs)
         quantized = inputs_for_st + (quantized_flat.view_as(inputs) - inputs_for_st).detach()
 
-        avg_probs = encodings.mean(dim=0)
+        if counts.numel() == 0:
+            avg_probs = counts.new_zeros(counts.shape)
+        elif counts.dim() == 1:
+            avg_probs = counts / counts.sum().clamp_min(1.0)
+        else:
+            avg_probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
         if avg_probs.dim() == 1:
             perplexity = torch.exp(-torch.sum(avg_probs * (avg_probs + 1e-8).log()))
         else:
@@ -332,9 +382,42 @@ class VectorQuantizerEMA(nn.Module):
             )
             perplexity = per_codebook.mean()
         usage_loss = self._usage_loss(avg_probs)
-        usage = self.ema_cluster_size if self.use_ema else encodings.sum(dim=0)
+        usage = self.ema_cluster_size if self.use_ema else counts
         if dead_fraction is None:
             dead_fraction = (usage <= float(self.dead_code_threshold)).float().mean()
+        if usage.numel() == 0:
+            perplexity_ema = usage.new_tensor(0.0)
+        elif usage.dim() == 1:
+            probs = usage / usage.sum().clamp_min(1.0)
+            perplexity_ema = torch.exp(-torch.sum(probs * (probs + 1e-8).log()))
+        else:
+            probs = usage / usage.sum(dim=1, keepdim=True).clamp_min(1.0)
+            per_codebook = torch.exp(-torch.sum(probs * (probs + 1e-8).log(), dim=-1))
+            perplexity_ema = per_codebook.mean()
+        if usage.numel() == 0:
+            active_codes = usage.new_tensor(0.0)
+            active_fraction = usage.new_tensor(0.0)
+            usage_entropy = usage.new_tensor(0.0)
+        elif usage.dim() == 1:
+            active_codes = (usage > float(self.dead_code_threshold)).float().sum()
+            active_fraction = active_codes / float(self.num_codes)
+            probs = usage / usage.sum().clamp_min(1.0)
+            usage_entropy = -(probs * (probs + 1e-8).log()).sum()
+        else:
+            active_codes = (usage > float(self.dead_code_threshold)).float().sum()
+            active_fraction = active_codes / float(self.num_codes * self.num_codebooks)
+            probs = usage / usage.sum(dim=1, keepdim=True).clamp_min(1.0)
+            usage_entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1).mean()
+        if indices.numel() == 0:
+            unique_codes = usage.new_tensor(0.0)
+        elif indices.dim() == 1:
+            unique_codes = indices.unique().numel()
+            unique_codes = usage.new_tensor(float(unique_codes))
+        else:
+            unique_sum = 0.0
+            for idx in range(self.num_codebooks):
+                unique_sum += float(indices[:, idx].unique().numel())
+            unique_codes = usage.new_tensor(unique_sum / float(self.num_codebooks))
         if self.is_pq:
             avg_distance = distances.min(dim=2).values.sum(dim=1).mean().sqrt()
         else:
@@ -347,7 +430,12 @@ class VectorQuantizerEMA(nn.Module):
             commitment_loss=commitment_loss,
             codebook_loss=codebook_loss,
             perplexity=perplexity,
+            perplexity_ema=perplexity_ema,
             usage_loss=usage_loss,
+            active_codes=active_codes,
+            active_fraction=active_fraction,
+            usage_entropy=usage_entropy,
+            unique_codes=unique_codes,
             dead_fraction=dead_fraction,
             avg_distance=avg_distance,
         )

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dibjudge_sft_baseline
+#SBATCH --job-name=dibjudge_deepspeed_lora
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
@@ -8,7 +8,7 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
-set -euo pipefail
+# set -euo pipefail
 
 cd DIBJUDGE_ROOT
 
@@ -21,20 +21,17 @@ unset NCCL_SHM_DISABLE
 unset NCCL_NVLS_DISABLE
 unset NCCL_IB_DISABLE
 export NCCL_P2P_LEVEL=NVL
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TOKENIZERS_PARALLELISM=false
 
 module load amd/gcc_compiler/11.3.0
 num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 echo "Detected ${num_gpus} GPUs"
 
-# python scripts/vanilla_evaluation.py \
-#     --model model/mR3-Qwen3-4B-en-prompt-en-thinking \
-#     --tensor_parallel_size ${num_gpus} \
-#     --output_dir results/mR3-Qwen3-4B-en-prompt-en-thinking \
-#     --template mr3_templates
-
-bash scripts/slurm_vanilla_evaluation.sbatch \
-    -m model/mR3-Qwen3-4B-en-prompt-en-thinking \
-    -o results/mR3-Qwen3-4B-en-prompt-en-thinking \
-    -t mr3_templates \
-    -p ${num_gpus}
+bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+    --model outputs/no_z_prompt/hf-epoch-1/lm \
+    --checkpoint outputs/no_z_prompt/hf-epoch-1/dibjudge \
+    --output_dir results/Qwen3-4B/no_z_prompt \
+    --languages zh \
+    --template mr3_templates \
+    --tensor_parallel_size ${num_gpus}

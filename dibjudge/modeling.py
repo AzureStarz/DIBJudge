@@ -14,6 +14,77 @@ from transformers import AutoModel, AutoModelForCausalLM
 from .vq import VectorQuantizerEMA
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms * self.weight
+
+
+class SwiGLULinear(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim * 2)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        value, gate = self.proj(x).chunk(2, dim=-1)
+        return self.act(value) * gate
+
+
+def _build_norm(norm_type: str, dim: int, eps: float) -> nn.Module:
+    if norm_type == "rms":
+        return RMSNorm(dim, eps=eps)
+    return nn.LayerNorm(dim)
+
+
+def _build_mlp(
+    in_dim: int,
+    hidden_dim: int,
+    layers: int,
+    dropout: float,
+    use_swiglu: bool,
+) -> Optional[nn.Module]:
+    if layers <= 0 or hidden_dim <= 0:
+        return None
+    blocks: List[nn.Module] = []
+    for idx in range(layers):
+        in_features = in_dim if idx == 0 else hidden_dim
+        if use_swiglu:
+            blocks.append(SwiGLULinear(in_features, hidden_dim))
+        else:
+            blocks.append(nn.Linear(in_features, hidden_dim))
+            blocks.append(nn.GELU())
+        if dropout > 0:
+            blocks.append(nn.Dropout(dropout))
+    return nn.Sequential(*blocks)
+
+
+def _resolve_torch_dtype(value: Optional[object]) -> Optional[torch.dtype]:
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        name = value.strip().lower()
+        if not name:
+            return None
+        mapping = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        return mapping.get(name)
+    return None
+
+
 def masked_mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask = mask.unsqueeze(-1).to(hidden.dtype)
     denom = mask.sum(dim=1).clamp_min(1.0)
@@ -79,22 +150,25 @@ class LatentHead(nn.Module):
         hidden_dim: int = 0,
         layers: int = 0,
         dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        norm_eps: float = 1e-6,
+        use_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self.ln = nn.LayerNorm(in_dim)
-        self.mlp = None
-        self.act = nn.GELU()
+        self.ln = _build_norm(norm_type, in_dim, eps=norm_eps)
+        self.act = nn.SiLU() if use_swiglu else nn.GELU()
         proj_in = in_dim
         if layers > 0 and hidden_dim > 0:
-            blocks = []
-            for idx in range(layers):
-                in_features = in_dim if idx == 0 else hidden_dim
-                blocks.append(nn.Linear(in_features, hidden_dim))
-                blocks.append(nn.GELU())
-                if dropout > 0:
-                    blocks.append(nn.Dropout(dropout))
-            self.mlp = nn.Sequential(*blocks)
+            self.mlp = _build_mlp(
+                in_dim,
+                hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                use_swiglu=use_swiglu,
+            )
             proj_in = hidden_dim
+        else:
+            self.mlp = None
         self.proj = DeterministicProjection(proj_in, latent_dim, latent_clip)
 
     def forward(self, pooled: torch.Tensor) -> torch.Tensor:
@@ -113,22 +187,25 @@ class _TokenClassifierHead(nn.Module):
         hidden_dim: int = 0,
         layers: int = 0,
         dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        norm_eps: float = 1e-6,
+        use_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self.ln = nn.LayerNorm(in_dim)
-        self.mlp = None
-        self.act = nn.GELU()
+        self.ln = _build_norm(norm_type, in_dim, eps=norm_eps)
+        self.act = nn.SiLU() if use_swiglu else nn.GELU()
         proj_in = in_dim
         if layers > 0 and hidden_dim > 0:
-            blocks = []
-            for idx in range(layers):
-                in_features = in_dim if idx == 0 else hidden_dim
-                blocks.append(nn.Linear(in_features, hidden_dim))
-                blocks.append(nn.GELU())
-                if dropout > 0:
-                    blocks.append(nn.Dropout(dropout))
-            self.mlp = nn.Sequential(*blocks)
+            self.mlp = _build_mlp(
+                in_dim,
+                hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                use_swiglu=use_swiglu,
+            )
             proj_in = hidden_dim
+        else:
+            self.mlp = None
         self.classifier = nn.Linear(proj_in, 2)
 
     def forward(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -170,22 +247,25 @@ class ProxyClassifierHead(nn.Module):
         hidden_dim: int = 0,
         layers: int = 0,
         dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        norm_eps: float = 1e-6,
+        use_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self.ln = nn.LayerNorm(in_dim)
-        self.mlp = None
-        self.act = nn.GELU()
+        self.ln = _build_norm(norm_type, in_dim, eps=norm_eps)
+        self.act = nn.SiLU() if use_swiglu else nn.GELU()
         proj_in = in_dim
         if layers > 0 and hidden_dim > 0:
-            blocks = []
-            for idx in range(layers):
-                in_features = in_dim if idx == 0 else hidden_dim
-                blocks.append(nn.Linear(in_features, hidden_dim))
-                blocks.append(nn.GELU())
-                if dropout > 0:
-                    blocks.append(nn.Dropout(dropout))
-            self.mlp = nn.Sequential(*blocks)
+            self.mlp = _build_mlp(
+                in_dim,
+                hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                use_swiglu=use_swiglu,
+            )
             proj_in = hidden_dim
+        else:
+            self.mlp = None
         self.classifier = nn.Linear(proj_in, num_classes)
 
     def forward(self, pooled: torch.Tensor) -> torch.Tensor:
@@ -205,22 +285,25 @@ class TokenReconstructionHead(nn.Module):
         hidden_dim: int = 0,
         layers: int = 0,
         dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        norm_eps: float = 1e-6,
+        use_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self.ln = nn.LayerNorm(in_dim)
-        self.mlp = None
-        self.act = nn.GELU()
+        self.ln = _build_norm(norm_type, in_dim, eps=norm_eps)
+        self.act = nn.SiLU() if use_swiglu else nn.GELU()
         proj_in = in_dim
         if layers > 0 and hidden_dim > 0:
-            blocks = []
-            for idx in range(layers):
-                in_features = in_dim if idx == 0 else hidden_dim
-                blocks.append(nn.Linear(in_features, hidden_dim))
-                blocks.append(nn.GELU())
-                if dropout > 0:
-                    blocks.append(nn.Dropout(dropout))
-            self.mlp = nn.Sequential(*blocks)
+            self.mlp = _build_mlp(
+                in_dim,
+                hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                use_swiglu=use_swiglu,
+            )
             proj_in = hidden_dim
+        else:
+            self.mlp = None
         self.proj = nn.Linear(proj_in, out_dim)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -241,26 +324,26 @@ class BranchMLP(nn.Module):
         hidden_dim: int = 0,
         layers: int = 1,
         dropout: float = 0.1,
+        norm_type: str = "layernorm",
+        norm_eps: float = 1e-6,
+        use_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self.prompt_len = max(1, int(prompt_len))
-        self.ln = nn.LayerNorm(in_dim)
-        self.act = nn.GELU()
+        self.ln = _build_norm(norm_type, in_dim, eps=norm_eps)
+        self.act = nn.SiLU() if use_swiglu else nn.GELU()
         proj_in = in_dim
-        blocks = []
         hidden_dim = int(hidden_dim) if hidden_dim and hidden_dim > 0 else in_dim
         layers = max(0, int(layers))
-        if layers > 0:
-            for idx in range(layers):
-                in_features = proj_in if idx == 0 else hidden_dim
-                blocks.append(nn.Linear(in_features, hidden_dim))
-                blocks.append(nn.GELU())
-                if dropout > 0:
-                    blocks.append(nn.Dropout(dropout))
+        self.mlp = _build_mlp(
+            proj_in,
+            hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            use_swiglu=use_swiglu,
+        )
+        if self.mlp is not None:
             proj_in = hidden_dim
-            self.mlp = nn.Sequential(*blocks)
-        else:
-            self.mlp = None
         self.proj = nn.Linear(proj_in, self.prompt_len * out_dim)
 
     def forward(self, pooled: torch.Tensor) -> torch.Tensor:
@@ -277,6 +360,12 @@ class BranchMLP(nn.Module):
 class DIBJudgeConfig:
     judge_encoder_name: str = "google/mt5-base"
     judge_lm_name: str = "gpt2"
+    attn_implementation: Optional[str] = None
+    padding_side: str = "right"
+    torch_dtype: Optional[str] = None
+    use_rms_norm: bool = False
+    rms_norm_eps: float = 1e-6
+    use_swiglu: bool = False
     z_latent_dim: int = 256
     z_prompt_prefix_len: int = 1
     z_prompt_postfix_len: int = 1
@@ -309,14 +398,67 @@ class DIBJudgeConfig:
     compact_head_layers: int = 1
     compact_head_dropout: float = 0.1
     compact_pi_init: float = 0.95
+    lm_loss_chunk_size: int = 0
+    compact_kl_chunk_size: int = 0
 
 
 class DIBJudgeModel(nn.Module):
+    @staticmethod
+    def _load_backbone(
+        model_cls,
+        name: str,
+        attn_implementation: Optional[str],
+        torch_dtype: Optional[torch.dtype],
+    ) -> torch.nn.Module:
+        use_flash = attn_implementation == "flash_attention_2"
+        use_cuda = use_flash and torch.cuda.is_available()
+        if use_flash and torch_dtype is None and torch.cuda.is_available():
+            torch_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        kwargs: Dict[str, object] = {}
+        if torch_dtype is not None:
+            kwargs["torch_dtype"] = torch_dtype
+        if use_flash:
+            kwargs["attn_implementation"] = attn_implementation
+        if use_cuda:
+            kwargs["device_map"] = "cuda"
+            kwargs["low_cpu_mem_usage"] = True
+        try:
+            model = model_cls.from_pretrained(name, **kwargs)
+        except (TypeError, ValueError, ImportError) as exc:
+            if use_flash:
+                warnings.warn(
+                    f"attn_implementation={attn_implementation} unavailable for {name}: {exc}. "
+                    "Falling back to default attention.",
+                    RuntimeWarning,
+                )
+                kwargs.pop("attn_implementation", None)
+            if "device_map" in kwargs:
+                kwargs.pop("device_map", None)
+                kwargs.pop("low_cpu_mem_usage", None)
+            model = model_cls.from_pretrained(name, **kwargs)
+        if use_cuda:
+            model = model.to("cuda")
+        return model
+
     def __init__(self, config: DIBJudgeConfig) -> None:
         super().__init__()
         self.config = config
-        self.shared_encoder = AutoModel.from_pretrained(config.judge_encoder_name)
-        self.judge_lm = AutoModelForCausalLM.from_pretrained(config.judge_lm_name)
+        attn_impl = getattr(config, "attn_implementation", None)
+        torch_dtype = _resolve_torch_dtype(getattr(config, "torch_dtype", None))
+        self.shared_encoder = self._load_backbone(
+            AutoModel, config.judge_encoder_name, attn_impl, torch_dtype
+        )
+        self.judge_lm = self._load_backbone(
+            AutoModelForCausalLM, config.judge_lm_name, attn_impl, torch_dtype
+        )
+        if (
+            attn_impl == "flash_attention_2"
+            and torch_dtype in (torch.float16, torch.bfloat16)
+        ):
+            self.shared_encoder = self.shared_encoder.to(dtype=torch_dtype)
+            self.judge_lm = self.judge_lm.to(dtype=torch_dtype)
         self._checkpoint_encoder = False
         self._checkpoint_lm = False
         self._checkpoint_use_reentrant = True
@@ -338,6 +480,9 @@ class DIBJudgeModel(nn.Module):
 
         self.task_prompt_len = max(1, int(config.z_prompt_len))
         self.bias_prompt_len = max(1, int(config.bias_prompt_len))
+        norm_type = "rms" if bool(config.use_rms_norm) else "layernorm"
+        norm_eps = float(config.rms_norm_eps)
+        use_swiglu = bool(config.use_swiglu)
         self.task_mlp = BranchMLP(
             encoder_hidden,
             encoder_hidden,
@@ -345,6 +490,9 @@ class DIBJudgeModel(nn.Module):
             hidden_dim=prompt_hidden,
             layers=max(0, int(config.prompt_mlp_layers)),
             dropout=float(config.prompt_mlp_dropout),
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
         self.bias_mlp = BranchMLP(
             encoder_hidden,
@@ -353,6 +501,9 @@ class DIBJudgeModel(nn.Module):
             hidden_dim=prompt_hidden,
             layers=max(0, int(config.prompt_mlp_layers)),
             dropout=float(config.prompt_mlp_dropout),
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
         self.vq_task = VectorQuantizerEMA(
             num_codes=int(config.task_codebook_size),
@@ -380,6 +531,9 @@ class DIBJudgeModel(nn.Module):
             hidden_dim=recon_hidden,
             layers=bias_layers,
             dropout=bias_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
         self.length_bin_head = ProxyClassifierHead(
             lm_hidden,
@@ -387,6 +541,9 @@ class DIBJudgeModel(nn.Module):
             hidden_dim=bias_hidden,
             layers=bias_layers,
             dropout=bias_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
         self.nll_bin_head = ProxyClassifierHead(
             lm_hidden,
@@ -394,6 +551,9 @@ class DIBJudgeModel(nn.Module):
             hidden_dim=bias_hidden,
             layers=bias_layers,
             dropout=bias_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
         self.ttr_bin_head = ProxyClassifierHead(
             lm_hidden,
@@ -401,6 +561,9 @@ class DIBJudgeModel(nn.Module):
             hidden_dim=bias_hidden,
             layers=bias_layers,
             dropout=bias_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
 
         compact_hidden = int(config.compact_head_hidden)
@@ -413,6 +576,9 @@ class DIBJudgeModel(nn.Module):
             hidden_dim=compact_hidden,
             layers=compact_layers,
             dropout=compact_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
         )
         self._init_compact_head_bias(float(config.compact_pi_init))
         self.register_buffer(
@@ -520,59 +686,158 @@ class DIBJudgeModel(nn.Module):
         self,
         orig_ids: torch.Tensor,
         orig_mask: torch.Tensor,
+        need_low_hidden: bool = True,
+        response_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
         Optional[Tuple[int, int]],
-        torch.Tensor,
+        Optional[torch.Tensor],
     ]:
         orig_ids, orig_mask, orig_shape = self._flatten_pair_inputs(orig_ids, orig_mask)
+        if orig_mask is None:
+            orig_mask = torch.ones_like(orig_ids, dtype=torch.long)
+        flat_response_mask: Optional[torch.Tensor] = None
+        if torch.is_tensor(response_mask):
+            if response_mask.dim() == 2 and orig_shape is not None:
+                flat_response_mask = response_mask.view(-1)
+            elif response_mask.dim() == 1 and response_mask.numel() == orig_ids.size(0):
+                flat_response_mask = response_mask
+        keep = None
+        if flat_response_mask is not None:
+            keep = flat_response_mask.to(orig_mask.device).bool()
+
+        empty = orig_mask.sum(dim=1).eq(0)
+        empty_kept = empty if keep is None else (empty & keep)
+        if empty_kept.any():
+            if not getattr(self, "_warned_empty_response", False):
+                count = int(empty_kept.sum().item())
+                detail = ""
+                if orig_shape is not None:
+                    bsz, pairs = orig_shape
+                    if pairs == 2:
+                        empty_pairs = empty_kept.view(bsz, pairs)
+                        count_a = int(empty_pairs[:, 0].sum().item())
+                        count_b = int(empty_pairs[:, 1].sum().item())
+                        detail = f" (A: {count_a}, B: {count_b})"
+                elif (
+                    torch.is_tensor(response_mask)
+                    and response_mask.dim() == 2
+                    and response_mask.size(1) == 2
+                    and empty_kept.numel() == response_mask.numel()
+                ):
+                    empty_pairs = empty_kept.view(response_mask.size(0), response_mask.size(1))
+                    count_a = int(empty_pairs[:, 0].sum().item())
+                    count_b = int(empty_pairs[:, 1].sum().item())
+                    detail = f" (A: {count_a}, B: {count_b})"
+                warnings.warn(
+                    f"Detected {count} empty response sequences{detail}; "
+                    "injecting a pad token to keep FlashAttention stable.",
+                    RuntimeWarning,
+                )
+                self._warned_empty_response = True
+            pad_side = getattr(self.config, "padding_side", "right")
+            pad_side = pad_side if pad_side in {"left", "right"} else "right"
+            pad_idx = -1 if pad_side == "left" else 0
+            orig_mask[empty_kept, pad_idx] = 1
+            pad_id = getattr(self.shared_encoder.config, "pad_token_id", None)
+            if pad_id is None:
+                pad_id = getattr(self.judge_lm.config, "pad_token_id", None)
+            if pad_id is None:
+                pad_id = 0
+            orig_ids[empty_kept, pad_idx] = int(pad_id)
         orig_len = orig_ids.size(1)
         use_ckpt = (
             self.training and self._checkpoint_encoder and torch.is_grad_enabled()
         )
         enc_embed_layer = self.shared_encoder.get_input_embeddings() if use_ckpt else None
-        if use_ckpt and enc_embed_layer is not None:
-            encoder_embeds = enc_embed_layer(orig_ids)
-            if not encoder_embeds.requires_grad:
-                encoder_embeds = encoder_embeds.detach().requires_grad_(True)
-            idx = int(self.config.low_recon_layer)
+        idx = int(self.config.low_recon_layer)
 
-            def _run_encoder(inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
-                outputs = self.shared_encoder(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    use_cache=False,
-                    return_dict=True,
+        def _encode(
+            inputs_ids: torch.Tensor, inputs_mask: torch.Tensor
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            if use_ckpt and enc_embed_layer is not None:
+                encoder_embeds = enc_embed_layer(inputs_ids)
+                if not encoder_embeds.requires_grad:
+                    encoder_embeds = encoder_embeds.detach().requires_grad_(True)
+
+                def _run_encoder(inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
+                    outputs = self.shared_encoder(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        output_hidden_states=need_low_hidden,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    low_hidden_local = None
+                    if need_low_hidden:
+                        hidden_states = outputs.hidden_states
+                        if not hidden_states:
+                            raise ValueError(
+                                "Shared encoder output missing hidden states for reconstruction."
+                            )
+                        idx_local = max(0, min(idx, len(hidden_states) - 1))
+                        low_hidden_local = hidden_states[idx_local][:, :orig_len]
+                    return outputs.last_hidden_state, low_hidden_local
+
+                return checkpoint(
+                    _run_encoder,
+                    encoder_embeds,
+                    inputs_mask,
+                    use_reentrant=self._checkpoint_use_reentrant,
                 )
-                hidden_states = outputs.hidden_states
-                if not hidden_states:
-                    raise ValueError("Shared encoder output missing hidden states for reconstruction.")
-                idx_local = max(0, min(idx, len(hidden_states) - 1))
-                low_hidden_local = hidden_states[idx_local][:, :orig_len]
-                return outputs.last_hidden_state, low_hidden_local
-
-            orig_hidden, low_hidden = checkpoint(
-                _run_encoder,
-                encoder_embeds,
-                orig_mask,
-                use_reentrant=self._checkpoint_use_reentrant,
-            )
-        else:
-            orig_outputs = self.shared_encoder(
-                input_ids=orig_ids,
-                attention_mask=orig_mask,
-                output_hidden_states=True,
+            outputs = self.shared_encoder(
+                input_ids=inputs_ids,
+                attention_mask=inputs_mask,
+                output_hidden_states=need_low_hidden,
                 use_cache=False,
             )
-            orig_hidden = self._get_hidden(orig_outputs)
-            hidden_states = getattr(orig_outputs, "hidden_states", None)
-            if not hidden_states:
-                raise ValueError("Shared encoder output missing hidden states for reconstruction.")
-            idx = int(self.config.low_recon_layer)
-            idx = max(0, min(idx, len(hidden_states) - 1))
-            low_hidden = hidden_states[idx][:, :orig_len]
+            hidden = self._get_hidden(outputs)
+            low_hidden_local = None
+            if need_low_hidden:
+                hidden_states = getattr(outputs, "hidden_states", None)
+                if not hidden_states:
+                    raise ValueError(
+                        "Shared encoder output missing hidden states for reconstruction."
+                    )
+                idx_local = max(0, min(idx, len(hidden_states) - 1))
+                low_hidden_local = hidden_states[idx_local][:, :orig_len]
+            return hidden, low_hidden_local
+
+        if keep is not None and keep.numel() == orig_ids.size(0) and not keep.all():
+            if keep.any():
+                kept_hidden, kept_low = _encode(orig_ids[keep], orig_mask[keep])
+                full_hidden = kept_hidden.new_zeros(
+                    (orig_ids.size(0), orig_ids.size(1), kept_hidden.size(-1))
+                )
+                full_hidden[keep] = kept_hidden
+                full_low = None
+                if need_low_hidden:
+                    full_low = kept_hidden.new_zeros(
+                        (orig_ids.size(0), orig_ids.size(1), kept_hidden.size(-1))
+                    )
+                    if kept_low is not None:
+                        full_low[keep] = kept_low
+                orig_hidden = full_hidden
+                low_hidden = full_low
+            else:
+                hidden_size = getattr(self.shared_encoder.config, "hidden_size", None)
+                if hidden_size is None:
+                    hidden_size = getattr(self.shared_encoder.config, "d_model", None)
+                if hidden_size is None:
+                    raise ValueError("Unable to resolve shared encoder hidden size.")
+                embed_layer = self.shared_encoder.get_input_embeddings()
+                dtype = embed_layer.weight.dtype if embed_layer is not None else torch.float32
+                orig_hidden = torch.zeros(
+                    (orig_ids.size(0), orig_ids.size(1), hidden_size),
+                    device=orig_ids.device,
+                    dtype=dtype,
+                )
+                low_hidden = (
+                    orig_hidden.clone() if need_low_hidden else None
+                )
+        else:
+            orig_hidden, low_hidden = _encode(orig_ids, orig_mask)
 
         return (
             orig_hidden,
@@ -673,6 +938,80 @@ class DIBJudgeModel(nn.Module):
         logvar = (var.clamp_min(1e-6)).log()
         return torch.cat([mean, logvar], dim=-1)
 
+    @staticmethod
+    def _compute_causal_lm_loss(
+        logits: torch.Tensor,
+        labels: Optional[torch.Tensor],
+        chunk_size: int = 0,
+    ) -> Optional[torch.Tensor]:
+        if labels is None:
+            return None
+        if logits.numel() == 0:
+            return logits.new_zeros(())
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+        if shift_labels.numel() == 0:
+            return logits.new_zeros(())
+        chunk_size = int(chunk_size) if chunk_size is not None else 0
+        if chunk_size <= 0:
+            return F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="mean",
+            )
+        total_loss = shift_logits.new_zeros(())
+        total_count = shift_labels.new_zeros((), dtype=torch.long)
+        for start in range(0, shift_logits.size(1), chunk_size):
+            end = min(start + chunk_size, shift_logits.size(1))
+            chunk_logits = shift_logits[:, start:end, :]
+            chunk_labels = shift_labels[:, start:end]
+            if chunk_labels.numel() == 0:
+                continue
+            chunk_loss = F.cross_entropy(
+                chunk_logits.reshape(-1, chunk_logits.size(-1)),
+                chunk_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_loss = total_loss + chunk_loss
+            total_count = total_count + chunk_labels.ne(-100).sum()
+        return total_loss / total_count.clamp_min(1).to(total_loss.dtype)
+
+    @staticmethod
+    def _compute_compact_kl_loss(
+        full_logits: torch.Tensor,
+        masked_logits: torch.Tensor,
+        label_mask: torch.Tensor,
+        chunk_size: int = 0,
+    ) -> torch.Tensor:
+        if label_mask is None or not label_mask.any():
+            return masked_logits.new_zeros(())
+        chunk_size = int(chunk_size) if chunk_size is not None else 0
+        if chunk_size > 0:
+            total_kl = full_logits.new_zeros(())
+            total_count = label_mask.new_zeros((), dtype=torch.long)
+            seq_len = full_logits.size(1)
+            for start in range(0, seq_len, chunk_size):
+                end = min(start + chunk_size, seq_len)
+                chunk_mask = label_mask[:, start:end]
+                if not chunk_mask.any():
+                    continue
+                chunk_full = full_logits[:, start:end, :][chunk_mask]
+                chunk_masked = masked_logits[:, start:end, :][chunk_mask]
+                full_logp = F.log_softmax(chunk_full.float(), dim=-1)
+                masked_logp = F.log_softmax(chunk_masked.float(), dim=-1)
+                kl = (full_logp.exp() * (full_logp - masked_logp)).sum(dim=-1)
+                total_kl = total_kl + kl.sum()
+                total_count = total_count + chunk_mask.sum()
+            return total_kl / total_count.clamp_min(1).to(total_kl.dtype)
+        full_logits = full_logits[label_mask]
+        masked_logits = masked_logits[label_mask]
+        full_logp = F.log_softmax(full_logits.float(), dim=-1)
+        masked_logp = F.log_softmax(masked_logits.float(), dim=-1)
+        kl = (full_logp.exp() * (full_logp - masked_logp)).sum(dim=-1)
+        return kl.mean()
+
     def _apply_z_dropout(self, z: torch.Tensor, dropout: float) -> torch.Tensor:
         if not self.training or dropout <= 0:
             return z
@@ -707,12 +1046,40 @@ class DIBJudgeModel(nn.Module):
         compact_prior: Optional[torch.Tensor] = None,
         compact_mask_scale: Optional[torch.Tensor] = None,
         disable_compactor: bool = False,
+        compute_compact_kl: bool = True,
+        lm_loss_chunk_size: Optional[int] = None,
+        compact_kl_chunk_size: Optional[int] = None,
+        return_logits: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        if lm_loss_chunk_size is None:
+            lm_loss_chunk_size = int(getattr(self.config, "lm_loss_chunk_size", 0) or 0)
+        elif torch.is_tensor(lm_loss_chunk_size):
+            lm_loss_chunk_size = int(lm_loss_chunk_size.detach().item())
+        else:
+            lm_loss_chunk_size = int(lm_loss_chunk_size)
+        if compact_kl_chunk_size is None:
+            compact_kl_chunk_size = int(
+                getattr(self.config, "compact_kl_chunk_size", 0) or 0
+            )
+        elif torch.is_tensor(compact_kl_chunk_size):
+            compact_kl_chunk_size = int(compact_kl_chunk_size.detach().item())
+        else:
+            compact_kl_chunk_size = int(compact_kl_chunk_size)
         embed_layer = self.judge_lm.get_input_embeddings()
         inputs_embeds = embed_layer(input_ids)
         use_ckpt = self.training and self._checkpoint_lm and torch.is_grad_enabled()
+        need_logits = bool(return_logits) or labels is None
         if use_ckpt and not inputs_embeds.requires_grad:
             inputs_embeds = inputs_embeds.detach().requires_grad_(True)
+        pad_side = getattr(self.config, "padding_side", None)
+        if isinstance(pad_side, str):
+            pad_side = pad_side.lower()
+        if pad_side not in {"left", "right"}:
+            pad_side = (
+                "left"
+                if attention_mask[:, -1].sum() == attention_mask.size(0)
+                else "right"
+            )
         compact_mask_loss = inputs_embeds.new_zeros(())
         compact_con_loss = inputs_embeds.new_zeros(())
         compact_kl_loss = inputs_embeds.new_zeros(())
@@ -722,12 +1089,41 @@ class DIBJudgeModel(nn.Module):
         if pi_logits is None:
             pi_logits = inputs_embeds.new_zeros(inputs_embeds.size(0), inputs_embeds.size(1))
         if response_types is not None and z_prompts is not None:
+            def _pad_sequences(
+                sequences: List[torch.Tensor],
+                pad_value: float,
+            ) -> torch.Tensor:
+                if not sequences:
+                    raise ValueError("Expected non-empty sequence list for padding.")
+                max_len = max(seq.size(0) for seq in sequences)
+                if sequences[0].dim() == 1:
+                    padded = sequences[0].new_full(
+                        (len(sequences), max_len), pad_value
+                    )
+                    for i, seq in enumerate(sequences):
+                        length = seq.size(0)
+                        if pad_side == "left":
+                            padded[i, -length:] = seq
+                        else:
+                            padded[i, :length] = seq
+                    return padded
+                dim = sequences[0].size(-1)
+                padded = sequences[0].new_full(
+                    (len(sequences), max_len, dim), pad_value
+                )
+                for i, seq in enumerate(sequences):
+                    length = seq.size(0)
+                    if pad_side == "left":
+                        padded[i, -length:, :] = seq
+                    else:
+                        padded[i, :length, :] = seq
+                return padded
+
             embeds_list = []
             attn_list = []
             labels_list = []
             resp_list = []
             pi_list = []
-            max_len = 0
             for idx in range(inputs_embeds.size(0)):
                 embeds = inputs_embeds[idx]
                 attn = attention_mask[idx]
@@ -751,36 +1147,48 @@ class DIBJudgeModel(nn.Module):
                 pi_list.append(pi)
                 if lbl is not None:
                     labels_list.append(lbl)
-                max_len = max(max_len, embeds.size(0))
 
-            inputs_embeds = torch.nn.utils.rnn.pad_sequence(
-                embeds_list, batch_first=True, padding_value=0.0
-            )
-            attention_mask = torch.nn.utils.rnn.pad_sequence(
-                attn_list, batch_first=True, padding_value=0
-            )
-            response_types = torch.nn.utils.rnn.pad_sequence(
-                resp_list, batch_first=True, padding_value=0
-            )
-            pi_logits = torch.nn.utils.rnn.pad_sequence(
-                pi_list, batch_first=True, padding_value=0.0
-            )
+            inputs_embeds = _pad_sequences(embeds_list, pad_value=0.0)
+            attention_mask = _pad_sequences(attn_list, pad_value=0)
+            response_types = _pad_sequences(resp_list, pad_value=0)
+            pi_logits = _pad_sequences(pi_list, pad_value=0.0)
             if labels is not None:
-                labels = torch.nn.utils.rnn.pad_sequence(
-                    labels_list, batch_first=True, padding_value=-100
-                )
+                labels = _pad_sequences(labels_list, pad_value=-100)
             else:
                 labels = None
         if disable_compactor:
-            outputs = self.judge_lm(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                labels=labels,
-                use_cache=False,
-            )
-            return {
-                "loss": outputs.loss,
-                "logits": outputs.logits,
+            if use_ckpt and labels is not None and not need_logits:
+                def _run_lm_loss(lm_embeds: torch.Tensor, lm_attention: torch.Tensor) -> torch.Tensor:
+                    out = self.judge_lm(
+                        inputs_embeds=lm_embeds,
+                        attention_mask=lm_attention,
+                        labels=None,
+                        use_cache=False,
+                    )
+                    return self._compute_causal_lm_loss(
+                        out.logits, labels, chunk_size=lm_loss_chunk_size
+                    )
+
+                lm_loss = checkpoint(
+                    _run_lm_loss,
+                    inputs_embeds,
+                    attention_mask,
+                    use_reentrant=self._checkpoint_use_reentrant,
+                )
+                lm_logits = None
+            else:
+                outputs = self.judge_lm(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    labels=None,
+                    use_cache=False,
+                )
+                lm_logits = outputs.logits
+                lm_loss = self._compute_causal_lm_loss(
+                    lm_logits, labels, chunk_size=lm_loss_chunk_size
+                )
+            result = {
+                "loss": lm_loss,
                 "compact_mask_loss": inputs_embeds.new_zeros(()),
                 "compact_con_loss": inputs_embeds.new_zeros(()),
                 "compact_kl_loss": inputs_embeds.new_zeros(()),
@@ -788,6 +1196,9 @@ class DIBJudgeModel(nn.Module):
                 "compact_mask_mean": inputs_embeds.new_zeros(()),
                 "compact_pi_saturation": inputs_embeds.new_zeros(()),
             }
+            if need_logits and lm_logits is not None:
+                result["logits"] = lm_logits
+            return result
         if labels is not None:
             labels = labels.masked_fill(attention_mask.eq(0), -100)
         pi = torch.sigmoid(pi_logits.float())
@@ -856,25 +1267,47 @@ class DIBJudgeModel(nn.Module):
         mu_embed = embed_layer(self.compact_mu_id.to(inputs_embeds.device))
         mu_embed = mu_embed.view(1, 1, -1)
         masked_embeds = m.unsqueeze(-1) * inputs_embeds + (1.0 - m).unsqueeze(-1) * mu_embed
-        if use_ckpt and labels is not None:
-            def _run_lm(
-                lm_embeds: torch.Tensor, lm_attention: torch.Tensor, lm_labels: torch.Tensor
-            ):
+        label_mask = labels.ne(-100) if labels is not None else None
+        compute_kl = bool(compute_compact_kl and label_mask is not None and label_mask.any())
+        if use_ckpt and labels is not None and not need_logits:
+            def _run_lm_loss(
+                lm_embeds: torch.Tensor, lm_attention: torch.Tensor
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
                 out = self.judge_lm(
                     inputs_embeds=lm_embeds,
                     attention_mask=lm_attention,
-                    labels=lm_labels,
+                    labels=None,
                     use_cache=False,
                 )
-                return out.loss, out.logits
+                lm_logits_local = out.logits
+                lm_loss_local = self._compute_causal_lm_loss(
+                    lm_logits_local, labels, chunk_size=lm_loss_chunk_size
+                )
+                if compute_kl:
+                    with torch.no_grad():
+                        full_out = self.judge_lm(
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=lm_attention,
+                            labels=None,
+                            use_cache=False,
+                        )
+                    compact_kl_local = self._compute_compact_kl_loss(
+                        full_out.logits,
+                        lm_logits_local,
+                        label_mask,
+                        chunk_size=compact_kl_chunk_size,
+                    )
+                else:
+                    compact_kl_local = lm_logits_local.new_zeros(())
+                return lm_loss_local, compact_kl_local
 
-            lm_loss, lm_logits = checkpoint(
-                _run_lm,
+            lm_loss, compact_kl_loss = checkpoint(
+                _run_lm_loss,
                 masked_embeds,
                 attention_mask,
-                labels,
                 use_reentrant=self._checkpoint_use_reentrant,
             )
+            lm_logits = None
         elif use_ckpt and labels is None:
             def _run_lm_logits(lm_embeds: torch.Tensor, lm_attention: torch.Tensor):
                 out = self.judge_lm(
@@ -896,14 +1329,14 @@ class DIBJudgeModel(nn.Module):
             outputs = self.judge_lm(
                 inputs_embeds=masked_embeds,
                 attention_mask=attention_mask,
-                labels=labels,
+                labels=None,
                 use_cache=False,
             )
-            lm_loss = outputs.loss
             lm_logits = outputs.logits
-        if labels is not None and lm_loss is not None:
-            label_mask = labels.ne(-100)
-            if label_mask.any():
+            lm_loss = self._compute_causal_lm_loss(
+                lm_logits, labels, chunk_size=lm_loss_chunk_size
+            )
+            if compute_kl and lm_loss is not None:
                 with torch.no_grad():
                     full_out = self.judge_lm(
                         inputs_embeds=inputs_embeds,
@@ -911,14 +1344,15 @@ class DIBJudgeModel(nn.Module):
                         labels=None,
                         use_cache=False,
                     )
-                full_logp = F.log_softmax(full_out.logits.float(), dim=-1)
-                masked_logp = F.log_softmax(lm_logits.float(), dim=-1)
-                full_p = full_logp.exp()
-                kl = (full_p * (full_logp - masked_logp)).sum(dim=-1)
-                compact_kl_loss = kl[label_mask].mean()
+                compact_kl_loss = self._compute_compact_kl_loss(
+                    full_out.logits,
+                    lm_logits,
+                    label_mask,
+                    chunk_size=compact_kl_chunk_size,
+                )
         return {
             "loss": lm_loss,
-            "logits": lm_logits,
+            "logits": lm_logits if need_logits else None,
             "compact_mask_loss": compact_mask_loss,
             "compact_con_loss": compact_con_loss,
             "compact_kl_loss": compact_kl_loss,
@@ -930,7 +1364,10 @@ class DIBJudgeModel(nn.Module):
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         disable_compactor = bool(batch.get("disable_compactor", False))
         disable_z_prompt = bool(batch.get("disable_z_prompt_insertion", False))
+        lm_loss_chunk_size = batch.get("lm_loss_chunk_size", None)
+        compact_kl_chunk_size = batch.get("compact_kl_chunk_size", None)
         if disable_compactor and disable_z_prompt:
+            compute_compact_kl = bool(batch.get("compute_compact_kl", True))
             lm_out = self.lm_forward(
                 batch["lm_input_ids"],
                 batch["lm_attention_mask"],
@@ -941,8 +1378,21 @@ class DIBJudgeModel(nn.Module):
                 compact_prior=batch.get("compact_prior"),
                 compact_mask_scale=None,
                 disable_compactor=True,
+                compute_compact_kl=compute_compact_kl,
+                lm_loss_chunk_size=lm_loss_chunk_size,
+                compact_kl_chunk_size=compact_kl_chunk_size,
+                return_logits=bool(batch.get("return_lm_logits", False)),
             )
-            zero = lm_out["logits"].new_zeros(())
+            base = lm_out.get("logits")
+            if base is None:
+                base = lm_out.get("loss")
+            if base is None:
+                base = lm_out.get("compact_mask_loss")
+            if base is None:
+                base = lm_out.get("compact_kl_loss")
+            if base is None:
+                base = batch["lm_input_ids"]
+            zero = base.new_zeros(())
             outputs = {
                 "lm_loss": lm_out["loss"],
                 "compact_mask_loss": lm_out["compact_mask_loss"],
@@ -957,6 +1407,11 @@ class DIBJudgeModel(nn.Module):
                 "vq_task_commitment_loss": zero,
                 "vq_task_codebook_loss": zero,
                 "vq_task_perplexity": zero,
+                "vq_task_perplexity_ema": zero,
+                "vq_task_active_codes": zero,
+                "vq_task_active_fraction": zero,
+                "vq_task_usage_entropy": zero,
+                "vq_task_unique_codes": zero,
                 "vq_task_dead_fraction": zero,
                 "vq_task_avg_distance": zero,
                 "vq_align_loss": zero,
@@ -965,6 +1420,7 @@ class DIBJudgeModel(nn.Module):
             if bool(batch.get("return_lm_logits", False)):
                 outputs["lm_logits"] = lm_out["logits"]
             return outputs
+        enable_low_recon = bool(batch.get("enable_low_recon", True))
         (
             orig_hidden,
             orig_mask,
@@ -973,6 +1429,8 @@ class DIBJudgeModel(nn.Module):
         ) = self._encode_bias_bundle(
             batch.get("original_prompt_input_ids", batch["original_input_ids"]),
             batch.get("original_prompt_attention_mask", batch["original_attention_mask"]),
+            need_low_hidden=enable_low_recon,
+            response_mask=batch.get("response_mask"),
         )
         if orig_shape is None:
             bsz = orig_mask.size(0)
@@ -994,6 +1452,12 @@ class DIBJudgeModel(nn.Module):
             vq_task_commitment_loss = zero
             vq_task_codebook_loss = zero
             vq_task_perplexity = zero
+            vq_task_perplexity_ema = zero
+            vq_task_usage_loss = zero
+            vq_task_active_codes = zero
+            vq_task_active_fraction = zero
+            vq_task_usage_entropy = zero
+            vq_task_unique_codes = zero
             vq_task_dead_fraction = zero
             vq_task_avg_distance = zero
         else:
@@ -1012,12 +1476,22 @@ class DIBJudgeModel(nn.Module):
             zq_task_prompt = self.task_vq_to_lm(zq_task_prompt)
             zq_task_pool_lm = self.task_vq_to_lm(zq_task_pool)
 
-            low_recon_pred = self.low_recon_head(zq_bias_orig_pool)
-            low_recon_target = self._compute_low_stats(low_hidden, orig_mask).detach()
+            if enable_low_recon and low_hidden is not None:
+                low_recon_pred = self.low_recon_head(zq_bias_orig_pool)
+                low_recon_target = self._compute_low_stats(low_hidden, orig_mask).detach()
+            else:
+                low_recon_pred = None
+                low_recon_target = None
             vq_task_loss = vq_task.loss
             vq_task_commitment_loss = vq_task.commitment_loss
             vq_task_codebook_loss = vq_task.codebook_loss
             vq_task_perplexity = vq_task.perplexity
+            vq_task_perplexity_ema = vq_task.perplexity_ema
+            vq_task_usage_loss = vq_task.usage_loss
+            vq_task_active_codes = vq_task.active_codes
+            vq_task_active_fraction = vq_task.active_fraction
+            vq_task_usage_entropy = vq_task.usage_entropy
+            vq_task_unique_codes = vq_task.unique_codes
             vq_task_dead_fraction = vq_task.dead_fraction
             vq_task_avg_distance = vq_task.avg_distance
         pi_logits = None
@@ -1041,6 +1515,7 @@ class DIBJudgeModel(nn.Module):
             if pairs > 1:
                 z_prompts["b"] = z_pair[:, 1]
 
+        compute_compact_kl = bool(batch.get("compute_compact_kl", True))
         lm_out = self.lm_forward(
             batch["lm_input_ids"],
             batch["lm_attention_mask"],
@@ -1051,6 +1526,10 @@ class DIBJudgeModel(nn.Module):
             compact_prior=batch.get("compact_prior"),
             compact_mask_scale=batch.get("compact_mask_scale"),
             disable_compactor=disable_compactor,
+            compute_compact_kl=compute_compact_kl,
+            lm_loss_chunk_size=lm_loss_chunk_size,
+            compact_kl_chunk_size=compact_kl_chunk_size,
+            return_logits=bool(batch.get("return_lm_logits", False)),
         )
         return_lm_logits = bool(batch.get("return_lm_logits", False))
 
@@ -1085,7 +1564,12 @@ class DIBJudgeModel(nn.Module):
             "vq_task_commitment_loss": vq_task_commitment_loss,
             "vq_task_codebook_loss": vq_task_codebook_loss,
             "vq_task_perplexity": vq_task_perplexity,
-            "vq_task_usage_loss": vq_task.usage_loss,
+            "vq_task_perplexity_ema": vq_task_perplexity_ema,
+            "vq_task_usage_loss": vq_task_usage_loss,
+            "vq_task_active_codes": vq_task_active_codes,
+            "vq_task_active_fraction": vq_task_active_fraction,
+            "vq_task_usage_entropy": vq_task_usage_entropy,
+            "vq_task_unique_codes": vq_task_unique_codes,
             "vq_task_dead_fraction": vq_task_dead_fraction,
             "vq_task_avg_distance": vq_task_avg_distance,
             "vq_align_loss": vq_align_task,

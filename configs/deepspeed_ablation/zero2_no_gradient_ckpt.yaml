@@ -62,20 +62,20 @@ proxy_soft_labels: true # use soft labels for proxy bin losses
 
 # runtime config
 epochs: 1 # number of training epochs
-deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
-output_dir: outputs/default # checkpoint output directory
-log_dir: logs/default # log output directory
+deepspeed_config: configs/deepspeed/ds_z2_config.json # DeepSpeed json config path
+output_dir: outputs/zero2_no_gradient_ckpt # checkpoint output directory
+log_dir: logs/zero2_no_gradient_ckpt # log output directory
 save_every_steps: 0 # checkpoint save interval (0 = disabled)
 save_at_end: true # save a checkpoint at end of training
 bf16: true # enable bfloat16 training
 allow_tf32: true # enable TF32 matmul kernels for speed
 gradient_checkpointing: false # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
-lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
-compact_kl_chunk_size: 256 # optional chunk size for compact KL (0 = disabled)
+lm_loss_chunk_size: 0 # optional chunk size for causal LM loss (0 = disabled)
+compact_kl_chunk_size: 0 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
-swanlab_run_name: default # SwanLab run name
+swanlab_run_name: zero2_no_gradient_ckpt # SwanLab run name
 swanlab_tags: null # SwanLab tags list or null
 swanlab_log_steps: 1 # SwanLab logging interval
 
@@ -118,24 +118,24 @@ scheduler_type: cosine # scheduler type for HF scheduler
 compact_keep_init: 0.9 # initial keep ratio for compact masking
 loss_schedule: dynamic
 compact_keep_final: 0.5
-disable_compactor: false
-disable_z_prompt_insertion: false
+disable_compactor: true
+disable_z_prompt_insertion: true
 compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value
 kl_weight_max: 1.0 # max weight for compact KL loss
 z_dropout: 0.0 # fixed z dropout for task prompts
 
 
 # loss config
-lambda_compression: 0.5 # global scale for compression loss
-mask_loss_weight: 1.0 # weight for compact mask loss
-consistency_loss_weight: 1.0 # weight for compact consistency loss
-mask_group_weight: 0.5 # weight for (mask_loss + consistency_loss) group loss
-vq_task_weight: 0.5 # weight for VQ commitment/codebook loss
-vq_usage_weight: 0.5 # weight for VQ usage regularization loss
-vq_align_weight: 0.1 # weight for VQ alignment loss
-lambda_bias: 0.5 # global scale for bias losses
-low_recon_weight: 0.5 # weight for low-level reconstruction loss
-nll_bin_weight: 0.5 # weight for NLL bin loss
-ttr_bin_weight: 0.5 # weight for TTR bin loss
-length_bin_weight: 0.5 # weight for length bin loss
-disentangle_weight: 0.5 # global scale for disentanglement loss
+lambda_compression: 0.0 # global scale for compression loss
+mask_loss_weight: 0.0 # weight for compact mask loss
+consistency_loss_weight: 0.0 # weight for compact consistency loss
+mask_group_weight: 0.0 # weight for (mask_loss + consistency_loss) group loss
+vq_task_weight: 0.0 # weight for VQ commitment/codebook loss
+vq_usage_weight: 0.0 # weight for VQ usage regularization loss
+vq_align_weight: 0.0 # weight for VQ alignment loss
+lambda_bias: 0.0 # global scale for bias losses
+low_recon_weight: 0.0 # weight for low-level reconstruction loss
+nll_bin_weight: 0.0 # weight for NLL bin loss
+ttr_bin_weight: 0.0 # weight for TTR bin loss
+length_bin_weight: 0.0 # weight for length bin loss
+disentangle_weight: 0.0 # global scale for disentanglement loss
