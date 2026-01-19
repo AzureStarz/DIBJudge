@@ -2,6 +2,7 @@ data/*
 logs/*
 outputs/*
 results/*
+bias_results/*
 swanlog/*
 vibe/*
 scripts/rm_r1_dataset/*

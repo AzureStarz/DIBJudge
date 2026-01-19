@@ -68,46 +68,100 @@ echo "Detected ${num_gpus} GPUs"
 #     --template mr3_templates \
 #     --tensor_parallel_size ${num_gpus}
 
-deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
-    --config configs/finetune_deepspeed.yaml
+# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+#     --config configs/finetune_deepspeed.yaml
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/vq_default/hf-epoch-1/lm \
+#     --checkpoint outputs/vq_default/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/vq_default/hf-epoch-1 \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/vq_default/hf-epoch-2/lm \
+#     --checkpoint outputs/vq_default/hf-epoch-2/dibjudge \
+#     --output_dir results/Qwen3-4B/vq_default/hf-epoch-2 \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
 
 bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/default/hf-epoch-1/lm \
-    --checkpoint outputs/default/hf-epoch-1/dibjudge \
-    --output_dir results/Qwen3-4B/default \
+    --model outputs/vq_default/hf-epoch-3/lm \
+    --checkpoint outputs/vq_default/hf-epoch-3/dibjudge \
+    --output_dir results/Qwen3-4B/vq_default/hf-epoch-3 \
     --languages zh \
     --template mr3_templates \
     --tensor_parallel_size ${num_gpus}
 
-deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
-    --config configs/ablation/no_disentangle.yaml
+# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+#     --config configs/finetune_deepspeed_50k.yaml
 
-bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/no_disentangle/hf-epoch-1/lm \
-    --checkpoint outputs/no_disentangle/hf-epoch-1/dibjudge \
-    --output_dir results/Qwen3-4B/no_disentangle \
-    --languages zh \
-    --template mr3_templates \
-    --tensor_parallel_size ${num_gpus}
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/noise_default_50k/hf-epoch-1/lm \
+#     --checkpoint outputs/noise_default_50k/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/noise_default_50k \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
 
-deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
-    --config configs/ablation/no_compactor.yaml
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/default/hf-epoch-1/lm \
+#     --checkpoint outputs/default/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/default \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
 
-bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/no_compactor/hf-epoch-1/lm \
-    --checkpoint outputs/no_compactor/hf-epoch-1/dibjudge \
-    --output_dir results/Qwen3-4B/no_compactor \
-    --languages zh \
-    --template mr3_templates \
-    --tensor_parallel_size ${num_gpus}
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/new_schedule_default/hf-epoch-1/lm \
+#     --checkpoint outputs/new_schedule_default/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/new_schedule_default \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
 
-deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
-    --config configs/ablation/no_z_prompt.yaml
+# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+#     --config configs/ablation/no_disentangle.yaml
 
-bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/no_z_prompt/hf-epoch-1/lm \
-    --checkpoint outputs/no_z_prompt/hf-epoch-1/dibjudge \
-    --output_dir results/Qwen3-4B/no_z_prompt \
-    --languages zh \
-    --template mr3_templates \
-    --tensor_parallel_size ${num_gpus}
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/no_disentangle/hf-epoch-1/lm \
+#     --checkpoint outputs/no_disentangle/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/no_disentangle \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
+
+# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+#     --config configs/ablation/no_compactor.yaml
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/no_compactor/hf-epoch-1/lm \
+#     --checkpoint outputs/no_compactor/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/no_compactor \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
+
+# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+#     --config configs/ablation/no_z_prompt.yaml
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/no_z_prompt/hf-epoch-1/lm \
+#     --checkpoint outputs/no_z_prompt/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/no_z_prompt \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
+
+# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+#     --config configs/ablation/no_proxy.yaml
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/no_proxy/hf-epoch-1/lm \
+#     --checkpoint outputs/no_proxy/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/no_proxy \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}

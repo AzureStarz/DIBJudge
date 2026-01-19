@@ -95,11 +95,11 @@ shift $((OPTIND - 1))
 cd DIBJUDGE_ROOT
 source DIBJUDGE_ENV_FILE
 
-module load amd/singularity/3.10.4
+module load amd/singularity/3.10.4 amd/cuda/11.8.89
 
 # Paths
 SIF=/online1/hpc_containers/base_hpc_glibc_235.sif
-CONDA_ENV=/path/to/workspace/online1/miniconda3/envs/vllm_0112_new/
+CONDA_ENV=/path/to/workspace/.conda/envs/vllm_0112_new01/
 BIND1=/online1/hpc_containers/conda/
 BIND2=/path/to/bind/
 
@@ -126,6 +126,10 @@ singularity exec --nv \
     # NCCL configs
     export VLLM_WORKER_MULTIPROC_METHOD=spawn
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+
+    # CUDA configs
+    # export PATH=/online1/public/support/amd/cuda/11.8/bin:$PATH
+    # export LD_LIBRARY_PATH=/online1/public/support/amd/cuda/11.8/lib64:$LD_LIBRARY_PATH
 
     num_gpus=\$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
     echo \"Detected \${num_gpus} GPUs\"

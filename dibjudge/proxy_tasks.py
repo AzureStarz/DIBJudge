@@ -51,17 +51,58 @@ def compute_proxy_losses(
     else:
         response_mask = None
 
-    low_recon_pred = outputs.get("low_recon_pred")
-    low_recon_target = outputs.get("low_recon_target")
-    if low_recon_pred is None or low_recon_target is None:
+    low_recon_mean_pred = outputs.get("low_recon_mean_pred")
+    low_recon_logvar_pred = outputs.get("low_recon_logvar_pred")
+    low_recon_mean_target = outputs.get("low_recon_mean_target")
+    low_recon_logvar_target = outputs.get("low_recon_logvar_target")
+    low_recon_mag_logits = outputs.get("low_recon_mag_logits")
+    low_recon_mag_target = outputs.get("low_recon_mag_target")
+    if (
+        low_recon_mean_pred is None
+        or low_recon_logvar_pred is None
+        or low_recon_mean_target is None
+        or low_recon_logvar_target is None
+    ):
+        losses["low_recon_mean_loss"] = outputs["lm_loss"].new_tensor(0.0)
+        losses["low_recon_logvar_loss"] = outputs["lm_loss"].new_tensor(0.0)
         losses["low_recon_loss"] = outputs["lm_loss"].new_tensor(0.0)
     else:
-        diff = (low_recon_pred.float() - low_recon_target.float()).pow(2).mean(dim=-1)
-        if response_mask is not None and diff.size(0) == response_mask.numel():
-            mask = response_mask.to(diff.device)
-            losses["low_recon_loss"] = diff[mask].mean() if mask.any() else outputs["lm_loss"].new_tensor(0.0)
+        mean_diff = (
+            (low_recon_mean_pred.float() - low_recon_mean_target.float())
+            .pow(2)
+            .mean(dim=-1)
+        )
+        logvar_diff = F.smooth_l1_loss(
+            low_recon_logvar_pred.float(),
+            low_recon_logvar_target.float(),
+            reduction="none",
+        ).mean(dim=-1)
+        if response_mask is not None and mean_diff.size(0) == response_mask.numel():
+            mask = response_mask.to(mean_diff.device)
+            if mask.any():
+                losses["low_recon_mean_loss"] = mean_diff[mask].mean()
+                losses["low_recon_logvar_loss"] = logvar_diff[mask].mean()
+            else:
+                losses["low_recon_mean_loss"] = outputs["lm_loss"].new_tensor(0.0)
+                losses["low_recon_logvar_loss"] = outputs["lm_loss"].new_tensor(0.0)
         else:
-            losses["low_recon_loss"] = diff.mean()
+            losses["low_recon_mean_loss"] = mean_diff.mean()
+            losses["low_recon_logvar_loss"] = logvar_diff.mean()
+        losses["low_recon_loss"] = (
+            losses["low_recon_mean_loss"] + losses["low_recon_logvar_loss"]
+        )
+    if low_recon_mag_logits is None or low_recon_mag_target is None:
+        losses["low_recon_mag_loss"] = outputs["lm_loss"].new_tensor(0.0)
+    else:
+        targets = low_recon_mag_target.to(low_recon_mag_logits.device)
+        if response_mask is not None and targets.size(0) == response_mask.numel():
+            mask = response_mask.to(targets.device).bool()
+        else:
+            mask = targets.sum(dim=-1).gt(0)
+        loss, _ = _wasserstein_1d(
+            low_recon_mag_logits, targets, mask, outputs["lm_loss"].new_tensor(0.0)
+        )
+        losses["low_recon_mag_loss"] = loss
 
     length_logits = outputs.get("length_bin_logits")
     length_labels = batch.get("proxy_length_label")

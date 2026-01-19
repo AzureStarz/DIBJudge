@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
+import gc
 import math
 import warnings
 import os
 import json
 import time
-from dataclasses import asdict
+import logging
+from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -31,6 +32,50 @@ def _get_env_int(name: str, default: int) -> int:
         return default
 
 
+_LOGGER: Optional[logging.Logger] = None
+
+
+def _setup_logger(rank: int, log_dir: Optional[str] = None) -> logging.Logger:
+    global _LOGGER
+    logger = _LOGGER or logging.getLogger("dibjudge.train")
+    if _LOGGER is None:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                fmt="%(asctime)s | %(levelname)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        _LOGGER = logger
+    if log_dir and rank == 0:
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "train.log")
+        has_file_handler = any(
+            isinstance(h, logging.FileHandler)
+            and getattr(h, "baseFilename", None) == os.path.abspath(log_path)
+            for h in logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            formatter = logging.Formatter(
+                fmt="%(asctime)s | %(levelname)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+    return logger
+
+
+def _log_message(rank: int, message: str, level: int = logging.INFO) -> None:
+    logger = _setup_logger(rank)
+    if rank != 0:
+        message = f"[rank {rank}] {message}"
+    logger.log(level, message)
+
+
 def init_distributed() -> Tuple[int, int, int]:
     rank = _get_env_int("RANK", _get_env_int("SLURM_PROCID", 0))
     world_size = _get_env_int("WORLD_SIZE", _get_env_int("SLURM_NTASKS", 1))
@@ -40,7 +85,25 @@ def init_distributed() -> Tuple[int, int, int]:
 
 def _rank0_print(rank: int, *args: object, **kwargs: object) -> None:
     if rank == 0:
-        print(*args, **kwargs)
+        sep = kwargs.get("sep", " ")
+        message = sep.join(str(arg) for arg in args)
+        if (
+            message.startswith("[warn]")
+            or message.startswith("[warning]")
+            or message.startswith("[checkpoint warn]")
+        ):
+            _log_message(rank, message, level=logging.WARNING)
+        elif message.startswith("[error]"):
+            _log_message(rank, message, level=logging.ERROR)
+        else:
+            _log_message(rank, message, level=logging.INFO)
+
+
+def _ema_update(prev: Optional[float], value: float, decay: float) -> float:
+    """EMA used for smoother logging, not for training logic."""
+    if prev is None or not math.isfinite(prev):
+        return value
+    return decay * prev + (1.0 - decay) * value
 
 
 def _warmup_steps_from_ratio(
@@ -55,18 +118,196 @@ def _warmup_steps_from_ratio(
 
 def _piecewise_linear(progress: float, points: List[Tuple[float, float]]) -> float:
     if not points:
-        return 0.0
-    progress = max(0.0, min(1.0, float(progress)))
-    points = sorted(points, key=lambda x: x[0])
+        raise ValueError("Schedule points must be non-empty.")
+    progress = max(0.0, min(float(progress), 1.0))
+    points = sorted(points, key=lambda item: item[0])
     if progress <= points[0][0]:
-        return float(points[0][1])
+        return points[0][1]
     for (p0, v0), (p1, v1) in zip(points, points[1:]):
         if progress <= p1:
-            if p1 <= p0 + 1e-8:
-                return float(v1)
+            if p1 <= p0:
+                return v1
             t = (progress - p0) / (p1 - p0)
-            return float(v0 + t * (v1 - v0))
-    return float(points[-1][1])
+            return v0 + (v1 - v0) * t
+    return points[-1][1]
+
+
+def _build_dib_schedule(
+    args: argparse.Namespace, dataset_size: int
+) -> Dict[str, List[Tuple[float, float]]]:
+    small = int(dataset_size) <= 200_000
+
+    def _cap_positive(value: float, cap: float, *, auto: bool) -> float:
+        value = float(value)
+        if value < 0.0:
+            return 0.0
+        if value == 0.0:
+            return cap if auto else 0.0
+        return min(value, cap)
+
+    def _clamp01(value: float) -> float:
+        return min(max(float(value), 0.0), 1.0)
+
+    base_keep = min(max(float(args.compact_keep_init), 0.0), 1.0)
+    keep_min_arg = float(getattr(args, "compact_keep_min", -1.0))
+    if keep_min_arg > 0.0:
+        keep_min = _clamp01(keep_min_arg)
+    else:
+        keep_min_floor = 0.65 if small else 0.60
+        keep_min = max(keep_min_floor, base_keep - (0.25 if small else 0.30))
+        keep_min = _clamp01(keep_min)
+
+    stage1_end = 0.20
+    stage2_end = 0.45
+    stage3_end = 0.75
+
+    keep_stage3 = _clamp01(max(keep_min, 0.40))
+    keep_stage2 = _clamp01(max(0.70, keep_stage3))
+    keep_stage1 = _clamp01(max(1.0, keep_stage2))
+
+    kl_cap = 0.8 if small else 1.5
+    kl_peak = _cap_positive(
+        float(args.kl_weight),
+        kl_cap,
+        auto=False,
+    )
+    disentangle_peak = max(0.0, float(args.disentangle_weight))
+    z_peak = _cap_positive(
+        float(args.z_dropout),
+        0.15 if small else 0.25,
+        auto=True,
+    )
+    lambda_bias_peak = _cap_positive(
+        float(args.lambda_bias),
+        0.5 if small else 1.0,
+        auto=False,
+    )
+    lambda_compression_peak = _cap_positive(
+        float(getattr(args, "lambda_compression", 1.0)),
+        0.5 if small else 1.0,
+        auto=False,
+    )
+    vq_warmup = min(max(float(getattr(args, "vq_warmup_ratio", 0.1)), 0.0), 1.0)
+    vq_ramp_end = stage2_end + (stage3_end - stage2_end) * vq_warmup
+    vq_ramp_end = min(1.0, max(stage2_end + 0.05, vq_ramp_end))
+
+    keep_points = [
+        (0.0, keep_stage1),
+        (stage1_end, keep_stage1),
+        (stage2_end, keep_stage2),
+        (stage3_end, keep_stage3),
+        (1.0, keep_stage3),
+    ]
+
+    return {
+        "keep_ratio": keep_points,
+        "kl_weight": [
+            (0.0, 0.0),
+            (stage1_end, 0.0),
+            (stage2_end, 0.20 * kl_peak),
+            (stage3_end, 1.00 * kl_peak),
+            (1.0, 0.70 * kl_peak),
+        ],
+        "disentangle_weight": [
+            (0.0, 0.0),
+            (stage1_end, 0.0),
+            (stage2_end, 0.20 * disentangle_peak),
+            (stage3_end, 1.00 * disentangle_peak),
+            (1.0, 1.00 * disentangle_peak),
+        ],
+        "z_dropout": [
+            (0.0, 0.0),
+            (stage1_end, 0.0),
+            (stage2_end, 0.40 * z_peak),
+            (stage3_end, 1.00 * z_peak),
+            (1.0, 0.20 * z_peak),
+        ],
+        "vq_commit_scale": (
+            [(0.0, 1.0), (1.0, 1.0)]
+            if vq_warmup <= 0.0
+            else [
+                (0.0, 0.0),
+                (stage1_end, 0.0),
+                (stage2_end, 0.40),
+                (vq_ramp_end, 1.00),
+                (1.0, 1.00),
+            ]
+        ),
+        "lambda_compression": [
+            (0.0, 0.00 * lambda_compression_peak),
+            (stage1_end, 0.00 * lambda_compression_peak),
+            (stage2_end, 0.35 * lambda_compression_peak),
+            (stage3_end, 1.00 * lambda_compression_peak),
+            (1.0, 1.00 * lambda_compression_peak),
+        ],
+        "lambda_bias": [
+            (0.0, 0.05 * lambda_bias_peak),
+            (stage1_end, 0.05 * lambda_bias_peak),
+            (stage2_end, 0.50 * lambda_bias_peak),
+            (stage3_end, 1.00 * lambda_bias_peak),
+            (1.0, 0.90 * lambda_bias_peak),
+        ],
+        "vq_usage_weight": [
+            (0.0, 0.0),
+            (stage1_end, 0.0),
+            (stage2_end, 0.50 * float(args.vq_usage_weight)),
+            (stage3_end, 1.00 * float(args.vq_usage_weight)),
+            (1.0, 1.00 * float(args.vq_usage_weight)),
+        ],
+        "vq_align_weight": [
+            (0.0, 0.0),
+            (stage1_end, 0.0),
+            (stage2_end, 0.20 * float(args.vq_align_weight)),
+            (stage3_end, 0.60 * float(args.vq_align_weight)),
+            (1.0, 0.50 * float(args.vq_align_weight)),
+        ],
+    }
+
+
+def _eval_dib_schedule(
+    schedule: Dict[str, List[Tuple[float, float]]], progress: float
+) -> Dict[str, float]:
+    values = {}
+    for name, points in schedule.items():
+        values[name] = _piecewise_linear(progress, points)
+    return values
+
+
+def _log_dib_schedule(
+    rank: int,
+    schedule: Dict[str, List[Tuple[float, float]]],
+    total_steps: int,
+    dataset_size: int,
+) -> None:
+    if rank != 0:
+        return
+    points_set = set()
+    for points in schedule.values():
+        points_set.update(p for p, _ in points)
+    points = sorted(points_set)
+    max_step = max(0, int(total_steps) - 1)
+    keep_points = schedule.get("keep_ratio", [])
+    keep_min = min((val for _, val in keep_points), default=0.0)
+    lines = [
+        f"[schedule] curriculum (dataset={dataset_size} total_steps={total_steps} keep_min={keep_min:.2f})",
+        "progress  step  keep_ratio  kl_weight  z_dropout  vq_commit  lambda_comp  lambda_bias  disentangle  vq_usage  vq_align",
+    ]
+    for p in points:
+        vals = _eval_dib_schedule(schedule, p)
+        step = int(round(float(p) * max_step))
+        lines.append(
+            f"{p:>7.2f} {step:>6d} "
+            f"{vals['keep_ratio']:>10.3f} "
+            f"{vals['kl_weight']:>9.3f} "
+            f"{vals['z_dropout']:>9.3f} "
+            f"{vals['vq_commit_scale']:>9.3f} "
+            f"{vals['lambda_compression']:>11.3f} "
+            f"{vals['lambda_bias']:>11.3f} "
+            f"{vals['disentangle_weight']:>11.3f} "
+            f"{vals['vq_usage_weight']:>8.3f} "
+            f"{vals['vq_align_weight']:>8.3f}"
+        )
+    _rank0_print(rank, "\n".join(lines))
 
 
 def _compute_bias_terms(
@@ -235,6 +476,7 @@ def _param_grad_norm(params: List[torch.nn.Parameter], device: torch.device) -> 
     return float(total.sqrt().item())
 
 
+
 def _collect_vq_task_samples(
     model: DIBJudgeModel,
     dataset: DIBJudgeDataset,
@@ -244,9 +486,6 @@ def _collect_vq_task_samples(
     device: torch.device,
     seed: int,
     rank: int,
-    torch_dtype: Optional[torch.dtype] = None,
-    enable_autocast: bool = True,
-    world_size: int = 1,
 ) -> Optional[torch.Tensor]:
     if max_samples <= 0 or len(dataset) == 0:
         return None
@@ -254,33 +493,11 @@ def _collect_vq_task_samples(
     generator = torch.Generator()
     generator.manual_seed(int(seed))
     indices = torch.randperm(len(dataset), generator=generator).tolist()
-    if world_size > 1:
-        indices = indices[int(rank) :: int(world_size)]
     samples: List[torch.Tensor] = []
     total = 0
     batch_examples = []
     model_was_training = model.training
     model.eval()
-    amp_dtype = torch_dtype
-    if amp_dtype is None:
-        for param in model.shared_encoder.parameters():
-            amp_dtype = param.dtype
-            break
-    if enable_autocast and device.type == "cuda":
-        if amp_dtype not in (torch.float16, torch.bfloat16):
-            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    attn_impl = getattr(model.config, "attn_implementation", None)
-    if attn_impl == "flash_attention_2" and device.type == "cuda":
-        if amp_dtype not in (torch.float16, torch.bfloat16):
-            amp_dtype = (
-                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            )
-        model.shared_encoder = model.shared_encoder.to(device=device, dtype=amp_dtype)
-    use_autocast = bool(
-        enable_autocast
-        and device.type == "cuda"
-        and amp_dtype in (torch.float16, torch.bfloat16)
-    )
 
     def _random_subset(vectors: torch.Tensor, count: int) -> torch.Tensor:
         if count <= 0 or vectors.numel() == 0:
@@ -309,12 +526,7 @@ def _collect_vq_task_samples(
         return _random_subset(flat, count)
 
     try:
-        amp_ctx = (
-            torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
-            if use_autocast
-            else contextlib.nullcontext()
-        )
-        with torch.inference_mode(), amp_ctx:
+        with torch.no_grad():
             for idx in indices:
                 batch_examples.append(dataset[idx])
                 if len(batch_examples) < batch_size:
@@ -323,16 +535,16 @@ def _collect_vq_task_samples(
                 batch_examples = []
                 orig_ids = batch["original_input_ids"].to(device)
                 orig_mask = batch["original_attention_mask"].to(device)
-                orig_ids, orig_mask, _ = model._flatten_pair_inputs(orig_ids, orig_mask)
-                outputs = model.shared_encoder(
-                    input_ids=orig_ids,
-                    attention_mask=orig_mask,
-                    output_hidden_states=False,
-                    use_cache=False,
+                hidden, orig_mask, _orig_shape, _ = model._encode_bias_bundle(
+                    orig_ids,
+                    orig_mask,
+                    need_low_hidden=False,
+                    response_mask=None,
                 )
-                hidden = model._get_hidden(outputs)
-                pooled = model._pool_hidden(hidden, orig_mask)
-                task_tokens = model.task_mlp(pooled)
+                resampler_dtype = next(model.task_resampler.parameters()).dtype
+                if hidden.dtype != resampler_dtype:
+                    hidden = hidden.to(dtype=resampler_dtype)
+                task_tokens = model.task_resampler(hidden, orig_mask)
                 needed = max_samples - total
                 if needed <= 0:
                     break
@@ -345,16 +557,16 @@ def _collect_vq_task_samples(
                 batch = collator(batch_examples)
                 orig_ids = batch["original_input_ids"].to(device)
                 orig_mask = batch["original_attention_mask"].to(device)
-                orig_ids, orig_mask, _ = model._flatten_pair_inputs(orig_ids, orig_mask)
-                outputs = model.shared_encoder(
-                    input_ids=orig_ids,
-                    attention_mask=orig_mask,
-                    output_hidden_states=False,
-                    use_cache=False,
+                hidden, orig_mask, _orig_shape, _ = model._encode_bias_bundle(
+                    orig_ids,
+                    orig_mask,
+                    need_low_hidden=False,
+                    response_mask=None,
                 )
-                hidden = model._get_hidden(outputs)
-                pooled = model._pool_hidden(hidden, orig_mask)
-                task_tokens = model.task_mlp(pooled)
+                resampler_dtype = next(model.task_resampler.parameters()).dtype
+                if hidden.dtype != resampler_dtype:
+                    hidden = hidden.to(dtype=resampler_dtype)
+                task_tokens = model.task_resampler(hidden, orig_mask)
                 needed = max_samples - total
                 if needed > 0:
                     flat = _sample_task_tokens(task_tokens, needed)
@@ -407,6 +619,95 @@ def _grad_norm_from_loss(
             continue
         total = total + grad.detach().float().pow(2).sum()
     return total.sqrt()
+
+
+@dataclass
+class ProxyBinWeightState:
+    ema: Dict[str, Optional[float]]
+
+
+def _init_proxy_bin_weight_state() -> ProxyBinWeightState:
+    return ProxyBinWeightState(ema={"nll": None, "ttr": None, "length": None})
+
+
+def _update_proxy_bin_ema(
+    state: ProxyBinWeightState,
+    losses: Dict[str, torch.Tensor],
+    counts: Dict[str, int],
+    decay: float,
+) -> None:
+    decay = min(max(float(decay), 0.0), 1.0)
+    for name, loss in losses.items():
+        if counts.get(name, 0) <= 0:
+            continue
+        if not torch.is_tensor(loss):
+            continue
+        val = float(loss.detach().item())
+        if not math.isfinite(val):
+            continue
+        prev = state.ema.get(name)
+        if prev is None:
+            state.ema[name] = val
+        else:
+            state.ema[name] = decay * prev + (1.0 - decay) * val
+
+
+def _compute_proxy_bin_weights(
+    base_weights: Dict[str, float],
+    state: ProxyBinWeightState,
+    counts: Dict[str, int],
+    args: argparse.Namespace,
+    step: int,
+) -> Tuple[Dict[str, float], float]:
+    weights: Dict[str, float] = {}
+    min_w = float(getattr(args, "proxy_bin_min_weight", 0.0))
+    max_w = float(getattr(args, "proxy_bin_max_weight", 0.0))
+    eps = float(getattr(args, "proxy_bin_weight_eps", 1e-6))
+    warmup = int(getattr(args, "proxy_bin_warmup_steps", 0))
+    strategy = str(getattr(args, "proxy_bin_weighting", "static")).lower()
+    for name, base in base_weights.items():
+        base = max(0.0, float(base))
+        if base <= 0.0 or counts.get(name, 0) <= 0:
+            weights[name] = 0.0
+            continue
+        weight = base
+        if strategy == "ema_inverse" and step >= warmup:
+            ema_val = state.ema.get(name)
+            if ema_val is not None and ema_val > 0.0:
+                weight = base / max(ema_val, eps)
+        if max_w > 0.0:
+            weight = min(weight, max_w)
+        if min_w > 0.0:
+            weight = max(weight, min_w)
+        weights[name] = weight
+    return weights, sum(weights.values())
+
+
+def _proxy_bin_histogram(
+    targets: Optional[torch.Tensor],
+    labels: Optional[torch.Tensor],
+    eps: float = 1e-8,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if not torch.is_tensor(targets) or not torch.is_tensor(labels):
+        return None
+    if targets.numel() == 0:
+        return None
+    if targets.dim() < 2:
+        return None
+    flat_targets = targets.view(-1, targets.size(-1)).float()
+    flat_labels = labels.view(-1)
+    mask = flat_labels.ne(-100)
+    bins = flat_targets.size(-1)
+    if not mask.any():
+        hist = flat_targets.new_zeros((bins,))
+        probs = hist.clone()
+        entropy = flat_targets.new_zeros(())
+        return hist, probs, entropy
+    hist = flat_targets[mask].sum(dim=0)
+    total = hist.sum().clamp_min(eps)
+    probs = hist / total
+    entropy = -(probs * (probs + eps).log()).sum()
+    return hist, probs, entropy
 
 
 def _load_yaml_config(path: str, parser: argparse.ArgumentParser) -> dict:
@@ -611,7 +912,7 @@ def _save_deepspeed_checkpoint(
         return
     os.makedirs(output_dir, exist_ok=True)
     if rank == 0:
-        print(f"[checkpoint] saving to {output_dir} tag={tag}", flush=True)
+        _rank0_print(rank, f"[checkpoint] saving to {output_dir} tag={tag}")
     # DeepSpeed requires all ranks to participate in checkpointing.
     try:
         if torch.cuda.is_available():
@@ -1021,6 +1322,10 @@ def _save_hf_from_zero(
         z_latent_dim=args.z_latent_dim,
         z_prompt_len=args.z_prompt_len,
         bias_prompt_len=args.bias_prompt_len,
+        task_resampler_layers=args.task_resampler_layers,
+        task_resampler_heads=args.task_resampler_heads,
+        task_resampler_mlp_ratio=args.task_resampler_mlp_ratio,
+        task_resampler_dropout=args.task_resampler_dropout,
         task_codebook_size=args.task_codebook_size,
         vq_num_codebooks=args.vq_num_codebooks,
         vq_commitment_gamma=args.vq_commitment_gamma,
@@ -1033,14 +1338,18 @@ def _save_hf_from_zero(
         vq_align_samples=args.vq_align_samples,
         z_prompt_prefix_len=args.z_prompt_prefix_len,
         z_prompt_postfix_len=args.z_prompt_postfix_len,
-        prompt_mlp_hidden=args.prompt_mlp_hidden,
-        prompt_mlp_layers=args.prompt_mlp_layers,
-        prompt_mlp_dropout=args.prompt_mlp_dropout,
+        bias_mlp_hidden=args.bias_mlp_hidden,
+        bias_mlp_layers=args.bias_mlp_layers,
+        bias_mlp_dropout=args.bias_mlp_dropout,
         bottleneck_noise_alpha=args.bottleneck_noise_alpha,
         bias_proxy_hidden=args.bias_proxy_hidden,
         bias_proxy_layers=args.bias_proxy_layers,
         bias_proxy_dropout=args.bias_proxy_dropout,
         low_recon_layer=args.low_recon_layer,
+        low_recon_mag_bins=tuple(
+            _parse_bins(getattr(args, "low_recon_mag_bins", None), float)
+            or DIBJudgeConfig.low_recon_mag_bins
+        ),
         compact_prior=args.compact_keep_init,
         compact_mu_token_id=args.compact_mu_token_id,
         compact_head_hidden=args.compact_head_hidden,
@@ -1049,6 +1358,13 @@ def _save_hf_from_zero(
         compact_pi_init=args.compact_pi_init,
         lm_loss_chunk_size=args.lm_loss_chunk_size,
         compact_kl_chunk_size=args.compact_kl_chunk_size,
+        disentangle_cos_weight=args.disentangle_cos_weight,
+        disentangle_cov_weight=args.disentangle_cov_weight,
+        disentangle_cov_min_batch=args.disentangle_cov_min_batch,
+        disentangle_cov_eps=args.disentangle_cov_eps,
+        disentangle_cov_gather=args.disentangle_cov_gather,
+        disentangle_cov_full_grad=args.disentangle_cov_full_grad,
+        disentangle_cov_queue_size=args.disentangle_cov_queue_size,
         proxy_length_classes=getattr(args, "proxy_length_classes", DIBJudgeConfig.proxy_length_classes),
     )
     config_path = os.path.join(dibjudge_dir, "config.json")
@@ -1228,11 +1544,15 @@ def _build_optimizer_params(
         "head": [],
     }
     head_prefixes = (
-        "task_mlp.",
-        "bias_mlp.",
+        "task_resampler.",
         "vq_task.",
-        "task_vq_to_lm.",
+        "task_latent_to_lm.",
+        "task_latent_to_encoder.",
+        "bias_mlp.",
         "low_recon_head.",
+        "low_recon_mean_head.",
+        "low_recon_logvar_head.",
+        "low_recon_mag_head.",
         "length_bin_head.",
         "nll_bin_head.",
         "ttr_bin_head.",
@@ -1377,9 +1697,13 @@ def main() -> None:
     parser.add_argument("--z-latent-dim", type=int, default=256)
     parser.add_argument("--z-prompt-len", type=int, default=16)
     parser.add_argument("--bias-prompt-len", type=int, default=8)
-    parser.add_argument("--prompt-mlp-hidden", type=int, default=0)
-    parser.add_argument("--prompt-mlp-layers", type=int, default=1)
-    parser.add_argument("--prompt-mlp-dropout", type=float, default=0.1)
+    parser.add_argument("--bias-mlp-hidden", type=int, default=0)
+    parser.add_argument("--bias-mlp-layers", type=int, default=1)
+    parser.add_argument("--bias-mlp-dropout", type=float, default=0.1)
+    parser.add_argument("--task-resampler-layers", type=int, default=2)
+    parser.add_argument("--task-resampler-heads", type=int, default=8)
+    parser.add_argument("--task-resampler-mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--task-resampler-dropout", type=float, default=0.1)
     parser.add_argument("--task-codebook-size", type=int, default=1024)
     parser.add_argument("--vq-num-codebooks", type=int, default=4)
     parser.add_argument("--vq-commitment-gamma", type=float, default=0.05)
@@ -1429,12 +1753,6 @@ def main() -> None:
         help="Batch size for VQ init forward passes (0 = per_device_train_batch_size).",
     )
     parser.add_argument(
-        "--vq-init-autocast",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable autocast during VQ codebook initialization.",
-    )
-    parser.add_argument(
         "--vq-init-spherical",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1446,7 +1764,13 @@ def main() -> None:
         default=0,
         help="Random seed for VQ codebook init sampling.",
     )
-    parser.add_argument("--bottleneck-noise-alpha", type=float, default=8.0)
+    parser.add_argument(
+        "--vq-warmup-ratio",
+        type=float,
+        default=0.1,
+        help="Linear warmup ratio for VQ commitment/usage losses (0-1).",
+    )
+    parser.add_argument("--bottleneck-noise-alpha", type=float, default=0.05)
     parser.add_argument("--bottleneck-noise-warmup-ratio", type=float, default=0.2)
     parser.add_argument("--z-prompt-prefix-len", type=int, default=1)
     parser.add_argument("--z-prompt-postfix-len", type=int, default=1)
@@ -1524,12 +1848,6 @@ def main() -> None:
         help="Weight for (mask_loss + consistency_loss) group loss.",
     )
     parser.add_argument(
-        "--loss-schedule",
-        choices=["static", "dynamic"],
-        default="dynamic",
-        help="Use dynamic scheduling for auxiliary losses (dynamic) or keep static weights.",
-    )
-    parser.add_argument(
         "--disable-compactor",
         action="store_true",
         help="Disable compact masking and compact losses (KL/mask/consistency).",
@@ -1539,12 +1857,17 @@ def main() -> None:
         action="store_true",
         help="Disable insertion of task prompt tokens into the LM input.",
     )
-    parser.add_argument("--compact-keep-init", type=float, default=0.9)
     parser.add_argument(
-        "--compact-keep-final",
+        "--compact-keep-init",
         type=float,
-        default=0.7,
-        help="Final keep ratio target for dynamic scheduling.",
+        default=0.9,
+        help="Fixed keep ratio for compact masking.",
+    )
+    parser.add_argument(
+        "--compact-keep-min",
+        type=float,
+        default=-1.0,
+        help="Optional schedule minimum keep ratio (<= 0 disables).",
     )
     parser.add_argument(
         "--compact-pi-init",
@@ -1552,7 +1875,7 @@ def main() -> None:
         default=0.95,
         help="Initialize compact head bias so sigmoid(pi) ~= this value.",
     )
-    parser.add_argument("--kl-weight-max", type=float, default=1.0)
+    parser.add_argument("--kl-weight", type=float, default=1.0)
     parser.add_argument(
         "--compact-kl-chunk-size",
         type=int,
@@ -1568,6 +1891,14 @@ def main() -> None:
     )
     parser.add_argument("--lambda-bias", type=float, default=1.0)
     parser.add_argument("--low-recon-weight", type=float, default=0.5)
+    parser.add_argument("--low-recon-mean-weight", type=float, default=1.0)
+    parser.add_argument("--low-recon-logvar-weight", type=float, default=0.25)
+    parser.add_argument("--low-recon-mag-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--low-recon-mag-bins",
+        default="0,0.5,1.0,1.5,2.0,3.0",
+        help="Comma-separated bins for low-recon token-magnitude histogram.",
+    )
     parser.add_argument("--nll-bin-weight", type=float, default=0.5)
     parser.add_argument(
         "--ppl-bin-weight",
@@ -1580,7 +1911,74 @@ def main() -> None:
     parser.add_argument("--length-bin-weight", type=float, default=0.5)
     parser.add_argument("--vq-task-weight", type=float, default=1.0)
     parser.add_argument("--vq-align-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--proxy-bin-weighting",
+        default="static",
+        choices=["static", "ema_inverse"],
+        help="Weighting strategy for NLL/TTR/length bin losses.",
+    )
+    parser.add_argument(
+        "--proxy-bin-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Normalize proxy bin weights to form a weighted average.",
+    )
+    parser.add_argument(
+        "--proxy-bin-ema",
+        type=float,
+        default=0.95,
+        help="EMA decay for proxy bin loss scale tracking.",
+    )
+    parser.add_argument(
+        "--proxy-bin-weight-eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon for inverse-EMA proxy bin weighting.",
+    )
+    parser.add_argument(
+        "--proxy-bin-min-weight",
+        type=float,
+        default=0.0,
+        help="Minimum per-loss proxy bin weight (0 to disable).",
+    )
+    parser.add_argument(
+        "--proxy-bin-max-weight",
+        type=float,
+        default=0.0,
+        help="Maximum per-loss proxy bin weight (0 to disable).",
+    )
+    parser.add_argument(
+        "--proxy-bin-warmup-steps",
+        type=int,
+        default=0,
+        help="Warmup steps before dynamic proxy bin weighting.",
+    )
     parser.add_argument("--disentangle-weight", type=float, default=1.0)
+    parser.add_argument("--disentangle-cos-weight", type=float, default=1.0)
+    parser.add_argument("--disentangle-cov-weight", type=float, default=0.0)
+    parser.add_argument("--disentangle-cov-min-batch", type=int, default=4)
+    parser.add_argument("--disentangle-cov-eps", type=float, default=1e-6)
+    parser.add_argument("--disentangle-cov-queue-size", type=int, default=0)
+    parser.add_argument(
+        "--disentangle-cov-gather",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="All-gather z_task/z_bias across ranks for cross-covariance loss.",
+    )
+    parser.add_argument(
+        "--disentangle-cov-full-grad",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use differentiable all-gather for cross-rank gradients (slower).",
+    )
+    parser.add_argument(
+        "--benchmark-disentangle-overhead",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Measure cross-covariance gather overhead (runs once before training).",
+    )
+    parser.add_argument("--benchmark-disentangle-iters", type=int, default=50)
+    parser.add_argument("--benchmark-disentangle-warmup", type=int, default=10)
     parser.add_argument(
         "--proxy-nll-bins",
         dest="proxy_nll_bins",
@@ -1787,6 +2185,7 @@ def main() -> None:
     import deepspeed
 
     rank, world_size, local_rank = init_distributed()
+    _setup_logger(rank)
     deepspeed.init_distributed()
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -1813,6 +2212,7 @@ def main() -> None:
         os.makedirs(args.log_dir, exist_ok=True)
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
+    _setup_logger(rank, log_dir=args.log_dir)
 
     enc_tok_kwargs = {"use_fast": False, "legacy": True}
     lm_tok_kwargs = {"use_fast": True}
@@ -1849,6 +2249,10 @@ def main() -> None:
     ttr_bins = _parse_bins(args.proxy_ttr_bins, float)
     if len(ttr_bins) < 2:
         ttr_bins = list(ProxyTaskConfig().ttr_bins)
+    mag_bins = _parse_bins(args.low_recon_mag_bins, float)
+    if len(mag_bins) < 2:
+        mag_bins = list(DIBJudgeConfig.low_recon_mag_bins)
+    args.low_recon_mag_bins = mag_bins
 
     dataset = DIBJudgeDataset.from_jsonl(
         args.data_path,
@@ -1902,6 +2306,11 @@ def main() -> None:
     samples_per_rank = math.ceil(len(dataset) / max(1, world_size))
     steps_per_epoch = math.ceil(samples_per_rank / max(1, args.per_device_train_batch_size))
     total_steps = max(1, steps_per_epoch * max(1, args.epochs))
+    schedule = _build_dib_schedule(args, len(dataset))
+    if rank == 0:
+        schedule_note = "small" if len(dataset) <= 200_000 else "large"
+        _rank0_print(rank, f"[stage done] schedule preset={schedule_note}")
+    _log_dib_schedule(rank, schedule, total_steps, len(dataset))
     proxy_labels_enabled = bool(args.proxy_cache_path)
     collator = DIBJudgeCollator(
         lm_tok,
@@ -1967,6 +2376,7 @@ def main() -> None:
                         f"[lm sample] labels='{label_decoded}'",
                     )
 
+    compact_prior = args.compact_keep_init
     model = DIBJudgeModel.init_from_backbones(
         judge_encoder_name=args.judge_encoder,
         judge_lm_name=args.lm,
@@ -1978,6 +2388,10 @@ def main() -> None:
         z_latent_dim=args.z_latent_dim,
         z_prompt_len=args.z_prompt_len,
         bias_prompt_len=args.bias_prompt_len,
+        task_resampler_layers=args.task_resampler_layers,
+        task_resampler_heads=args.task_resampler_heads,
+        task_resampler_mlp_ratio=args.task_resampler_mlp_ratio,
+        task_resampler_dropout=args.task_resampler_dropout,
         task_codebook_size=args.task_codebook_size,
         vq_num_codebooks=args.vq_num_codebooks,
         vq_commitment_gamma=args.vq_commitment_gamma,
@@ -1988,16 +2402,16 @@ def main() -> None:
         vq_dead_code_threshold=args.vq_dead_code_threshold,
         vq_reset_dead_codes=args.vq_reset_dead_codes,
         vq_align_samples=args.vq_align_samples,
-        prompt_mlp_hidden=args.prompt_mlp_hidden,
-        prompt_mlp_layers=args.prompt_mlp_layers,
-        prompt_mlp_dropout=args.prompt_mlp_dropout,
+        bias_mlp_hidden=args.bias_mlp_hidden,
+        bias_mlp_layers=args.bias_mlp_layers,
+        bias_mlp_dropout=args.bias_mlp_dropout,
         z_prompt_prefix_len=args.z_prompt_prefix_len,
         z_prompt_postfix_len=args.z_prompt_postfix_len,
         low_recon_layer=args.low_recon_layer,
         bias_proxy_hidden=args.bias_proxy_hidden,
         bias_proxy_layers=args.bias_proxy_layers,
         bias_proxy_dropout=args.bias_proxy_dropout,
-        compact_prior=args.compact_keep_init,
+        compact_prior=compact_prior,
         compact_mu_token_id=args.compact_mu_token_id,
         compact_head_hidden=args.compact_head_hidden,
         compact_head_layers=args.compact_head_layers,
@@ -2005,106 +2419,57 @@ def main() -> None:
         compact_pi_init=args.compact_pi_init,
         lm_loss_chunk_size=args.lm_loss_chunk_size,
         compact_kl_chunk_size=args.compact_kl_chunk_size,
+        low_recon_mag_bins=tuple(mag_bins),
+        disentangle_cos_weight=args.disentangle_cos_weight,
+        disentangle_cov_weight=args.disentangle_cov_weight,
+        disentangle_cov_min_batch=args.disentangle_cov_min_batch,
+        disentangle_cov_eps=args.disentangle_cov_eps,
+        disentangle_cov_gather=args.disentangle_cov_gather,
+        disentangle_cov_full_grad=args.disentangle_cov_full_grad,
+        disentangle_cov_queue_size=args.disentangle_cov_queue_size,
         proxy_nll_classes=max(2, len(nll_bins) - 1),
         proxy_ttr_classes=max(2, len(ttr_bins) - 1),
         proxy_length_classes=max(2, len(length_bins) - 1),
     ).to(device)
+    if args.benchmark_disentangle_overhead:
+        bench_bsz = max(1, int(args.per_device_train_batch_size))
+        bench_dim = getattr(model.shared_encoder.config, "hidden_size", None)
+        if bench_dim is None:
+            bench_dim = getattr(model.shared_encoder.config, "d_model", None)
+        if bench_dim is None:
+            raise ValueError("Unable to resolve shared encoder hidden size.")
+        try:
+            bench_dtype = next(model.shared_encoder.parameters()).dtype
+        except StopIteration:
+            bench_dtype = torch.float32
+        bench_task = torch.randn(bench_bsz, bench_dim, device=device, dtype=bench_dtype)
+        bench_bias = torch.randn(bench_bsz, bench_dim, device=device, dtype=bench_dtype)
+        bench_kwargs = {
+            "iters": int(args.benchmark_disentangle_iters),
+            "warmup": int(args.benchmark_disentangle_warmup),
+        }
+        stats_local = model.benchmark_disentangle_overhead(
+            bench_task, bench_bias, full_grad=False, **bench_kwargs
+        )
+        stats_full = model.benchmark_disentangle_overhead(
+            bench_task, bench_bias, full_grad=True, **bench_kwargs
+        )
+        _rank0_print(
+            rank,
+            "[bench] disentangle cov gather (ms):",
+            {"local_only": stats_local, "full_grad": stats_full},
+        )
     _maybe_resize_embeddings(model.shared_encoder, judge_tok, "shared_encoder", rank)
     _maybe_resize_embeddings(model.judge_lm, lm_tok, "judge_lm", rank)
     skip_encoder_checkpointing = _set_shared_encoder_trainable(
         model, args.encoder_trainable, rank
     )
     if args.disable_z_prompt_insertion:
-        vq_init_samples = 0
-        args.vq_init_samples = 0
-        args.vq_task_weight = 0.0
-        args.vq_align_weight = 0.0
-        args.vq_usage_weight = 0.0
         args.disentangle_weight = 0.0
-        args.vq_align_samples = 0
         _rank0_print(
             rank,
-            "[stage done] disable_z_prompt_insertion=true; skipping VQ init/losses/align",
+            "[stage done] disable_z_prompt_insertion=true; skipping task prompt losses",
         )
-    else:
-        vq_init_samples = _resolve_vq_init_samples(args, len(dataset), rank)
-    args.vq_init_samples = vq_init_samples
-    if vq_init_samples > 0:
-        vq_init_dtype = None
-        if args.vq_init_autocast:
-            vq_init_dtype = torch.bfloat16 if args.bf16 else torch.float16
-        init_batch_size = (
-            int(args.vq_init_batch_size)
-            if int(args.vq_init_batch_size) > 0
-            else int(args.per_device_train_batch_size)
-        )
-        per_rank_target = int(math.ceil(float(vq_init_samples) / float(max(1, world_size))))
-        samples = _collect_vq_task_samples(
-            model=model,
-            dataset=dataset,
-            collator=collator,
-            max_samples=per_rank_target,
-            batch_size=init_batch_size,
-            device=device,
-            seed=int(args.vq_init_seed),
-            rank=rank,
-            torch_dtype=vq_init_dtype,
-            enable_autocast=bool(args.vq_init_autocast),
-            world_size=world_size,
-        )
-        merged_samples = samples
-        if dist.is_initialized() and world_size > 1:
-            local = samples
-            if local is None:
-                local = torch.zeros(
-                    (0, model.vq_task.dim),
-                    device=device,
-                    dtype=model.vq_task.codebook.dtype,
-                )
-            else:
-                local = local.to(device=device, dtype=model.vq_task.codebook.dtype)
-            local_size = torch.tensor([local.size(0)], device=device, dtype=torch.long)
-            size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
-            dist.all_gather(size_list, local_size)
-            max_size = max(int(size.item()) for size in size_list)
-            if local.size(0) < max_size:
-                pad = torch.zeros(
-                    (max_size - local.size(0), local.size(1)),
-                    device=device,
-                    dtype=local.dtype,
-                )
-                local = torch.cat([local, pad], dim=0)
-            gather_list = [torch.zeros_like(local) for _ in range(world_size)]
-            dist.all_gather(gather_list, local)
-            merged_samples = None
-            if rank == 0:
-                chunks = []
-                for tensor, size in zip(gather_list, size_list):
-                    size_int = int(size.item())
-                    if size_int > 0:
-                        chunks.append(tensor[:size_int].cpu())
-                if chunks:
-                    merged = torch.cat(chunks, dim=0)
-                    if merged.size(0) > vq_init_samples:
-                        merged = merged[:vq_init_samples]
-                    merged_samples = merged
-        if rank == 0 and merged_samples is not None:
-            model.vq_task.initialize_codebook(
-                merged_samples.to(device),
-                max_samples=int(vq_init_samples),
-                seed=int(args.vq_init_seed),
-                spherical=bool(args.vq_init_spherical),
-            )
-            _rank0_print(rank, "[stage done] VQ codebook initialized with kmeans++")
-        if dist.is_initialized() and world_size > 1:
-            dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
-            with torch.no_grad():
-                dist.broadcast(model.vq_task.codebook, src=0)
-                dist.broadcast(model.vq_task.ema_w, src=0)
-                dist.broadcast(model.vq_task.ema_cluster_size, src=0)
-            dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
     _rank0_print(rank, "[stage done] model initialized")
     _maybe_apply_lora(model, args)
     if args.use_lora and args.freeze_lm_when_lora:
@@ -2132,6 +2497,37 @@ def main() -> None:
         )
     else:
         model.set_gradient_checkpointing(encoder=False, lm=False, use_reentrant=False)
+
+    vq_init_samples = _resolve_vq_init_samples(args, len(dataset), rank)
+    args.vq_init_samples = vq_init_samples
+    if vq_init_samples > 0:
+        init_batch_size = (
+            int(args.vq_init_batch_size)
+            if int(args.vq_init_batch_size) > 0
+            else int(args.per_device_train_batch_size)
+        )
+        samples = _collect_vq_task_samples(
+            model,
+            dataset=dataset,
+            collator=collator,
+            max_samples=int(vq_init_samples),
+            batch_size=init_batch_size,
+            device=device,
+            seed=int(args.vq_init_seed),
+            rank=rank,
+        )
+        if samples is not None:
+            model.vq_task.initialize_codebook(
+                samples,
+                max_samples=int(vq_init_samples),
+                seed=int(args.vq_init_seed),
+                spherical=bool(args.vq_init_spherical),
+            )
+            _rank0_print(rank, "[stage done] VQ codebook initialized with kmeans++")
+            if dist is not None and dist.is_available() and dist.is_initialized():
+                dist.broadcast(model.vq_task.codebook, src=0)
+                dist.broadcast(model.vq_task.ema_w, src=0)
+                dist.broadcast(model.vq_task.ema_cluster_size, src=0)
 
     optimizer_params = _build_optimizer_params(
         model,
@@ -2230,23 +2626,32 @@ def main() -> None:
         rank,
         "Loss config:",
         {
-            "loss_schedule": args.loss_schedule,
             "disable_compactor": args.disable_compactor,
             "disable_z_prompt_insertion": args.disable_z_prompt_insertion,
-            "lambda_bias": args.lambda_bias,
             "lambda_compression": args.lambda_compression,
+            "lambda_bias": args.lambda_bias,
             "compact_keep_init": args.compact_keep_init,
-            "compact_keep_final": args.compact_keep_final,
-            "kl_weight_max": args.kl_weight_max,
+            "kl_weight": args.kl_weight,
             "z_dropout": args.z_dropout,
             "low_recon_weight": args.low_recon_weight,
+            "low_recon_mean_weight": args.low_recon_mean_weight,
+            "low_recon_logvar_weight": args.low_recon_logvar_weight,
+            "low_recon_mag_weight": args.low_recon_mag_weight,
             "vq_task_weight": args.vq_task_weight,
             "vq_usage_weight": args.vq_usage_weight,
             "vq_align_weight": args.vq_align_weight,
+            "vq_warmup_ratio": args.vq_warmup_ratio,
             "disentangle_weight": args.disentangle_weight,
+            "disentangle_cos_weight": args.disentangle_cos_weight,
+            "disentangle_cov_weight": args.disentangle_cov_weight,
+            "disentangle_cov_min_batch": args.disentangle_cov_min_batch,
+            "disentangle_cov_gather": args.disentangle_cov_gather,
+            "disentangle_cov_full_grad": args.disentangle_cov_full_grad,
+            "disentangle_cov_queue_size": args.disentangle_cov_queue_size,
             "length_bin_weight": args.length_bin_weight,
             "mask_loss_weight": args.mask_loss_weight,
             "consistency_loss_weight": args.consistency_loss_weight,
+            "mask_group_weight": args.mask_group_weight,
         },
     )
     _rank0_print(
@@ -2276,6 +2681,30 @@ def main() -> None:
 
     step = 0
     ema_lm_loss: Optional[float] = None
+    ema_log_loss: Optional[float] = None
+    ema_log_lm_loss: Optional[float] = None
+    log_ema_decay = 0.98
+    ema_component_values: Dict[str, Optional[float]] = {
+        "compact_kl_loss": None,
+        "low_recon_loss": None,
+        "low_recon_mean_loss": None,
+        "low_recon_logvar_loss": None,
+        "low_recon_mag_loss": None,
+        "vq_task_loss": None,
+        "vq_align_loss": None,
+        "vq_usage_loss": None,
+        "disentangle_loss": None,
+        "nll_bin_loss": None,
+        "ttr_bin_loss": None,
+        "length_bin_loss": None,
+        "proxy_bin_loss": None,
+        "nll_bin_mae": None,
+        "ttr_bin_mae": None,
+        "length_bin_mae": None,
+        "compact_mask_loss": None,
+        "compact_consistency_loss": None,
+    }
+    proxy_bin_state = _init_proxy_bin_weight_state()
     last_update_diag: Dict[str, float] = {}
     for epoch in range(1, args.epochs + 1):
         if sampler is not None:
@@ -2289,25 +2718,23 @@ def main() -> None:
             "lm_loss": 0.0,
             "compact_kl_loss": 0.0,
             "low_recon_loss": 0.0,
+            "low_recon_mean_loss": 0.0,
+            "low_recon_logvar_loss": 0.0,
+            "low_recon_mag_loss": 0.0,
             "vq_task_loss": 0.0,
             "vq_align_loss": 0.0,
             "vq_usage_loss": 0.0,
             "disentangle_loss": 0.0,
-            "vq_task_perplexity": 0.0,
-            "vq_task_perplexity_ema": 0.0,
-            "vq_task_active_codes": 0.0,
-            "vq_task_active_fraction": 0.0,
-            "vq_task_usage_entropy": 0.0,
-            "vq_task_unique_codes": 0.0,
-            "vq_task_dead_fraction": 0.0,
-            "vq_task_avg_distance": 0.0,
             "nll_bin_loss": 0.0,
             "ttr_bin_loss": 0.0,
             "length_bin_loss": 0.0,
+            "proxy_bin_loss": 0.0,
             "nll_bin_mae": 0.0,
             "ttr_bin_mae": 0.0,
             "length_bin_mae": 0.0,
-            "compression_loss": 0.0,
+            "vq_task_perplexity": 0.0,
+            "vq_task_dead_fraction": 0.0,
+            "vq_task_avg_distance": 0.0,
             "mask_group_loss": 0.0,
             "mask_loss": 0.0,
             "consistency_loss": 0.0,
@@ -2323,99 +2750,59 @@ def main() -> None:
             step_index = step + 1
             accum_boundary = step_index % args.grad_accum_steps == 0
             optim_step = step_index // args.grad_accum_steps
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            if total_update_steps > 0:
-                progress = min(1.0, float(optim_step) / float(total_update_steps))
-            else:
-                progress = 0.0
+            current_grad_norm: Optional[float] = None
+            batch = {
+                k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
             device = batch["lm_input_ids"].device
             disable_compactor = bool(args.disable_compactor)
             disable_z_prompt_insertion = bool(args.disable_z_prompt_insertion)
-            if args.loss_schedule == "dynamic":
-                keep_init = float(args.compact_keep_init)
-                keep_final = float(args.compact_keep_final)
-                keep_ratio = _piecewise_linear(
-                    progress,
-                    [
-                        (0.0, keep_init),
-                        (0.2, keep_init),
-                        (0.6, keep_final),
-                        (1.0, keep_final),
-                    ],
-                )
-                keep_ratio = min(max(keep_ratio, 0.0), 1.0)
-                kl_weight = _piecewise_linear(
-                    progress,
-                    [
-                        (0.0, 0.1 * float(args.kl_weight_max)),
-                        (0.2, 0.1 * float(args.kl_weight_max)),
-                        (0.5, float(args.kl_weight_max)),
-                        (1.0, float(args.kl_weight_max)),
-                    ],
-                )
-                lambda_compression = float(args.lambda_compression) * _piecewise_linear(
-                    progress,
-                    [
-                        (0.0, 0.1),
-                        (0.1, 0.1),
-                        (0.4, 1.0),
-                        (1.0, 0.3),
-                    ],
-                )
-                lambda_bias = float(args.lambda_bias) * _piecewise_linear(
-                    progress,
-                    [
-                        (0.0, 0.2),
-                        (0.05, 0.2),
-                        (0.3, 1.0),
-                        (0.7, 1.0),
-                        (1.0, 0.2),
-                    ],
-                )
-                disentangle_weight = float(args.disentangle_weight) * _piecewise_linear(
-                    progress,
-                    [
-                        (0.0, 0.0),
-                        (0.2, 0.0),
-                        (0.6, 1.0),
-                        (1.0, 0.5),
-                    ],
-                )
-                vq_commit_ramp = _piecewise_linear(
-                    progress,
-                    [
-                        (0.0, 0.0),
-                        (0.1, 1.0),
-                        (1.0, 1.0),
-                    ],
-                )
-                mask_group_scale = 1.0
-            else:
-                keep_ratio = min(max(float(args.compact_keep_init), 0.0), 1.0)
-                kl_weight = float(args.kl_weight_max)
-                lambda_compression = float(args.lambda_compression)
-                lambda_bias = float(args.lambda_bias)
-                disentangle_weight = float(args.disentangle_weight)
-                vq_commit_ramp = 1.0
-                mask_group_scale = 1.0
+            denom = max(1, total_steps - 1)
+            progress = min(1.0, float(step) / float(denom))
+            sched_values = _eval_dib_schedule(schedule, progress)
+            keep_ratio = min(max(sched_values["keep_ratio"], 0.0), 1.0)
+            kl_weight = max(0.0, sched_values["kl_weight"])
+            lambda_compression = max(0.0, sched_values["lambda_compression"])
+            lambda_bias = max(0.0, sched_values["lambda_bias"])
+            low_recon_scale = float(args.low_recon_weight)
+            low_recon_mean_weight = float(args.low_recon_mean_weight)
+            low_recon_logvar_weight = float(args.low_recon_logvar_weight)
+            low_recon_mag_weight = float(args.low_recon_mag_weight)
+            disentangle_weight = max(0.0, sched_values["disentangle_weight"])
+            mask_group_weight = float(args.mask_group_weight)
+            vq_commit_scale = max(0.0, min(1.0, sched_values["vq_commit_scale"]))
+            vq_usage_weight = max(0.0, sched_values.get("vq_usage_weight", args.vq_usage_weight))
+            vq_align_weight = max(0.0, sched_values.get("vq_align_weight", args.vq_align_weight))
             if disable_compactor:
                 keep_ratio = 1.0
                 kl_weight = 0.0
-                mask_group_scale = 0.0
-            z_dropout = float(args.z_dropout)
+                mask_group_weight = 0.0
+            z_dropout = max(0.0, sched_values["z_dropout"])
+            if disable_z_prompt_insertion:
+                z_dropout = 0.0
             batch["compact_prior"] = keep_ratio
             batch["z_task_dropout"] = z_dropout
-            batch["compact_mask_scale"] = mask_group_scale
             batch["disable_compactor"] = disable_compactor
             batch["disable_z_prompt_insertion"] = disable_z_prompt_insertion
             batch["compute_compact_kl"] = kl_weight > 0.0
-            batch["enable_low_recon"] = float(args.low_recon_weight) > 0.0
+            batch["enable_low_recon"] = low_recon_scale > 0.0 and (
+                low_recon_mean_weight > 0.0
+                or low_recon_logvar_weight > 0.0
+                or low_recon_mag_weight > 0.0
+            )
 
             diag_metrics: Dict[str, float] = {}
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = engine(batch)
                 proxy_losses = _compute_bias_terms(outputs, batch)
-                low_recon_loss = proxy_losses["low_recon_loss"]
+                low_recon_mean_loss = proxy_losses["low_recon_mean_loss"]
+                low_recon_logvar_loss = proxy_losses["low_recon_logvar_loss"]
+                low_recon_loss = (
+                    low_recon_mean_weight * low_recon_mean_loss
+                    + low_recon_logvar_weight * low_recon_logvar_loss
+                )
+                low_recon_mag_loss = proxy_losses["low_recon_mag_loss"]
                 nll_bin_loss = proxy_losses["nll_bin_loss"]
                 ttr_bin_loss = proxy_losses["ttr_bin_loss"]
                 length_bin_loss = proxy_losses["length_bin_loss"]
@@ -2427,8 +2814,87 @@ def main() -> None:
                 vq_usage_loss = outputs.get(
                     "vq_task_usage_loss", outputs["lm_loss"].new_tensor(0.0)
                 )
+                proxy_counts = {}
+                for name, key in (
+                    ("nll", "proxy_nll_label"),
+                    ("ttr", "proxy_ttr_label"),
+                    ("length", "proxy_length_label"),
+                ):
+                    labels = batch.get(key)
+                    count = int(labels.ne(-100).sum().item()) if torch.is_tensor(labels) else 0
+                    proxy_counts[name] = count
+                proxy_base_weights = {
+                    "nll": float(args.nll_bin_weight),
+                    "ttr": float(args.ttr_bin_weight),
+                    "length": float(args.length_bin_weight),
+                }
+                proxy_bin_weights, proxy_bin_weight_sum = _compute_proxy_bin_weights(
+                    proxy_base_weights,
+                    proxy_bin_state,
+                    proxy_counts,
+                    args,
+                    step,
+                )
+                weight_nll = nll_bin_loss.new_tensor(proxy_bin_weights.get("nll", 0.0))
+                weight_ttr = nll_bin_loss.new_tensor(proxy_bin_weights.get("ttr", 0.0))
+                weight_length = nll_bin_loss.new_tensor(proxy_bin_weights.get("length", 0.0))
+                proxy_bin_numer = (
+                    weight_nll * nll_bin_loss
+                    + weight_ttr * ttr_bin_loss
+                    + weight_length * length_bin_loss
+                )
+                if bool(getattr(args, "proxy_bin_normalize", False)):
+                    denom = max(
+                        float(args.proxy_bin_weight_eps), float(proxy_bin_weight_sum)
+                    )
+                    proxy_bin_loss = proxy_bin_numer / nll_bin_loss.new_tensor(denom)
+                else:
+                    proxy_bin_loss = proxy_bin_numer
+                _update_proxy_bin_ema(
+                    proxy_bin_state,
+                    {"nll": nll_bin_loss, "ttr": ttr_bin_loss, "length": length_bin_loss},
+                    proxy_counts,
+                    float(args.proxy_bin_ema),
+                )
+                diag_metrics.update(
+                    {
+                        "proxy_bin/weight_nll": float(proxy_bin_weights.get("nll", 0.0)),
+                        "proxy_bin/weight_ttr": float(proxy_bin_weights.get("ttr", 0.0)),
+                        "proxy_bin/weight_length": float(proxy_bin_weights.get("length", 0.0)),
+                        "proxy_bin/weight_sum": float(proxy_bin_weight_sum),
+                        "proxy_bin/ema_nll": float(proxy_bin_state.ema.get("nll") or 0.0),
+                        "proxy_bin/ema_ttr": float(proxy_bin_state.ema.get("ttr") or 0.0),
+                        "proxy_bin/ema_length": float(
+                            proxy_bin_state.ema.get("length") or 0.0
+                        ),
+                        "proxy_bin/count_nll": float(proxy_counts.get("nll", 0)),
+                        "proxy_bin/count_ttr": float(proxy_counts.get("ttr", 0)),
+                        "proxy_bin/count_length": float(proxy_counts.get("length", 0)),
+                        "proxy_bin/normalized": 1.0
+                        if bool(getattr(args, "proxy_bin_normalize", False))
+                        else 0.0,
+                    }
+                )
+                for name, target_key, label_key in (
+                    ("nll", "proxy_nll_target", "proxy_nll_label"),
+                    ("ttr", "proxy_ttr_target", "proxy_ttr_label"),
+                    ("length", "proxy_length_target", "proxy_length_label"),
+                ):
+                    hist_out = _proxy_bin_histogram(
+                        batch.get(target_key),
+                        batch.get(label_key),
+                        eps=float(args.proxy_bin_weight_eps),
+                    )
+                    if hist_out is None:
+                        continue
+                    hist, probs, entropy = hist_out
+                    diag_metrics[f"proxy_bin_hist/{name}/count"] = float(hist.sum().item())
+                    diag_metrics[f"proxy_bin_hist/{name}/entropy"] = float(entropy.item())
+                    for idx in range(probs.numel()):
+                        diag_metrics[
+                            f"proxy_bin_hist/{name}/bin_{idx}"
+                        ] = float(probs[idx].item())
                 disentangle_loss = outputs.get("disentangle_loss", outputs["lm_loss"].new_tensor(0.0))
-
                 mask_loss = outputs.get(
                     "compact_mask_loss", outputs["lm_loss"].new_tensor(0.0)
                 )
@@ -2439,25 +2905,54 @@ def main() -> None:
                     args.mask_loss_weight * mask_loss
                     + args.consistency_loss_weight * consistency_loss
                 )
-                compression_loss = (
-                    args.vq_task_weight * vq_task_loss * vq_commit_ramp
-                    + args.vq_align_weight * vq_align_loss
-                    + args.vq_usage_weight * vq_usage_loss * vq_commit_ramp
+                vq_loss = (
+                    args.vq_task_weight * vq_task_loss * vq_commit_scale
+                    + vq_align_weight * vq_align_loss
+                    + vq_usage_weight * vq_usage_loss * vq_commit_scale
                 )
                 bias_loss = (
-                    + args.low_recon_weight * low_recon_loss
-                    + args.nll_bin_weight * nll_bin_loss
-                    + args.ttr_bin_weight * ttr_bin_loss
-                    + args.length_bin_weight * length_bin_loss
+                    + low_recon_scale
+                    * (low_recon_loss + low_recon_mag_weight * low_recon_mag_loss)
+                    + proxy_bin_loss
                 )
                 core_lm_loss = outputs["lm_loss"] + kl_weight * outputs["compact_kl_loss"]
             total_loss = (
                 core_lm_loss
-                + (args.mask_group_weight * mask_group_scale) * mask_group_loss
-                + lambda_compression * compression_loss
+                + (mask_group_weight * mask_group_loss)
+                + lambda_compression * vq_loss
                 + lambda_bias * bias_loss
                 + disentangle_weight * disentangle_loss
             )
+            # Use EMA for smoother display metrics without changing optimization behavior.
+            raw_total_loss = float(total_loss.detach().item())
+            raw_lm_loss = float(outputs["lm_loss"].detach().item())
+            ema_log_loss = _ema_update(ema_log_loss, raw_total_loss, log_ema_decay)
+            ema_log_lm_loss = _ema_update(ema_log_lm_loss, raw_lm_loss, log_ema_decay)
+            raw_component_metrics = {
+                "compact_kl_loss": float(outputs["compact_kl_loss"].item()),
+                "low_recon_loss": float(low_recon_loss.item()),
+                "low_recon_mean_loss": float(low_recon_mean_loss.item()),
+                "low_recon_logvar_loss": float(low_recon_logvar_loss.item()),
+                "low_recon_mag_loss": float(low_recon_mag_loss.item()),
+                "vq_task_loss": float(vq_task_loss.item()),
+                "vq_align_loss": float(vq_align_loss.item()),
+                "vq_usage_loss": float(vq_usage_loss.item()),
+                "disentangle_loss": float(disentangle_loss.item()),
+                "nll_bin_loss": float(nll_bin_loss.item()),
+                "ttr_bin_loss": float(ttr_bin_loss.item()),
+                "length_bin_loss": float(length_bin_loss.item()),
+                "proxy_bin_loss": float(proxy_bin_loss.item()),
+                "nll_bin_mae": float(nll_bin_mae.item()),
+                "ttr_bin_mae": float(ttr_bin_mae.item()),
+                "length_bin_mae": float(length_bin_mae.item()),
+                "compact_mask_loss": float(mask_loss.item()),
+                "compact_consistency_loss": float(consistency_loss.item()),
+            }
+            ema_component_metrics: Dict[str, float] = {}
+            for name, value in raw_component_metrics.items():
+                ema_value = _ema_update(ema_component_values.get(name), value, log_ema_decay)
+                ema_component_values[name] = ema_value
+                ema_component_metrics[f"ema/{name}"] = float(ema_value)
             if args.debug_loss_spike and rank == 0:
                 lm_loss_val = float(outputs["lm_loss"].detach().item())
                 ema_ref = ema_lm_loss if ema_lm_loss is not None else lm_loss_val
@@ -2535,27 +3030,22 @@ def main() -> None:
                 and step % args.debug_aux_checks_interval == 0
                 and not args.gradient_checkpointing
             ):
-                compression_term = lambda_compression * compression_loss
                 bias_term = lambda_bias * bias_loss
                 lm_term = core_lm_loss
                 enc_lm_grad = _grad_norm_from_loss(lm_term, encoder_params)
                 enc_bias_grad = _grad_norm_from_loss(bias_term, encoder_params)
-                enc_comp_grad = _grad_norm_from_loss(compression_term, encoder_params)
                 lm_lm_grad = _grad_norm_from_loss(lm_term, lm_params)
                 lm_bias_grad = _grad_norm_from_loss(bias_term, lm_params)
-                lm_comp_grad = _grad_norm_from_loss(compression_term, lm_params)
                 if args.use_lora:
                     lora_lm_grad = _grad_norm_from_loss(lm_term, lora_params)
-                aux_enc = enc_bias_grad + enc_comp_grad
-                aux_lm = lm_bias_grad + lm_comp_grad
+                aux_enc = enc_bias_grad
+                aux_lm = lm_bias_grad
                 diag_metrics.update(
                     {
                         "diag/grad_norm/lm/encoder": float(enc_lm_grad.item()),
                         "diag/grad_norm/bias/encoder": float(enc_bias_grad.item()),
-                        "diag/grad_norm/compression/encoder": float(enc_comp_grad.item()),
                         "diag/grad_norm/lm/lm": float(lm_lm_grad.item()),
                         "diag/grad_norm/bias/lm": float(lm_bias_grad.item()),
-                        "diag/grad_norm/compression/lm": float(lm_comp_grad.item()),
                         "diag/grad_ratio/aux_vs_lm/encoder": float(
                             aux_enc.item() / (enc_lm_grad.item() + 1e-8)
                         ),
@@ -2593,17 +3083,25 @@ def main() -> None:
                 if "out of memory" not in msg and "cublas_status_alloc_failed" not in msg:
                     raise
                 exc_msg = str(exc).splitlines()[0] if exc else "CUDA out of memory"
-                print(
-                    f"[warn] OOM error occurred | sequence_len={sequence_len} | details={exc_msg}"
+                _log_message(
+                    rank,
+                    f"[warn] OOM error occurred | sequence_len={sequence_len} | details={exc_msg}",
+                    level=logging.WARNING,
                 )
                 engine.zero_grad()
+                del total_loss
+                del outputs
+                del batch
+                gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 continue
             if args.debug_aux_checks and accum_boundary:
                 total_params = [p for p in engine.module.parameters() if p.requires_grad]
                 total_norm = _param_grad_norm(total_params, total_loss.device)
+                current_grad_norm = float(total_norm)
                 last_update_diag = {
+                    "grad_norm/total": current_grad_norm,
                     "diag/grad_norm_total/encoder": _param_grad_norm(
                         encoder_params, total_loss.device
                     ),
@@ -2622,32 +3120,27 @@ def main() -> None:
                         lora_params, total_loss.device
                     )
             engine.step()
-
-
             totals["loss"] += total_loss.item()
             totals["lm_loss"] += outputs["lm_loss"].item()
             totals["compact_kl_loss"] += outputs["compact_kl_loss"].item()
             totals["low_recon_loss"] += low_recon_loss.item()
+            totals["low_recon_mean_loss"] += low_recon_mean_loss.item()
+            totals["low_recon_logvar_loss"] += low_recon_logvar_loss.item()
+            totals["low_recon_mag_loss"] += low_recon_mag_loss.item()
             totals["vq_task_loss"] += vq_task_loss.item()
             totals["vq_align_loss"] += vq_align_loss.item()
             totals["vq_usage_loss"] += vq_usage_loss.item()
             totals["disentangle_loss"] += disentangle_loss.item()
-            totals["vq_task_perplexity"] += float(outputs.get("vq_task_perplexity", 0.0))
-            totals["vq_task_perplexity_ema"] += float(outputs.get("vq_task_perplexity_ema", 0.0))
-            totals["vq_task_active_codes"] += float(outputs.get("vq_task_active_codes", 0.0))
-            totals["vq_task_active_fraction"] += float(outputs.get("vq_task_active_fraction", 0.0))
-            totals["vq_task_usage_entropy"] += float(outputs.get("vq_task_usage_entropy", 0.0))
-            totals["vq_task_unique_codes"] += float(outputs.get("vq_task_unique_codes", 0.0))
-            totals["vq_task_dead_fraction"] += float(outputs.get("vq_task_dead_fraction", 0.0))
-            totals["vq_task_avg_distance"] += float(outputs.get("vq_task_avg_distance", 0.0))
             totals["nll_bin_loss"] += nll_bin_loss.item()
             totals["ttr_bin_loss"] += ttr_bin_loss.item()
             totals["length_bin_loss"] += length_bin_loss.item()
+            totals["proxy_bin_loss"] += proxy_bin_loss.item()
             totals["nll_bin_mae"] += nll_bin_mae.item()
             totals["ttr_bin_mae"] += ttr_bin_mae.item()
             totals["length_bin_mae"] += length_bin_mae.item()
-            totals.setdefault("compression_loss", 0.0)
-            totals["compression_loss"] += compression_loss.item()
+            totals["vq_task_perplexity"] += float(outputs.get("vq_task_perplexity", 0.0))
+            totals["vq_task_dead_fraction"] += float(outputs.get("vq_task_dead_fraction", 0.0))
+            totals["vq_task_avg_distance"] += float(outputs.get("vq_task_avg_distance", 0.0))
             totals["mask_group_loss"] += mask_group_loss.item()
             totals["mask_loss"] += mask_loss.item()
             totals["consistency_loss"] += consistency_loss.item()
@@ -2664,11 +3157,42 @@ def main() -> None:
             if torch.is_tensor(drop_min_target):
                 totals["lm_drop_min_target"] += float(drop_min_target.item())
             totals["steps"] += 1
-            if tqdm_enabled and step % tqdm_every == 0:
-                epoch_loader.set_postfix(
-                    loss=f"{total_loss.item():.4f}",
-                    lm=f"{outputs['lm_loss'].item():.4f}",
+            log_loss = ema_log_loss if ema_log_loss is not None else raw_total_loss
+            log_lm_loss = ema_log_lm_loss if ema_log_lm_loss is not None else raw_lm_loss
+            # Group key optimizer-facing metrics for consistent step logging.
+            step_metrics = {
+                "loss": float(raw_total_loss),
+                "lm_loss": float(raw_lm_loss),
+                "ema/loss": float(log_loss),
+                "ema/lm_loss": float(log_lm_loss),
+                **ema_component_metrics,
+            }
+            lrs = [group.get("lr", 0.0) for group in optimizer.param_groups]
+            if lrs:
+                lr_mean = float(sum(lrs) / len(lrs))
+                step_metrics["lr"] = lr_mean
+                step_metrics.update(
+                    {
+                        "lr/main_min": float(min(lrs)),
+                        "lr/main_max": float(max(lrs)),
+                        "lr/main_mean": lr_mean,
+                    }
                 )
+            if current_grad_norm is not None:
+                step_metrics["grad_norm"] = current_grad_norm
+            val_loss = None  # Populated when validation is available.
+            if val_loss is not None:
+                step_metrics["val_loss"] = float(val_loss)
+            if tqdm_enabled and step % tqdm_every == 0:
+                tqdm_postfix = {
+                    "loss": f"{log_loss:.4f}",
+                    "lm": f"{log_lm_loss:.4f}",
+                }
+                if "lr" in step_metrics:
+                    tqdm_postfix["lr"] = f"{step_metrics['lr']:.2e}"
+                if "grad_norm" in step_metrics:
+                    tqdm_postfix["gn"] = f"{step_metrics['grad_norm']:.2f}"
+                epoch_loader.set_postfix(**tqdm_postfix)
             if (
                 swanlab_client is not None
                 and args.swanlab_log_steps > 0
@@ -2703,84 +3227,103 @@ def main() -> None:
                         "mem/allocated_mb": torch.cuda.memory_allocated() / (1024**2),
                         "mem/reserved_mb": torch.cuda.memory_reserved() / (1024**2),
                     }
-                lrs = [group.get("lr", 0.0) for group in optimizer.param_groups]
-                lr_stats = {}
-                if lrs:
-                    lr_stats = {
-                        "lr/main_min": float(min(lrs)),
-                        "lr/main_max": float(max(lrs)),
-                        "lr/main_mean": float(sum(lrs) / len(lrs)),
-                    }
+                vq_health_metrics = {
+                    "vq/health/task_loss": float(vq_task_loss.item()),
+                    "vq/health/usage_loss": float(vq_usage_loss.item()),
+                    "vq/health/align_loss": float(vq_align_loss.item()),
+                    "vq/health/perplexity": float(outputs.get("vq_task_perplexity", 0.0)),
+                    "vq/health/dead_fraction": float(outputs.get("vq_task_dead_fraction", 0.0)),
+                    "vq/health/avg_distance": float(outputs.get("vq_task_avg_distance", 0.0)),
+                }
                 log_swanlab(
                     swanlab_client,
                     {
-                            "loss": total_loss.item(),
-                            "lm_loss": outputs["lm_loss"].item(),
-                            "compact_kl_loss": outputs["compact_kl_loss"].item(),
-                            "low_recon_loss": low_recon_loss.item(),
-                            "vq_task_loss": vq_task_loss.item(),
-                            "vq_align_loss": vq_align_loss.item(),
-                            "vq_usage_loss": vq_usage_loss.item(),
-                            "disentangle_loss": disentangle_loss.item(),
-                            "vq/task_commitment_loss": float(outputs.get("vq_task_commitment_loss", 0.0)),
-                            "vq/task_codebook_loss": float(outputs.get("vq_task_codebook_loss", 0.0)),
-                            "vq/task_perplexity": float(outputs.get("vq_task_perplexity", 0.0)),
-                            "vq/task_perplexity_ema": float(outputs.get("vq_task_perplexity_ema", 0.0)),
-                            "vq/task_usage_loss": float(outputs.get("vq_task_usage_loss", 0.0)),
-                            "vq/task_active_codes": float(outputs.get("vq_task_active_codes", 0.0)),
-                            "vq/task_active_fraction": float(outputs.get("vq_task_active_fraction", 0.0)),
-                            "vq/task_usage_entropy": float(outputs.get("vq_task_usage_entropy", 0.0)),
-                            "vq/task_unique_codes": float(outputs.get("vq_task_unique_codes", 0.0)),
-                            "vq/task_dead_fraction": float(outputs.get("vq_task_dead_fraction", 0.0)),
-                            "vq/task_avg_distance": float(outputs.get("vq_task_avg_distance", 0.0)),
-                            "nll_bin_loss": nll_bin_loss.item(),
-                            "ttr_bin_loss": ttr_bin_loss.item(),
-                            "length_bin_loss": length_bin_loss.item(),
-                            "nll_bin_mae": nll_bin_mae.item(),
-                            "ttr_bin_mae": ttr_bin_mae.item(),
-                            "length_bin_mae": length_bin_mae.item(),
-                            "compression/mask_loss": mask_loss.item(),
-                            "compression/consistency_loss": consistency_loss.item(),
-                            "compression/loss": compression_loss.item(),
-                            "compact/pi_mean": float(outputs.get("compact_pi_mean", 0.0)),
-                            "compact/mask_mean": float(outputs.get("compact_mask_mean", 0.0)),
-                            "compact/pi_saturation": float(outputs.get("compact_pi_saturation", 0.0)),
-                            "compact/kl_loss": outputs["compact_kl_loss"].item(),
-                            "weights/lambda_bias": lambda_bias,
-                            "weights/lambda_compression": lambda_compression,
-                            "weights/kl_weight": kl_weight,
-                            "weights/keep_ratio": keep_ratio,
-                            "weights/z_task_dropout": z_dropout,
-                            "weights/vq_commit_scale": vq_commit_ramp,
-                            "weights/low_recon": args.low_recon_weight,
-                            "weights/vq_task": args.vq_task_weight,
-                            "weights/vq_usage": args.vq_usage_weight,
-                            "weights/vq_align": args.vq_align_weight,
-                            "weights/disentangle": disentangle_weight,
-                            "weights/nll_bin": args.nll_bin_weight,
-                            "weights/ttr_bin": args.ttr_bin_weight,
-                            "weights/length_bin": args.length_bin_weight,
-                            "weights/mask_group": args.mask_group_weight * mask_group_scale,
-                            "weights/mask_group_scale": mask_group_scale,
-                            "weights/mask_loss": args.mask_loss_weight,
-                            "weights/consistency_loss": args.consistency_loss_weight,
-                            "data/lm_drop_count": float(drop_count.item()) if torch.is_tensor(drop_count) else 0.0,
-                            "data/lm_drop_seen": float(drop_seen.item()) if torch.is_tensor(drop_seen) else 0.0,
-                            "data/lm_drop_ratio": float(
-                                (drop_count.item() / drop_seen.item())
-                                if torch.is_tensor(drop_count) and torch.is_tensor(drop_seen) and drop_seen.item() > 0
-                                else 0.0
-                            ),
-                            "data/lm_drop_maxlen_count": float(drop_maxlen.item())
-                            if torch.is_tensor(drop_maxlen)
-                            else 0.0,
-                            "data/lm_drop_min_target_count": float(drop_min_target.item())
-                            if torch.is_tensor(drop_min_target)
-                            else 0.0,
-                            **last_update_diag,
-                            "batch/lm_tokens": lm_tokens,
-                            "batch/original_tokens": original_tokens,
-                            **lr_stats,
+                        **step_metrics,
+                        **vq_health_metrics,
+                        "raw/loss": raw_total_loss,
+                        "raw/lm_loss": raw_lm_loss,
+                        "raw/compact_kl_loss": float(outputs["compact_kl_loss"].item()),
+                        "raw/low_recon_loss": float(low_recon_loss.item()),
+                        "raw/low_recon_mean_loss": float(low_recon_mean_loss.item()),
+                        "raw/low_recon_logvar_loss": float(low_recon_logvar_loss.item()),
+                        "raw/low_recon_mag_loss": float(low_recon_mag_loss.item()),
+                        "raw/vq_task_loss": float(vq_task_loss.item()),
+                        "raw/vq_align_loss": float(vq_align_loss.item()),
+                        "raw/vq_usage_loss": float(vq_usage_loss.item()),
+                        "raw/disentangle_loss": float(disentangle_loss.item()),
+                        "raw/nll_bin_loss": float(nll_bin_loss.item()),
+                        "raw/ttr_bin_loss": float(ttr_bin_loss.item()),
+                        "raw/length_bin_loss": float(length_bin_loss.item()),
+                        "raw/proxy_bin_loss": float(proxy_bin_loss.item()),
+                        "raw/nll_bin_mae": float(nll_bin_mae.item()),
+                        "raw/ttr_bin_mae": float(ttr_bin_mae.item()),
+                        "raw/length_bin_mae": float(length_bin_mae.item()),
+                        "raw/compact_mask_loss": float(mask_loss.item()),
+                        "raw/compact_consistency_loss": float(consistency_loss.item()),
+                        "compact_kl_loss": outputs["compact_kl_loss"].item(),
+                        "low_recon_loss": low_recon_loss.item(),
+                        "low_recon_mean_loss": low_recon_mean_loss.item(),
+                        "low_recon_logvar_loss": low_recon_logvar_loss.item(),
+                        "low_recon_mag_loss": low_recon_mag_loss.item(),
+                        "vq_task_loss": vq_task_loss.item(),
+                        "vq_align_loss": vq_align_loss.item(),
+                        "vq_usage_loss": vq_usage_loss.item(),
+                        "disentangle_loss": disentangle_loss.item(),
+                        "nll_bin_loss": nll_bin_loss.item(),
+                        "ttr_bin_loss": ttr_bin_loss.item(),
+                        "length_bin_loss": length_bin_loss.item(),
+                        "proxy_bin_loss": proxy_bin_loss.item(),
+                        "nll_bin_mae": nll_bin_mae.item(),
+                        "ttr_bin_mae": ttr_bin_mae.item(),
+                        "length_bin_mae": length_bin_mae.item(),
+                        "vq/task_commitment_loss": float(outputs.get("vq_task_commitment_loss", 0.0)),
+                        "vq/task_codebook_loss": float(outputs.get("vq_task_codebook_loss", 0.0)),
+                        "vq/task_perplexity": float(outputs.get("vq_task_perplexity", 0.0)),
+                        "vq/task_usage_loss": float(outputs.get("vq_task_usage_loss", 0.0)),
+                        "vq/task_dead_fraction": float(outputs.get("vq_task_dead_fraction", 0.0)),
+                        "vq/task_avg_distance": float(outputs.get("vq_task_avg_distance", 0.0)),
+                        "compact/mask_loss": mask_loss.item(),
+                        "compact/consistency_loss": consistency_loss.item(),
+                        "compact/pi_mean": float(outputs.get("compact_pi_mean", 0.0)),
+                        "compact/mask_mean": float(outputs.get("compact_mask_mean", 0.0)),
+                        "compact/pi_saturation": float(outputs.get("compact_pi_saturation", 0.0)),
+                        "compact/kl_loss": outputs["compact_kl_loss"].item(),
+                        "weights/lambda_bias": lambda_bias,
+                        "weights/lambda_compression": lambda_compression,
+                        "weights/vq_task": args.vq_task_weight,
+                        "weights/vq_usage": vq_usage_weight,
+                        "weights/vq_align": vq_align_weight,
+                        "weights/vq_commit_scale": vq_commit_scale,
+                        "weights/kl_weight": kl_weight,
+                        "weights/keep_ratio": keep_ratio,
+                        "weights/z_task_dropout": z_dropout,
+                        "weights/low_recon": args.low_recon_weight,
+                        "weights/low_recon_mean": args.low_recon_mean_weight,
+                        "weights/low_recon_logvar": args.low_recon_logvar_weight,
+                        "weights/low_recon_mag": args.low_recon_mag_weight,
+                        "weights/disentangle": disentangle_weight,
+                        "weights/nll_bin": args.nll_bin_weight,
+                        "weights/ttr_bin": args.ttr_bin_weight,
+                        "weights/length_bin": args.length_bin_weight,
+                        "weights/mask_group": mask_group_weight,
+                        "weights/mask_loss": args.mask_loss_weight,
+                        "weights/consistency_loss": args.consistency_loss_weight,
+                        "data/lm_drop_count": float(drop_count.item()) if torch.is_tensor(drop_count) else 0.0,
+                        "data/lm_drop_seen": float(drop_seen.item()) if torch.is_tensor(drop_seen) else 0.0,
+                        "data/lm_drop_ratio": float(
+                            (drop_count.item() / drop_seen.item())
+                            if torch.is_tensor(drop_count) and torch.is_tensor(drop_seen) and drop_seen.item() > 0
+                            else 0.0
+                        ),
+                        "data/lm_drop_maxlen_count": float(drop_maxlen.item())
+                        if torch.is_tensor(drop_maxlen)
+                        else 0.0,
+                        "data/lm_drop_min_target_count": float(drop_min_target.item())
+                        if torch.is_tensor(drop_min_target)
+                        else 0.0,
+                        **last_update_diag,
+                        "batch/lm_tokens": lm_tokens,
+                        "batch/original_tokens": original_tokens,
                         **perf,
                         **mem,
                         **diag_metrics,

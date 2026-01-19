@@ -8,24 +8,13 @@ rms_norm_eps: 1.0e-6 # RMSNorm epsilon
 use_swiglu: true # use SwiGLU activations in custom heads
 z_prompt_len: 16 # number of task prompt tokens injected per response
 bias_prompt_len: 1 # number of bias prompt tokens for proxy heads
-prompt_mlp_hidden: 0 # hidden width for task/bias MLP heads (0 = 2x encoder dim)
-prompt_mlp_layers: 0 # number of hidden layers in task/bias MLP heads
-prompt_mlp_dropout: 0.05 # dropout rate for task/bias MLP heads
-task_codebook_size: 128 # number of VQ codes for task branch
-vq_num_codebooks: 4 # number of product quantization codebooks
-vq_commitment_gamma: 0.05 # beta for VQ commitment loss
-vq_ema_decay: 0.995 # EMA decay for codebook updates
-vq_use_ema: true # enable EMA updates for VQ
-vq_normalize_inputs: true # normalize encoder outputs before VQ
-vq_codebook_trainable: false # allow gradients into codebook in addition to EMA
-vq_dead_code_threshold: 0.1 # usage threshold for dead code reset
-vq_reset_dead_codes: true # reset dead codes from batch samples
-vq_align_samples: 512 # token embeddings sampled for VQ alignment loss
-vq_init_samples: 0 # task tokens used for kmeans++ codebook init (0 = auto)
-vq_init_batch_size: 128 # batch size for VQ init forward passes (0 = per_device_train_batch_size)
-vq_init_autocast: true # enable autocast during VQ init
-vq_init_seed: 0 # random seed for VQ init sampling
-vq_init_spherical: true # normalize samples before VQ initialization
+bias_mlp_hidden: 0 # hidden width for bias prompt MLP heads (0 = 2x encoder dim)
+bias_mlp_layers: 0 # number of hidden layers in bias prompt MLP heads
+bias_mlp_dropout: 0.05 # dropout rate for bias prompt MLP heads
+task_resampler_layers: 2 # number of cross-attn resampler layers
+task_resampler_heads: 8 # number of cross-attn heads in resampler
+task_resampler_mlp_ratio: 4.0 # MLP expansion ratio in resampler
+task_resampler_dropout: 0.05 # dropout rate in resampler
 encoder_trainable: last # which encoder layers to train (all|last|none)
 bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 1 # number of hidden layers for bias proxy heads
@@ -71,8 +60,8 @@ bf16: true # enable bfloat16 training
 allow_tf32: true # enable TF32 matmul kernels for speed
 gradient_checkpointing: true # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
-lm_loss_chunk_size: 0 # optional chunk size for causal LM loss (0 = disabled)
-compact_kl_chunk_size: 0 # optional chunk size for compact KL (0 = disabled)
+lm_loss_chunk_size: 256 # optional chunk size for causal LM loss (0 = disabled)
+compact_kl_chunk_size: 128 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
 swanlab_run_name: zero2_gradient_ckpt # SwanLab run name
@@ -103,7 +92,7 @@ lora_targets: q_proj,k_proj,v_proj,o_proj # comma-separated module names for LoR
 encoder_lr: 2.0e-5 # learning rate for shared encoder
 lm_lr: 2.0e-5 # learning rate for judge LM (if unfrozen)
 lora_lr: 2.0e-4 # learning rate for LoRA params
-head_lr: 2.0e-4 # learning rate for heads (task/bias/VQ/prompt)
+head_lr: 2.0e-4 # learning rate for heads (task/bias/resampler/prompt)
 weight_decay: 0.01 # weight decay for main params
 head_weight_decay: 0 # weight decay for head params
 max_grad_norm: 1.0 # gradient clipping norm
@@ -114,25 +103,19 @@ warmup_steps: 0 # explicit warmup steps (0 = use warmup_ratio)
 warmup_ratio: 0.03 # warmup ratio of total steps
 scheduler_type: cosine # scheduler type for HF scheduler
 
-# schedule config
+# compactor config
 compact_keep_init: 0.9 # initial keep ratio for compact masking
-loss_schedule: dynamic
-compact_keep_final: 0.5
 disable_compactor: true
 disable_z_prompt_insertion: true
 compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value
-kl_weight_max: 1.0 # max weight for compact KL loss
+kl_weight: 1.0 # weight for compact KL loss
 z_dropout: 0.0 # fixed z dropout for task prompts
 
 
 # loss config
-lambda_compression: 0.0 # global scale for compression loss
 mask_loss_weight: 0.0 # weight for compact mask loss
 consistency_loss_weight: 0.0 # weight for compact consistency loss
 mask_group_weight: 0.0 # weight for (mask_loss + consistency_loss) group loss
-vq_task_weight: 0.0 # weight for VQ commitment/codebook loss
-vq_usage_weight: 0.0 # weight for VQ usage regularization loss
-vq_align_weight: 0.0 # weight for VQ alignment loss
 lambda_bias: 0.0 # global scale for bias losses
 low_recon_weight: 0.0 # weight for low-level reconstruction loss
 nll_bin_weight: 0.0 # weight for NLL bin loss

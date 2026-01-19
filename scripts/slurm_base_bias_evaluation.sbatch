@@ -39,14 +39,14 @@ MODEL_PATHS=(
     # model/mR3-Qwen3-8B-en-prompt-en-thinking
     # model/Qwen3-4B
     # model/Qwen3-8B
-    model/Qwen2.5-7B-Instruct
-    model/Qwen2.5-3B-Instruct
+    # model/Qwen2.5-7B-Instruct
+    # model/Qwen2.5-3B-Instruct
     outputs/Qwen3-4B_mR3_baseline_vanilla_LoRA/Qwen3-4B_mR3_baseline_vanilla_LoRA
 )
 
 for model_path in "${MODEL_PATHS[@]}"; do
     model_name="$(basename "${model_path}")"
-    output_dir="results/${model_name}"
+    output_dir="bias_results/${model_name}"
     mkdir -p "${output_dir}"
     log_file="${output_dir}/run.log"
 
@@ -55,26 +55,7 @@ for model_path in "${MODEL_PATHS[@]}"; do
         --model "${model_path}" \
         --output_dir "${output_dir}" \
         --template mr3_templates \
-        --tensor_parallel_size "${num_gpus}" \
-        >"${log_file}" 2>&1
-done
-
-MODEL_PATHS=(
-    model/M-Prometheus-7B
-    model/M-Prometheus-3B
-)
-
-for model_path in "${MODEL_PATHS[@]}"; do
-    model_name="$(basename "${model_path}")"
-    output_dir="results/${model_name}"
-    mkdir -p "${output_dir}"
-    log_file="${output_dir}/run.log"
-
-    # bash scripts/slurm_vanilla_evaluation.sbatch \
-    python scripts/vanilla_evaluation.py \
-        --model "${model_path}" \
-        --output_dir "${output_dir}" \
-        --template prometheus \
+        --benchmark judgment-requests \
         --tensor_parallel_size "${num_gpus}" \
         >"${log_file}" 2>&1
 done

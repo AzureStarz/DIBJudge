@@ -36,10 +36,24 @@ DEFAULT_USER_PROMPT = (
     "[The Start of Assistant B's Answer]\n{answer_b}\n[The End of Assistant B's Answer]"
 )
 
+JUDGMENT_BENCHMARK = "judgment-requests"
+DEFAULT_JUDGMENT_REQUEST_DIR = (
+    "/path/to/workspace/online1/"
+    "llm-as-judge-cultural-evaluation/preliminary_exp/judgment_requests"
+)
+
 DEFAULT_VERDICT_A = "[[A]]"
 DEFAULT_VERDICT_B = "[[B]]"
 QWEN3_SYSTEM_PREFIX = "You are Qwen3, an AI assistant that reasons, thinks, and answers strictly in English."
 _PRINTED_TEST_PROMPT = False
+_JUDGMENT_USER_RE = re.compile(
+    r"\[User Question\]\s*(?P<question>.*?)\s*"
+    r"\[The Start of Assistant A's Answer\]\s*(?P<answer_a>.*?)\s*"
+    r"\[The End of Assistant A's Answer\]\s*"
+    r"\[The Start of Assistant B's Answer\]\s*(?P<answer_b>.*?)\s*"
+    r"\[The End of Assistant B's Answer\]\s*$",
+    re.S,
+)
 
 
 class _SafeDict(dict):
@@ -187,6 +201,286 @@ def _safe_format_template(template: str, payload: Dict[str, object]) -> str:
         return match.group(0)
 
     return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+
+_LONG_PROMPT_LOG_LIMIT = 3
+_LONG_PROMPT_LOG_COUNT = 0
+
+
+def _count_prompt_tokens(tokenizer, prompt: str) -> Optional[int]:
+    if tokenizer is None:
+        return None
+    try:
+        return len(tokenizer(prompt, add_special_tokens=False).input_ids)
+    except Exception:
+        try:
+            return len(tokenizer.encode(prompt, add_special_tokens=False))
+        except Exception:
+            return None
+
+
+def _resolve_prompt_limit(tokenizer, max_model_len: Optional[int]) -> Optional[int]:
+    if max_model_len is not None:
+        return int(max_model_len)
+    if tokenizer is None:
+        return None
+    limit = getattr(tokenizer, "model_max_length", None)
+    if isinstance(limit, int) and 0 < limit < 1_000_000:
+        return limit
+    return None
+
+
+def _truncate_text_tokens(tokenizer, text: str, budget: int) -> str:
+    if tokenizer is None or budget <= 0:
+        return ""
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) <= budget:
+        return text
+    if budget < 4:
+        return tokenizer.decode(ids[:budget], skip_special_tokens=True)
+    head = budget // 2
+    tail = budget - head
+    truncated = ids[:head] + ids[-tail:]
+    return tokenizer.decode(truncated, skip_special_tokens=True)
+
+
+def _log_long_prompt(
+    meta: Dict[str, object],
+    prompt_len: int,
+    max_model_len: int,
+    truncated: bool,
+) -> None:
+    global _LONG_PROMPT_LOG_COUNT
+    if _LONG_PROMPT_LOG_COUNT >= _LONG_PROMPT_LOG_LIMIT:
+        return
+    _LONG_PROMPT_LOG_COUNT += 1
+    status = "truncated" if truncated else "overlong"
+    print(
+        "[warn] long prompt",
+        f"status={status}",
+        f"len={prompt_len}",
+        f"max={max_model_len}",
+        f"benchmark={meta.get('benchmark')}",
+        f"language={meta.get('language')}",
+        f"id={meta.get('id')}",
+    )
+
+
+def _maybe_truncate_prompt(
+    render_fn: Callable[[str, str, str], str],
+    tokenizer,
+    max_model_len: Optional[int],
+    question: str,
+    answer_a: str,
+    answer_b: str,
+    meta: Dict[str, object],
+) -> Tuple[str, str, str, str, Optional[int]]:
+    prompt = render_fn(question, answer_a, answer_b)
+    limit = _resolve_prompt_limit(tokenizer, max_model_len)
+    prompt_len = _count_prompt_tokens(tokenizer, prompt)
+    if limit is None or prompt_len is None or prompt_len <= limit:
+        return prompt, question, answer_a, answer_b, prompt_len
+
+    orig_len = prompt_len
+    empty_prompt = render_fn("", "", "")
+    empty_len = _count_prompt_tokens(tokenizer, empty_prompt)
+    base_prompt = render_fn(question, "", "")
+    base_len = _count_prompt_tokens(tokenizer, base_prompt)
+    if empty_len is None or base_len is None:
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt = tokenizer.decode(ids[:limit], skip_special_tokens=True)
+        _log_long_prompt(meta, orig_len, limit, True)
+        return prompt, question, answer_a, answer_b, limit
+
+    truncated_question = question
+    if base_len > limit:
+        question_budget = max(0, limit - empty_len)
+        truncated_question = _truncate_text_tokens(tokenizer, question, question_budget)
+        base_prompt = render_fn(truncated_question, "", "")
+        base_len = _count_prompt_tokens(tokenizer, base_prompt) or base_len
+
+    available = max(0, limit - base_len)
+    answer_budget = max(0, available // 2)
+    truncated_a = _truncate_text_tokens(tokenizer, answer_a, answer_budget)
+    truncated_b = _truncate_text_tokens(tokenizer, answer_b, answer_budget)
+    prompt = render_fn(truncated_question, truncated_a, truncated_b)
+    prompt_len = _count_prompt_tokens(tokenizer, prompt)
+    if prompt_len is None:
+        prompt_len = orig_len
+
+    for _ in range(3):
+        if prompt_len <= limit or answer_budget <= 0:
+            break
+        over = prompt_len - limit
+        shrink = max(1, (over + 1) // 2)
+        answer_budget = max(0, answer_budget - shrink)
+        truncated_a = _truncate_text_tokens(tokenizer, answer_a, answer_budget)
+        truncated_b = _truncate_text_tokens(tokenizer, answer_b, answer_budget)
+        prompt = render_fn(truncated_question, truncated_a, truncated_b)
+        prompt_len = _count_prompt_tokens(tokenizer, prompt) or prompt_len
+
+    if prompt_len > limit:
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt = tokenizer.decode(ids[:limit], skip_special_tokens=True)
+        prompt_len = limit
+
+    _log_long_prompt(meta, orig_len, limit, True)
+    return prompt, truncated_question, truncated_a, truncated_b, prompt_len
+
+
+def _parse_custom_id(
+    custom_id: str,
+    fallback_group: Optional[str] = None,
+    fallback_lang: Optional[str] = None,
+) -> Tuple[str, str, str, str, str]:
+    text = str(custom_id)
+    match = re.match(r"^(?P<prefix>.+)[-_](?P<idx>\d+)[-_]gold(?P<gold>[AB])$", text)
+    if not match:
+        raise ValueError(f"custom_id has unexpected format: {custom_id}")
+    prefix = match.group("prefix")
+    idx = match.group("idx")
+    gold = match.group("gold")
+
+    group = None
+    lang = None
+    if fallback_group:
+        for sep in ("-", "_"):
+            token = f"{fallback_group}{sep}"
+            if prefix.startswith(token):
+                group = fallback_group
+                lang = prefix[len(token) :]
+                break
+
+    if group is None or lang is None:
+        if "-" in prefix:
+            parts = prefix.split("-", 1)
+            group = parts[0]
+            lang = parts[1] if len(parts) > 1 else ""
+        elif "_" in prefix:
+            group = fallback_group or "unknown"
+            lang = prefix
+        else:
+            group = fallback_group or "unknown"
+            lang = prefix
+
+    if not lang:
+        lang = fallback_lang or "unknown"
+    base_id = f"{group}-{lang}-{idx}"
+    return group, lang, idx, gold, base_id
+
+
+def _parse_judgment_user_content(user_content: str) -> Tuple[str, str, str]:
+    text = str(user_content).replace("\r\n", "\n")
+    match = _JUDGMENT_USER_RE.search(text)
+    if not match:
+        raise ValueError("Unable to parse judgment request user content.")
+    question = match.group("question").strip("\n")
+    answer_a = match.group("answer_a").strip("\n")
+    answer_b = match.group("answer_b").strip("\n")
+    return question, answer_a, answer_b
+
+
+def _parse_judgment_filename(path: str) -> Tuple[Optional[str], Optional[str]]:
+    name = os.path.basename(path)
+    suffix = "_judgment_requests.jsonl"
+    if not name.endswith(suffix):
+        return None, None
+    core = name[: -len(suffix)]
+    parts = core.split("_")
+    if len(parts) >= 3 and parts[1] == "resource":
+        group = "_".join(parts[:2])
+        lang = "_".join(parts[2:])
+        return group, lang or None
+    if len(parts) >= 2:
+        return parts[0], "_".join(parts[1:]) or None
+    return None, core or None
+
+
+def _discover_judgment_request_datasets(root_dir: str) -> List[str]:
+    if not os.path.isdir(root_dir):
+        return []
+    datasets = [
+        name
+        for name in os.listdir(root_dir)
+        if not name.startswith(".") and os.path.isdir(os.path.join(root_dir, name))
+    ]
+    return sorted(datasets)
+
+
+def _load_judgment_requests(
+    root_dir: str,
+    datasets: Optional[List[str]] = None,
+    limit: Optional[int] = None,
+    limit_per_language: Optional[int] = None,
+) -> Dict[str, List[dict]]:
+    available = _discover_judgment_request_datasets(root_dir)
+    if not available:
+        raise ValueError(f"judgment request directory not found: {root_dir}")
+    selected = datasets or available
+    missing = [name for name in selected if name not in available]
+    if missing:
+        raise ValueError(
+            "Missing judgment request datasets: " + ", ".join(sorted(missing))
+        )
+    loaded: Dict[str, List[dict]] = {}
+    for dataset in selected:
+        dataset_dir = os.path.join(root_dir, dataset)
+        entries: List[dict] = []
+        files = sorted(glob.glob(os.path.join(dataset_dir, "*.jsonl")))
+        for path in files:
+            fallback_group, fallback_lang = _parse_judgment_filename(path)
+            file_entries: List[dict] = []
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    payload = json.loads(line)
+                    custom_id = str(payload.get("custom_id", ""))
+                    messages = payload.get("body", {}).get("messages", [])
+                    user_message = next(
+                        (msg for msg in messages if msg.get("role") == "user"), None
+                    )
+                    if user_message is None:
+                        raise ValueError(
+                            f"Missing user message in judgment request: {path}"
+                        )
+                    question, answer_a, answer_b = _parse_judgment_user_content(
+                        user_message.get("content", "")
+                    )
+                    group, lang, idx, gold, base_id = _parse_custom_id(
+                        custom_id,
+                        fallback_group=fallback_group,
+                        fallback_lang=fallback_lang,
+                    )
+                    file_entries.append(
+                        {
+                            "custom_id": custom_id,
+                            "pair_id": base_id,
+                            "group": group,
+                            "language": lang,
+                            "idx": idx,
+                            "gold": gold,
+                            "question": question,
+                            "answer_a": answer_a,
+                            "answer_b": answer_b,
+                        }
+                    )
+                    if limit is not None and len(entries) + len(file_entries) >= limit:
+                        break
+            if limit_per_language:
+                file_entries = _limit_judgment_pairs(file_entries, limit_per_language)
+            entries.extend(file_entries)
+            if limit is not None:
+                entries = _limit_judgment_pairs(entries, limit)
+                if len(entries) >= limit:
+                    break
+        pair_map: Dict[str, set] = defaultdict(set)
+        for entry in entries:
+            pair_map[str(entry["pair_id"])].add(str(entry.get("gold")))
+        for entry in entries:
+            entry["has_pair"] = len(pair_map[str(entry["pair_id"])]) > 1
+        loaded[dataset] = entries
+    return loaded
 
 
 def _get_reproducible_rubric_str(
@@ -407,6 +701,7 @@ def _build_task(
     benchmark: str,
     language_override: Optional[str] = None,
     seed_value: Optional[int] = None,
+    max_model_len: Optional[int] = None,
 ) -> Tuple[str, dict]:
     question = str(row.get("prompt", ""))
     chosen = str(row.get("chosen", ""))
@@ -422,27 +717,23 @@ def _build_task(
         expected = "A"
     src_lang = str(language_override or row.get("language", ""))
     tgt_lang = src_lang
-    if template:
-        if isinstance(template, dict):
-            template_type = _select_mr3_template_type(template, benchmark, row)
-            prompt = _render_mr3_prompt(
-                tokenizer,
-                template,
-                template_type,
-                question,
-                answer_a,
-                answer_b,
-                row.get("id"),
-                seed_value,
-            )
-        else:
-            prompt = _render_template_prompt(
-                template, question, answer_a, answer_b, src_lang, tgt_lang
-            )
-    else:
-        prompt = _render_default_prompt(
-            tokenizer, question, answer_a, answer_b, src_lang, tgt_lang
-        )
+    def _render(q: str, a: str, b: str) -> str:
+        if template:
+            if isinstance(template, dict):
+                template_type = _select_mr3_template_type(template, benchmark, row)
+                return _render_mr3_prompt(
+                    tokenizer,
+                    template,
+                    template_type,
+                    q,
+                    a,
+                    b,
+                    row.get("id"),
+                    seed_value,
+                )
+            return _render_template_prompt(template, q, a, b, src_lang, tgt_lang)
+        return _render_default_prompt(tokenizer, q, a, b, src_lang, tgt_lang)
+
     meta = {
         "benchmark": benchmark,
         "id": row.get("id"),
@@ -457,11 +748,105 @@ def _build_task(
         "expected_verdict": expected,
         "swapped": swap,
     }
+    prompt, question, answer_a, answer_b, prompt_len = _maybe_truncate_prompt(
+        _render, tokenizer, max_model_len, question, answer_a, answer_b, meta
+    )
+    meta["prompt"] = question
+    meta["answer_a"] = answer_a
+    meta["answer_b"] = answer_b
+    if prompt_len is not None:
+        meta["prompt_len"] = prompt_len
     global _PRINTED_TEST_PROMPT
     if not _PRINTED_TEST_PROMPT:
         print("[test] final_prompt:\n", prompt)
         _PRINTED_TEST_PROMPT = True
     return prompt, meta
+
+
+def _build_judgment_tasks(
+    entry: dict,
+    dataset: str,
+    template: Optional[Union[str, Dict[str, object]]],
+    tokenizer,
+    seed_value: Optional[int] = None,
+    max_model_len: Optional[int] = None,
+) -> List[Tuple[str, dict]]:
+    question = str(entry.get("question", ""))
+    answer_a = str(entry.get("answer_a", ""))
+    answer_b = str(entry.get("answer_b", ""))
+    src_lang = str(entry.get("language", ""))
+    tgt_lang = src_lang
+    custom_id = str(entry.get("custom_id", ""))
+    pair_id = str(entry.get("pair_id") or custom_id)
+    gold = str(entry.get("gold", ""))
+    has_pair = bool(entry.get("has_pair"))
+    if gold not in {"A", "B"}:
+        raise ValueError(f"Missing gold label in entry: {custom_id}")
+
+    results: List[Tuple[str, dict]] = []
+    def _render(q: str, a: str, b: str) -> str:
+        if template:
+            if isinstance(template, dict):
+                template_type = _select_mr3_template_type(
+                    template, JUDGMENT_BENCHMARK, {"subset": dataset}
+                )
+                return _render_mr3_prompt(
+                    tokenizer,
+                    template,
+                    template_type,
+                    q,
+                    a,
+                    b,
+                    custom_id,
+                    seed_value,
+                )
+            return _render_template_prompt(template, q, a, b, src_lang, tgt_lang)
+        return _render_default_prompt(tokenizer, q, a, b, src_lang, tgt_lang)
+
+    def _append(
+        current_a: str,
+        current_b: str,
+        expected: str,
+        swapped: bool,
+        suffix: Optional[str],
+    ) -> None:
+        entry_id = custom_id if suffix is None else f"{custom_id}-{suffix}"
+        meta = {
+            "benchmark": JUDGMENT_BENCHMARK,
+            "id": entry_id,
+            "pair_id": pair_id,
+            "language": dataset,
+            "sample_language": src_lang,
+            "group": entry.get("group"),
+            "prompt": question,
+            "answer_a": current_a,
+            "answer_b": current_b,
+            "expected_verdict": expected,
+            "swapped": swapped,
+            "gold": gold,
+        }
+        prompt, q_out, a_out, b_out, prompt_len = _maybe_truncate_prompt(
+            _render, tokenizer, max_model_len, question, current_a, current_b, meta
+        )
+        meta["prompt"] = q_out
+        meta["answer_a"] = a_out
+        meta["answer_b"] = b_out
+        if prompt_len is not None:
+            meta["prompt_len"] = prompt_len
+        results.append((prompt, meta))
+
+    if has_pair:
+        _append(answer_a, answer_b, gold, gold == "B", None)
+    else:
+        _append(answer_a, answer_b, gold, False, "orig")
+        swapped_expected = "B" if gold == "A" else "A"
+        _append(answer_b, answer_a, swapped_expected, True, "swap")
+
+    global _PRINTED_TEST_PROMPT
+    if not _PRINTED_TEST_PROMPT and results:
+        print("[test] final_prompt:\n", results[0][0])
+        _PRINTED_TEST_PROMPT = True
+    return results
 
 
 def _write_prompt_log(path: str, prompts: List[str]) -> None:
@@ -499,6 +884,29 @@ def _run_vllm(
         kwargs.pop("seed", None)
         llm = LLM(**kwargs)
     return llm, llm.get_tokenizer()
+
+
+def _get_vllm_max_model_len(llm) -> Optional[int]:
+    if llm is None:
+        return None
+    getter = getattr(llm, "get_model_config", None)
+    if callable(getter):
+        try:
+            config = getter()
+            max_len = getattr(config, "max_model_len", None)
+            if max_len is not None:
+                return int(max_len)
+        except Exception:
+            pass
+    engine = getattr(llm, "llm_engine", None) or getattr(llm, "_llm_engine", None)
+    if engine is None:
+        engine = getattr(llm, "engine", None) or getattr(llm, "_engine", None)
+    if engine is not None:
+        config = getattr(engine, "model_config", None) or getattr(engine, "config", None)
+        max_len = getattr(config, "max_model_len", None) if config is not None else None
+        if max_len is not None:
+            return int(max_len)
+    return None
 
 
 def _shutdown_vllm(llm) -> None:
@@ -640,29 +1048,38 @@ def _build_records(
         expected = payload.get("expected_verdict")
         correct = verdict == expected
         group_key = (payload.get("benchmark", ""), payload.get("language", ""))
-        raw_by_group[group_key].append(
-            {
-                "id": payload.get("id"),
-                "language": payload.get("language"),
-                "prompt": payload.get("prompt"),
-                "answer_a": payload.get("answer_a"),
-                "answer_b": payload.get("answer_b"),
-                "completion": completion,
-                "verdict": verdict,
-                "expected_verdict": expected,
-                "swapped": payload.get("swapped"),
-            }
-        )
-        parsed_by_group[group_key].append(
-            {
-                "id": payload.get("id"),
-                "language": payload.get("language"),
-                "verdict": verdict,
-                "expected_verdict": expected,
-                "correct": bool(correct),
-                "swapped": payload.get("swapped"),
-            }
-        )
+        raw_entry = {
+            "id": payload.get("id"),
+            "language": payload.get("language"),
+            "prompt": payload.get("prompt"),
+            "answer_a": payload.get("answer_a"),
+            "answer_b": payload.get("answer_b"),
+            "completion": completion,
+            "verdict": verdict,
+            "expected_verdict": expected,
+            "swapped": payload.get("swapped"),
+        }
+        parsed_entry = {
+            "id": payload.get("id"),
+            "language": payload.get("language"),
+            "verdict": verdict,
+            "expected_verdict": expected,
+            "correct": bool(correct),
+            "swapped": payload.get("swapped"),
+        }
+        if payload.get("pair_id") is not None:
+            raw_entry["pair_id"] = payload.get("pair_id")
+            parsed_entry["pair_id"] = payload.get("pair_id")
+        if payload.get("sample_language") is not None:
+            raw_entry["sample_language"] = payload.get("sample_language")
+            parsed_entry["sample_language"] = payload.get("sample_language")
+        if payload.get("group") is not None:
+            raw_entry["group"] = payload.get("group")
+            parsed_entry["group"] = payload.get("group")
+        if payload.get("gold") is not None:
+            raw_entry["gold"] = payload.get("gold")
+        raw_by_group[group_key].append(raw_entry)
+        parsed_by_group[group_key].append(parsed_entry)
     return raw_by_group, parsed_by_group
 
 
@@ -682,11 +1099,36 @@ def _load_jsonl(path: str) -> List[dict]:
     return rows
 
 
+def _limit_judgment_pairs(rows: List[dict], limit: Optional[int]) -> List[dict]:
+    if not limit:
+        return rows
+    pair_ids: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        pair_id = str(row.get("pair_id") or row.get("custom_id") or "")
+        if not pair_id or pair_id in seen:
+            continue
+        seen.add(pair_id)
+        pair_ids.append(pair_id)
+        if len(pair_ids) >= limit:
+            break
+    if not pair_ids:
+        return []
+    selected = set(pair_ids)
+    return [
+        row
+        for row in rows
+        if str(row.get("pair_id") or row.get("custom_id") or "") in selected
+    ]
+
+
 def _result_paths(output_dir: str, benchmark: str, lang: str) -> Tuple[str, str]:
     if benchmark == "MM-Eval":
         prefix = "mm_eval"
     elif benchmark == "multilingual-reward-bench":
         prefix = "mreward"
+    elif benchmark == JUDGMENT_BENCHMARK:
+        prefix = "judgment_requests"
     else:
         raise ValueError(f"Unknown benchmark: {benchmark}")
     raw_path = os.path.join(output_dir, f"{prefix}_{lang}_raw.jsonl")
@@ -704,16 +1146,19 @@ def _parsed_from_raw(raw_rows: List[dict]) -> Optional[List[dict]]:
             correct = verdict == expected
         if correct is None:
             return None
-        parsed.append(
-            {
-                "id": row.get("id"),
-                "language": row.get("language"),
-                "verdict": verdict,
-                "expected_verdict": expected,
-                "correct": bool(correct),
-                "swapped": row.get("swapped"),
-            }
-        )
+        entry = {
+            "id": row.get("id"),
+            "language": row.get("language"),
+            "verdict": verdict,
+            "expected_verdict": expected,
+            "correct": bool(correct),
+            "swapped": row.get("swapped"),
+        }
+        if row.get("pair_id") is not None:
+            entry["pair_id"] = row.get("pair_id")
+        if row.get("group") is not None:
+            entry["group"] = row.get("group")
+        parsed.append(entry)
     return parsed
 
 
@@ -802,6 +1247,61 @@ def _summarize_with_ci(
                 "high": ci[1],
                 "confidence": bootstrap_confidence,
             }
+    return summary
+
+
+def _summarize_bias_pairs(rows: List[dict]) -> Dict[str, object]:
+    by_pair: Dict[str, List[dict]] = defaultdict(list)
+    for row in rows:
+        pair_id = row.get("pair_id") or row.get("id")
+        if not pair_id:
+            continue
+        by_pair[str(pair_id)].append(row)
+
+    consistent_human_win = 0
+    consistent_machine_win = 0
+    total_pairs = 0
+    for pair_rows in by_pair.values():
+        if len(pair_rows) != 2:
+            continue
+        total_pairs += 1
+        if any(row.get("verdict") is None for row in pair_rows):
+            continue
+        correct_flags = [bool(row.get("correct")) for row in pair_rows]
+        if all(correct_flags):
+            consistent_human_win += 1
+        elif not any(correct_flags):
+            consistent_machine_win += 1
+
+    denom = consistent_human_win + consistent_machine_win
+    bias_severity = float(consistent_machine_win) / denom if denom else 0.0
+    return {
+        "total_pairs": total_pairs,
+        "consistent_human_win": consistent_human_win,
+        "consistent_machine_win": consistent_machine_win,
+        "bias_severity": bias_severity,
+    }
+
+
+def _summarize_bias(parsed: List[dict]) -> Dict[str, object]:
+    summary = _summarize_bias_pairs(parsed)
+    by_group: Dict[str, Dict[str, object]] = {}
+    by_language: Dict[str, Dict[str, object]] = {}
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    grouped_lang: Dict[str, List[dict]] = defaultdict(list)
+    for row in parsed:
+        group = row.get("group")
+        if group is not None:
+            grouped[str(group)].append(row)
+        lang = row.get("sample_language") or row.get("language")
+        if lang is not None:
+            grouped_lang[str(lang)].append(row)
+    for group, rows in grouped.items():
+        by_group[group] = _summarize_bias_pairs(rows)
+    for lang, rows in grouped_lang.items():
+        by_language[lang] = _summarize_bias_pairs(rows)
+    summary["by_group"] = by_group
+    summary["by_language"] = by_language
     return summary
 
 
@@ -925,6 +1425,164 @@ def _aggregate_seed_summaries(
                     "high": ci[1],
                     "confidence": bootstrap_confidence,
                 }
+
+    bias_names = sorted(
+        {
+            name
+            for summary in seed_summaries
+            for name in summary.get("bias_benchmarks", {}).keys()
+        }
+    )
+    if bias_names:
+        bias_out: Dict[str, object] = {}
+        for name in bias_names:
+            human_vals: List[float] = []
+            machine_vals: List[float] = []
+            severity_vals: List[float] = []
+            totals: List[int] = []
+            group_names: set[str] = set()
+            language_names: set[str] = set()
+            for summary in seed_summaries:
+                metrics = summary.get("bias_benchmarks", {}).get(name, {})
+                group_names.update(metrics.get("by_group", {}).keys())
+                language_names.update(metrics.get("by_language", {}).keys())
+            for summary in seed_summaries:
+                metrics = summary.get("bias_benchmarks", {}).get(name)
+                if metrics is None:
+                    continue
+                human_vals.append(float(metrics.get("consistent_human_win", 0)))
+                machine_vals.append(float(metrics.get("consistent_machine_win", 0)))
+                severity_vals.append(float(metrics.get("bias_severity", 0.0)))
+                totals.append(int(metrics.get("total_pairs", 0)))
+            if not human_vals:
+                continue
+            human_mean, human_std = eval_stats.mean_std(human_vals)
+            machine_mean, machine_std = eval_stats.mean_std(machine_vals)
+            severity_mean, severity_std = eval_stats.mean_std(severity_vals)
+            overall_entry = {
+                "total_pairs": totals[0] if totals else 0,
+                "consistent_human_win": {
+                    "mean": human_mean,
+                    "std": human_std,
+                    "formatted": eval_stats.format_mean_std(human_mean, human_std),
+                    "values": human_vals,
+                },
+                "consistent_machine_win": {
+                    "mean": machine_mean,
+                    "std": machine_std,
+                    "formatted": eval_stats.format_mean_std(machine_mean, machine_std),
+                    "values": machine_vals,
+                },
+                "bias_severity": {
+                    "mean": severity_mean,
+                    "std": severity_std,
+                    "formatted": eval_stats.format_mean_std(severity_mean, severity_std),
+                    "values": severity_vals,
+                },
+            }
+            by_group_out: Dict[str, object] = {}
+            for group in sorted(group_names):
+                group_human: List[float] = []
+                group_machine: List[float] = []
+                group_severity: List[float] = []
+                group_totals: List[int] = []
+                for summary in seed_summaries:
+                    metrics = summary.get("bias_benchmarks", {}).get(name, {})
+                    group_metrics = metrics.get("by_group", {}).get(group)
+                    if group_metrics is None:
+                        continue
+                    group_human.append(float(group_metrics.get("consistent_human_win", 0)))
+                    group_machine.append(float(group_metrics.get("consistent_machine_win", 0)))
+                    group_severity.append(float(group_metrics.get("bias_severity", 0.0)))
+                    group_totals.append(int(group_metrics.get("total_pairs", 0)))
+                if not group_human:
+                    continue
+                group_h_mean, group_h_std = eval_stats.mean_std(group_human)
+                group_m_mean, group_m_std = eval_stats.mean_std(group_machine)
+                group_s_mean, group_s_std = eval_stats.mean_std(group_severity)
+                by_group_out[group] = {
+                    "total_pairs": group_totals[0] if group_totals else 0,
+                    "consistent_human_win": {
+                        "mean": group_h_mean,
+                        "std": group_h_std,
+                        "formatted": eval_stats.format_mean_std(
+                            group_h_mean, group_h_std
+                        ),
+                        "values": group_human,
+                    },
+                    "consistent_machine_win": {
+                        "mean": group_m_mean,
+                        "std": group_m_std,
+                        "formatted": eval_stats.format_mean_std(
+                            group_m_mean, group_m_std
+                        ),
+                        "values": group_machine,
+                    },
+                    "bias_severity": {
+                        "mean": group_s_mean,
+                        "std": group_s_std,
+                        "formatted": eval_stats.format_mean_std(
+                            group_s_mean, group_s_std
+                        ),
+                        "values": group_severity,
+                    },
+                }
+            by_language_out: Dict[str, object] = {}
+            for lang in sorted(language_names):
+                lang_human: List[float] = []
+                lang_machine: List[float] = []
+                lang_severity: List[float] = []
+                lang_totals: List[int] = []
+                for summary in seed_summaries:
+                    metrics = summary.get("bias_benchmarks", {}).get(name, {})
+                    lang_metrics = metrics.get("by_language", {}).get(lang)
+                    if lang_metrics is None:
+                        continue
+                    lang_human.append(float(lang_metrics.get("consistent_human_win", 0)))
+                    lang_machine.append(
+                        float(lang_metrics.get("consistent_machine_win", 0))
+                    )
+                    lang_severity.append(float(lang_metrics.get("bias_severity", 0.0)))
+                    lang_totals.append(int(lang_metrics.get("total_pairs", 0)))
+                if not lang_human:
+                    continue
+                lang_h_mean, lang_h_std = eval_stats.mean_std(lang_human)
+                lang_m_mean, lang_m_std = eval_stats.mean_std(lang_machine)
+                lang_s_mean, lang_s_std = eval_stats.mean_std(lang_severity)
+                by_language_out[lang] = {
+                    "total_pairs": lang_totals[0] if lang_totals else 0,
+                    "consistent_human_win": {
+                        "mean": lang_h_mean,
+                        "std": lang_h_std,
+                        "formatted": eval_stats.format_mean_std(
+                            lang_h_mean, lang_h_std
+                        ),
+                        "values": lang_human,
+                    },
+                    "consistent_machine_win": {
+                        "mean": lang_m_mean,
+                        "std": lang_m_std,
+                        "formatted": eval_stats.format_mean_std(
+                            lang_m_mean, lang_m_std
+                        ),
+                        "values": lang_machine,
+                    },
+                    "bias_severity": {
+                        "mean": lang_s_mean,
+                        "std": lang_s_std,
+                        "formatted": eval_stats.format_mean_std(
+                            lang_s_mean, lang_s_std
+                        ),
+                        "values": lang_severity,
+                    },
+                }
+            bias_out[name] = {
+                "overall": overall_entry,
+                "by_group": by_group_out,
+                "by_language": by_language_out,
+            }
+        if bias_out:
+            aggregate["bias_benchmarks"] = bias_out
     return aggregate
 
 
@@ -937,6 +1595,8 @@ def _evaluate_seed(
     mm_grouped: Optional[Dict[str, List[dict]]],
     mm_selected: List[str],
     mreward_pairs: List[Tuple[str, str]],
+    bias_grouped: Optional[Dict[str, List[dict]]],
+    bias_selected: List[str],
     expected_groups: List[Tuple[str, str]],
     tokenizer: Optional[object],
     generate_fn: Optional[
@@ -984,6 +1644,7 @@ def _evaluate_seed(
                         "MM-Eval",
                         language_override=lang,
                         seed_value=seed,
+                        max_model_len=args.max_model_len,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
@@ -1010,9 +1671,29 @@ def _evaluate_seed(
                         "multilingual-reward-bench",
                         language_override=display_lang,
                         seed_value=seed,
+                        max_model_len=args.max_model_len,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
+
+        if bias_grouped is not None:
+            for dataset in bias_selected:
+                if (JUDGMENT_BENCHMARK, dataset) not in missing_set:
+                    continue
+                rows = bias_grouped[dataset]
+                if args.limit:
+                    rows = _limit_judgment_pairs(rows, args.limit)
+                for entry in rows:
+                    for prompt, meta in _build_judgment_tasks(
+                        entry,
+                        dataset,
+                        template,
+                        tokenizer,
+                        seed_value=seed,
+                        max_model_len=args.max_model_len,
+                    ):
+                        prompts.append(prompt)
+                        tasks.append(meta)
 
         if args.debug_vllm_prompts:
             prompt_log = os.path.join(seed_output_dir, "vllm_prompts.jsonl")
@@ -1043,7 +1724,7 @@ def _evaluate_seed(
     overall_flags: List[float] = []
     benchmark_flags: Dict[str, List[float]] = {"MM-Eval": [], "multilingual-reward-bench": []}
 
-    if args.benchmark in {"MM-Eval", "both"}:
+    if args.benchmark in {"MM-Eval", "both", "all"}:
         benchmark_rows = {}
         mm_total = 0
         mm_correct = 0
@@ -1091,7 +1772,7 @@ def _evaluate_seed(
             benchmark_rows["_overall"] = overall
         summary["benchmarks"]["MM-Eval"] = benchmark_rows
 
-    if args.benchmark in {"multilingual-reward-bench", "both"}:
+    if args.benchmark in {"multilingual-reward-bench", "both", "all"}:
         benchmark_rows = {}
         mr_total = 0
         mr_correct = 0
@@ -1143,6 +1824,25 @@ def _evaluate_seed(
                     }
             benchmark_rows["_overall"] = overall
         summary["benchmarks"]["multilingual-reward-bench"] = benchmark_rows
+
+    if args.benchmark in {JUDGMENT_BENCHMARK, "all"}:
+        bias_rows = {}
+        for dataset in bias_selected:
+            parsed = parsed_by_group.get((JUDGMENT_BENCHMARK, dataset))
+            if not parsed:
+                continue
+            raw = raw_by_group.get((JUDGMENT_BENCHMARK, dataset), [])
+            if write_outputs and (JUDGMENT_BENCHMARK, dataset) in generated_groups:
+                raw_path = os.path.join(
+                    seed_output_dir, f"judgment_requests_{dataset}_raw.jsonl"
+                )
+                parsed_path = os.path.join(
+                    seed_output_dir, f"judgment_requests_{dataset}_parsed.jsonl"
+                )
+                _save_jsonl(raw_path, raw)
+                _save_jsonl(parsed_path, parsed)
+            bias_rows[dataset] = _summarize_bias(parsed)
+        summary["bias_benchmarks"] = bias_rows
 
     overall_total = len(overall_flags)
     overall_correct = int(sum(overall_flags))
@@ -1196,7 +1896,7 @@ def main() -> None:
     parser.add_argument(
         "--benchmark",
         default="both",
-        choices=["MM-Eval", "multilingual-reward-bench", "both"],
+        choices=["MM-Eval", "multilingual-reward-bench", JUDGMENT_BENCHMARK, "both", "all"],
     )
     parser.add_argument(
         "--languages",
@@ -1214,6 +1914,17 @@ def main() -> None:
     parser.add_argument("--verdict-pattern-b", default=None)
     parser.add_argument("--output_dir", default="results")
     parser.add_argument(
+        "--judgment-request-dir",
+        default=DEFAULT_JUDGMENT_REQUEST_DIR,
+        help="Directory containing judgment request jsonl datasets.",
+    )
+    parser.add_argument(
+        "--judgment-datasets",
+        nargs="+",
+        default=None,
+        help="Optional subset of judgment request datasets to evaluate.",
+    )
+    parser.add_argument(
         "--use_vllm",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1228,6 +1939,12 @@ def main() -> None:
     parser.add_argument("--max_model_len", type=int, default=None)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--limit-per-language",
+        type=int,
+        default=None,
+        help="Limit number of judgment request pairs per language file.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--num-seeds", type=int, default=3)
@@ -1272,7 +1989,7 @@ def main() -> None:
     mm_selected: List[str] = []
     mreward_pairs: List[Tuple[str, str]] = []
     expected_groups: List[Tuple[str, str]] = []
-    if args.benchmark in {"MM-Eval", "both"}:
+    if args.benchmark in {"MM-Eval", "both", "all"}:
         mm_dir = os.path.join("data", "eval_data", "MM-Eval")
         dataset = _load_mm_eval(mm_dir)
         grouped = _group_by_language(dataset)
@@ -1285,7 +2002,7 @@ def main() -> None:
         mm_grouped = grouped
         expected_groups.extend([("MM-Eval", lang) for lang in mm_selected])
 
-    if args.benchmark in {"multilingual-reward-bench", "both"}:
+    if args.benchmark in {"multilingual-reward-bench", "both", "all"}:
         mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
         available = _available_mreward_languages(mreward_dir)
         if not available:
@@ -1298,6 +2015,19 @@ def main() -> None:
         mreward_pairs = [(lang, CONFIG_TO_SHORT.get(lang, lang)) for lang in selected]
         expected_groups.extend(
             [("multilingual-reward-bench", display) for _, display in mreward_pairs]
+        )
+
+    bias_grouped = None
+    bias_selected: List[str] = []
+    if args.benchmark in {JUDGMENT_BENCHMARK, "all"}:
+        bias_grouped = _load_judgment_requests(
+            args.judgment_request_dir,
+            args.judgment_datasets,
+            limit_per_language=args.limit_per_language,
+        )
+        bias_selected = sorted(bias_grouped.keys())
+        expected_groups.extend(
+            [(JUDGMENT_BENCHMARK, dataset) for dataset in bias_selected]
         )
 
     if not expected_groups:
@@ -1330,6 +2060,7 @@ def main() -> None:
                 "MM-Eval",
                 language_override=lang,
                 seed_value=seeds[0],
+                max_model_len=args.max_model_len,
             )
         elif mreward_pairs:
             mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
@@ -1346,7 +2077,23 @@ def main() -> None:
                 "multilingual-reward-bench",
                 language_override=display_lang,
                 seed_value=seeds[0],
+                max_model_len=args.max_model_len,
             )
+        elif bias_grouped is not None and bias_selected:
+            dataset = bias_selected[0]
+            entries = bias_grouped[dataset]
+            if not entries:
+                raise ValueError("Judgment requests have no rows to build a debug prompt.")
+            prompts = _build_judgment_tasks(
+                entries[0],
+                dataset,
+                template,
+                tokenizer,
+                seed_value=seeds[0],
+                max_model_len=args.max_model_len,
+            )
+            print(prompts[0][0])
+            return
         else:
             raise ValueError("No datasets loaded to build a debug prompt.")
         print(prompt)
@@ -1377,6 +2124,11 @@ def main() -> None:
                 args.trust_remote_code,
                 seed=seeds[0],
             )
+            effective_len = _get_vllm_max_model_len(llm_handle)
+            if effective_len is not None and (
+                args.max_model_len is None or effective_len < args.max_model_len
+            ):
+                args.max_model_len = int(effective_len)
 
             def _generate(
                 prompts: List[str],
@@ -1439,6 +2191,8 @@ def main() -> None:
             mm_grouped,
             mm_selected,
             mreward_pairs,
+            bias_grouped,
+            bias_selected,
             expected_groups,
             tokenizer,
             generate_fn,
@@ -1497,6 +2251,97 @@ def main() -> None:
             print(
                 f"{bench_name} accuracy mean {ci['confidence']:.0%} CI: [{ci['low']:.4f}, {ci['high']:.4f}]"
             )
+
+    bias_benchmarks = aggregate.get("bias_benchmarks", {})
+    if bias_benchmarks:
+        bias_rows: List[List[str]] = []
+        bias_language_rows: List[List[str]] = []
+        for name, stats in bias_benchmarks.items():
+            overall = stats.get("overall", {})
+            total_pairs = int(overall.get("total_pairs", 0))
+            human = overall.get("consistent_human_win", {}).get(
+                "formatted", "0.0000 ± 0.0000"
+            )
+            machine = overall.get("consistent_machine_win", {}).get(
+                "formatted", "0.0000 ± 0.0000"
+            )
+            severity = overall.get("bias_severity", {}).get(
+                "formatted", "0.0000 ± 0.0000"
+            )
+            bias_rows.append(
+                [
+                    name,
+                    "_overall",
+                    str(total_pairs),
+                    str(human),
+                    str(machine),
+                    str(severity),
+                ]
+            )
+            for group_name, group_stats in stats.get("by_group", {}).items():
+                total_pairs = int(group_stats.get("total_pairs", 0))
+                human = group_stats.get("consistent_human_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                machine = group_stats.get("consistent_machine_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                severity = group_stats.get("bias_severity", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                bias_rows.append(
+                    [
+                        name,
+                        str(group_name),
+                        str(total_pairs),
+                        str(human),
+                    str(machine),
+                    str(severity),
+                ]
+            )
+            for lang_name in sorted(stats.get("by_language", {}).keys()):
+                lang_stats = stats.get("by_language", {}).get(lang_name, {})
+                total_pairs = int(lang_stats.get("total_pairs", 0))
+                human = lang_stats.get("consistent_human_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                machine = lang_stats.get("consistent_machine_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                severity = lang_stats.get("bias_severity", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                bias_language_rows.append(
+                    [
+                        name,
+                        str(lang_name),
+                        str(total_pairs),
+                        str(human),
+                        str(machine),
+                        str(severity),
+                    ]
+                )
+        headers = [
+            "Benchmark",
+            "Group",
+            "Total Pairs",
+            "Consistent Human",
+            "Consistent Machine",
+            "Bias Severity",
+        ]
+        print("")
+        print(_format_table(bias_rows, headers))
+        if bias_language_rows:
+            language_headers = [
+                "Benchmark",
+                "Language",
+                "Total Pairs",
+                "Consistent Human",
+                "Consistent Machine",
+                "Bias Severity",
+            ]
+            print("")
+            print(_format_table(bias_language_rows, language_headers))
 
     summary_path = os.path.join(args.output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as handle:

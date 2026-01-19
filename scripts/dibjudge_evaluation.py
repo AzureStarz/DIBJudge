@@ -20,7 +20,11 @@ if __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from dibjudge.data import _find_response_span
-from dibjudge.modeling import BranchMLP, DIBJudgeModel, LatentHead, last_token_pool
+from dibjudge.modeling import (
+    DIBJudgeModel,
+    LatentHead,
+    LatentResampler,
+)
 from dibjudge.vq import VectorQuantizerEMA
 import vanilla_evaluation as ve
 
@@ -263,67 +267,49 @@ class DIBJudgePromptBundle(torch.nn.Module):
         if enc_hidden is None:
             raise ValueError("Unable to resolve encoder hidden size.")
 
-        task_vq_to_lm_weight = state.get("task_vq_to_lm.weight")
-        if task_vq_to_lm_weight is None:
-            raise ValueError("Checkpoint missing task_vq_to_lm weights.")
-        z_dim = task_vq_to_lm_weight.shape[1]
-        lm_hidden = task_vq_to_lm_weight.shape[0]
-        prompt_out = state["task_mlp.proj.weight"].shape[0]
-        if prompt_out % z_dim != 0:
-            raise ValueError("Task prompt projection shape is incompatible with latent dim.")
-        prompt_len = prompt_out // z_dim
-        layers, hidden_dim, _first_idx, dropout = _infer_branch_mlp_config(state, "task_mlp.")
-        if hidden_dim <= 0:
-            hidden_dim = 2 * enc_hidden
+        resampler_latents = state.get("task_resampler.latents")
+        if resampler_latents is None:
+            raise ValueError("Checkpoint missing task_resampler.latents.")
+        prompt_len, latent_dim = resampler_latents.shape
+        proj_weight = state.get("task_latent_to_lm.weight")
+        if proj_weight is not None:
+            lm_hidden = proj_weight.shape[0]
+            if proj_weight.shape[1] != latent_dim:
+                raise ValueError("task_latent_to_lm input dim does not match resampler latents.")
+        else:
+            lm_hidden = latent_dim
         norm_type = "rms" if bool(self.config.get("use_rms_norm", False)) else "layernorm"
         norm_eps = float(self.config.get("rms_norm_eps", 1e-6))
         use_swiglu = bool(self.config.get("use_swiglu", False))
-        self.task_mlp = BranchMLP(
-            enc_hidden,
-            z_dim,
-            prompt_len=prompt_len,
-            hidden_dim=hidden_dim,
-            layers=layers,
-            dropout=dropout,
+        self.task_resampler = LatentResampler(
+            input_dim=enc_hidden,
+            latent_dim=latent_dim,
+            num_latents=prompt_len,
+            num_heads=int(self.config.get("task_resampler_heads", 8)),
+            num_layers=int(self.config.get("task_resampler_layers", 2)),
+            mlp_ratio=float(self.config.get("task_resampler_mlp_ratio", 4.0)),
+            dropout=float(self.config.get("task_resampler_dropout", 0.1)),
             norm_type=norm_type,
             norm_eps=norm_eps,
             use_swiglu=use_swiglu,
+            attn_implementation=attn_implementation,
         )
-        codebook = state.get("vq_task.codebook")
-        if codebook is None:
-            raise ValueError("Checkpoint missing vq_task.codebook.")
-        if codebook.dim() == 3:
-            num_codebooks, num_codes, sub_dim = codebook.shape
-            vq_dim = int(num_codebooks * sub_dim)
-            inferred_num_codebooks = int(num_codebooks)
-        else:
-            num_codes, vq_dim = codebook.shape
-            inferred_num_codebooks = 1
-        if vq_dim != z_dim:
-            raise ValueError("VQ codebook dim does not match task_vq_to_lm input.")
-        vq_num_codebooks = int(self.config.get("vq_num_codebooks", inferred_num_codebooks))
-        if vq_num_codebooks != inferred_num_codebooks:
-            vq_num_codebooks = inferred_num_codebooks
-        vq_commitment = float(self.config.get("vq_commitment_gamma", 0.05))
-        vq_decay = float(self.config.get("vq_ema_decay", 0.99))
-        vq_use_ema = bool(self.config.get("vq_use_ema", True))
-        vq_codebook_trainable = bool(self.config.get("vq_codebook_trainable", False))
-        vq_dead_code = float(self.config.get("vq_dead_code_threshold", 0.1))
-        vq_reset_dead = bool(self.config.get("vq_reset_dead_codes", True))
-        vq_normalize = bool(self.config.get("vq_normalize_inputs", True))
         self.vq_task = VectorQuantizerEMA(
-            num_codes=int(num_codes),
-            dim=int(vq_dim),
-            num_codebooks=vq_num_codebooks,
-            commitment_cost=vq_commitment,
-            decay=vq_decay,
-            use_ema=vq_use_ema,
-            codebook_trainable=vq_codebook_trainable,
-            dead_code_threshold=vq_dead_code,
-            reset_dead_codes=vq_reset_dead,
-            normalize_inputs=vq_normalize,
+            num_codes=int(self.config.get("task_codebook_size", 1024)),
+            dim=latent_dim,
+            num_codebooks=int(self.config.get("vq_num_codebooks", 4)),
+            commitment_cost=float(self.config.get("vq_commitment_gamma", 0.05)),
+            decay=float(self.config.get("vq_ema_decay", 0.99)),
+            use_ema=bool(self.config.get("vq_use_ema", True)),
+            codebook_trainable=bool(self.config.get("vq_codebook_trainable", False)),
+            dead_code_threshold=float(self.config.get("vq_dead_code_threshold", 0.1)),
+            reset_dead_codes=bool(self.config.get("vq_reset_dead_codes", True)),
+            normalize_inputs=bool(self.config.get("vq_normalize_inputs", True)),
         )
-        self.task_vq_to_lm = torch.nn.Linear(z_dim, lm_hidden)
+        if proj_weight is None:
+            self.task_latent_to_lm = torch.nn.Identity()
+        else:
+            self.task_latent_to_lm = torch.nn.Linear(latent_dim, lm_hidden)
         compact_state = {
             k.replace("compact_head.", ""): v
             for k, v in state.items()
@@ -360,25 +346,23 @@ class DIBJudgePromptBundle(torch.nn.Module):
             for k, v in state.items()
             if k.startswith("shared_encoder.")
         }
-        task_state = {
-            k.replace("task_mlp.", ""): v
-            for k, v in state.items()
-            if k.startswith("task_mlp.")
-        }
-        vq_state = {
-            k.replace("vq_task.", ""): v
-            for k, v in state.items()
-            if k.startswith("vq_task.")
-        }
         proj_state = {
-            k.replace("task_vq_to_lm.", ""): v
+            k.replace("task_latent_to_lm.", ""): v
             for k, v in state.items()
-            if k.startswith("task_vq_to_lm.")
+            if k.startswith("task_latent_to_lm.")
         }
+        resampler_state = {
+            k.replace("task_resampler.", ""): v
+            for k, v in state.items()
+            if k.startswith("task_resampler.")
+        }
+        vq_state = {k.replace("vq_task.", ""): v for k, v in state.items() if k.startswith("vq_task.")}
         self.shared_encoder.load_state_dict(shared_state, strict=False)
-        self.task_mlp.load_state_dict(task_state, strict=False)
-        self.vq_task.load_state_dict(vq_state, strict=False)
-        self.task_vq_to_lm.load_state_dict(proj_state, strict=False)
+        self.task_resampler.load_state_dict(resampler_state, strict=False)
+        if vq_state:
+            self.vq_task.load_state_dict(vq_state, strict=False)
+        if proj_state:
+            self.task_latent_to_lm.load_state_dict(proj_state, strict=False)
         if self.compact_head is not None:
             self.compact_head.load_state_dict(compact_state, strict=False)
         self.compact_mu_id = None
@@ -400,10 +384,8 @@ class DIBJudgePromptBundle(torch.nn.Module):
             return_dict=True,
         )
         hidden = outputs.last_hidden_state
-        pooled = last_token_pool(hidden, attention_mask)
-        task_tokens = self.task_mlp(pooled)
-        z_quant = self.vq_task(task_tokens).quantized
-        z_prompt = self.task_vq_to_lm(z_quant)
+        task_latents = self.task_resampler(hidden, attention_mask)
+        z_prompt = self.task_latent_to_lm(self.vq_task(task_latents).quantized)
         compact_logits = None
         if self.compact_head is not None:
             compact_logits = self.compact_head(hidden).squeeze(-1)
@@ -754,6 +736,8 @@ def _prepare_seed_inputs(
     mm_grouped: Optional[Dict[str, List[dict]]],
     mm_selected: List[str],
     mreward_pairs: List[Tuple[str, str]],
+    bias_grouped: Optional[Dict[str, List[dict]]],
+    bias_selected: List[str],
     expected_groups: List[Tuple[str, str]],
     use_z_soft_prompt: bool,
     use_compactor: bool,
@@ -797,6 +781,7 @@ def _prepare_seed_inputs(
                         "MM-Eval",
                         language_override=lang,
                         seed_value=seed,
+                        max_model_len=args.max_model_len,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
@@ -821,9 +806,29 @@ def _prepare_seed_inputs(
                         "multilingual-reward-bench",
                         language_override=display_lang,
                         seed_value=seed,
+                        max_model_len=args.max_model_len,
                     )
                     prompts.append(prompt)
                     tasks.append(meta)
+
+        if bias_grouped is not None:
+            for dataset in bias_selected:
+                if (ve.JUDGMENT_BENCHMARK, dataset) not in missing_groups:
+                    continue
+                rows = bias_grouped[dataset]
+                if args.limit:
+                    rows = ve._limit_judgment_pairs(rows, args.limit)
+                for entry in rows:
+                    for prompt, meta in ve._build_judgment_tasks(
+                        entry,
+                        dataset,
+                        template,
+                        lm_tokenizer,
+                        seed_value=seed,
+                        max_model_len=args.max_model_len,
+                    ):
+                        prompts.append(prompt)
+                        tasks.append(meta)
 
         if args.enable_prompt_embeds:
             dtype = embed_resources["dtype"]
@@ -891,6 +896,7 @@ def _evaluate_seed(
     mm_grouped: Optional[Dict[str, List[dict]]],
     mm_selected: List[str],
     mreward_pairs: List[Tuple[str, str]],
+    bias_selected: List[str],
     expected_groups: List[Tuple[str, str]],
     use_z_soft_prompt: bool,
     use_compactor: bool,
@@ -973,29 +979,37 @@ def _evaluate_seed(
             expected = payload.get("expected_verdict")
             correct = verdict == expected
             group_key = (payload.get("benchmark", ""), payload.get("language", ""))
-            new_raw[group_key].append(
-                {
-                    "id": payload.get("id"),
-                    "language": payload.get("language"),
-                    "prompt": payload.get("prompt"),
-                    "answer_a": payload.get("answer_a"),
-                    "answer_b": payload.get("answer_b"),
-                    "completion": completion,
-                    "verdict": verdict,
-                    "expected_verdict": expected,
-                    "swapped": payload.get("swapped"),
-                }
-            )
-            new_parsed[group_key].append(
-                {
-                    "id": payload.get("id"),
-                    "language": payload.get("language"),
-                    "verdict": verdict,
-                    "expected_verdict": expected,
-                    "correct": bool(correct),
-                    "swapped": payload.get("swapped"),
-                }
-            )
+            raw_entry = {
+                "id": payload.get("id"),
+                "language": payload.get("language"),
+                "prompt": payload.get("prompt"),
+                "answer_a": payload.get("answer_a"),
+                "answer_b": payload.get("answer_b"),
+                "completion": completion,
+                "verdict": verdict,
+                "expected_verdict": expected,
+                "swapped": payload.get("swapped"),
+            }
+            parsed_entry = {
+                "id": payload.get("id"),
+                "language": payload.get("language"),
+                "verdict": verdict,
+                "expected_verdict": expected,
+                "correct": bool(correct),
+                "swapped": payload.get("swapped"),
+            }
+            if payload.get("pair_id") is not None:
+                raw_entry["pair_id"] = payload.get("pair_id")
+                parsed_entry["pair_id"] = payload.get("pair_id")
+            if payload.get("sample_language") is not None:
+                raw_entry["sample_language"] = payload.get("sample_language")
+            if payload.get("group") is not None:
+                raw_entry["group"] = payload.get("group")
+                parsed_entry["group"] = payload.get("group")
+            if payload.get("gold") is not None:
+                raw_entry["gold"] = payload.get("gold")
+            new_raw[group_key].append(raw_entry)
+            new_parsed[group_key].append(parsed_entry)
 
         raw_by_group.update(new_raw)
         parsed_by_group.update(new_parsed)
@@ -1008,7 +1022,7 @@ def _evaluate_seed(
     overall_flags: List[float] = []
     benchmark_flags: Dict[str, List[float]] = {"MM-Eval": [], "multilingual-reward-bench": []}
 
-    if args.benchmark in {"MM-Eval", "both"}:
+    if args.benchmark in {"MM-Eval", "both", "all"}:
         benchmark_rows = {}
         mm_total = 0
         mm_correct = 0
@@ -1056,7 +1070,7 @@ def _evaluate_seed(
             benchmark_rows["_overall"] = overall
         summary["benchmarks"]["MM-Eval"] = benchmark_rows
 
-    if args.benchmark in {"multilingual-reward-bench", "both"}:
+    if args.benchmark in {"multilingual-reward-bench", "both", "all"}:
         benchmark_rows = {}
         mr_total = 0
         mr_correct = 0
@@ -1108,6 +1122,25 @@ def _evaluate_seed(
                     }
             benchmark_rows["_overall"] = overall
         summary["benchmarks"]["multilingual-reward-bench"] = benchmark_rows
+
+    if args.benchmark in {ve.JUDGMENT_BENCHMARK, "all"}:
+        bias_rows = {}
+        for dataset in bias_selected:
+            parsed = parsed_by_group.get((ve.JUDGMENT_BENCHMARK, dataset))
+            if not parsed:
+                continue
+            raw = raw_by_group.get((ve.JUDGMENT_BENCHMARK, dataset), [])
+            if write_outputs and (ve.JUDGMENT_BENCHMARK, dataset) in generated_groups:
+                raw_path = os.path.join(
+                    seed_output_dir, f"judgment_requests_{dataset}_raw.jsonl"
+                )
+                parsed_path = os.path.join(
+                    seed_output_dir, f"judgment_requests_{dataset}_parsed.jsonl"
+                )
+                ve._save_jsonl(raw_path, raw)
+                ve._save_jsonl(parsed_path, parsed)
+            bias_rows[dataset] = ve._summarize_bias(parsed)
+        summary["bias_benchmarks"] = bias_rows
 
     overall_total = len(overall_flags)
     overall_correct = int(sum(overall_flags))
@@ -1163,7 +1196,13 @@ def main() -> None:
     parser.add_argument(
         "--benchmark",
         default="both",
-        choices=["MM-Eval", "multilingual-reward-bench", "both"],
+        choices=[
+            "MM-Eval",
+            "multilingual-reward-bench",
+            ve.JUDGMENT_BENCHMARK,
+            "both",
+            "all",
+        ],
     )
     parser.add_argument(
         "--languages",
@@ -1180,6 +1219,17 @@ def main() -> None:
     parser.add_argument("--verdict-pattern-a", default=None)
     parser.add_argument("--verdict-pattern-b", default=None)
     parser.add_argument("--output_dir", default="results")
+    parser.add_argument(
+        "--judgment-request-dir",
+        default=ve.DEFAULT_JUDGMENT_REQUEST_DIR,
+        help="Directory containing judgment request jsonl datasets.",
+    )
+    parser.add_argument(
+        "--judgment-datasets",
+        nargs="+",
+        default=None,
+        help="Optional subset of judgment request datasets to evaluate.",
+    )
     parser.add_argument(
         "--use_vllm",
         action=argparse.BooleanOptionalAction,
@@ -1201,6 +1251,12 @@ def main() -> None:
     parser.add_argument("--max_model_len", type=int, default=None)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--limit-per-language",
+        type=int,
+        default=None,
+        help="Limit number of judgment request pairs per language file.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--num-seeds", type=int, default=3)
@@ -1281,7 +1337,7 @@ def main() -> None:
     mm_selected: List[str] = []
     mreward_pairs: List[Tuple[str, str]] = []
     expected_groups: List[Tuple[str, str]] = []
-    if args.benchmark in {"MM-Eval", "both"}:
+    if args.benchmark in {"MM-Eval", "both", "all"}:
         mm_dir = os.path.join("data", "eval_data", "MM-Eval")
         dataset = ve._load_mm_eval(mm_dir)
         grouped = ve._group_by_language(dataset)
@@ -1294,7 +1350,7 @@ def main() -> None:
         mm_grouped = grouped
         expected_groups.extend([("MM-Eval", lang) for lang in mm_selected])
 
-    if args.benchmark in {"multilingual-reward-bench", "both"}:
+    if args.benchmark in {"multilingual-reward-bench", "both", "all"}:
         mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
         available = ve._available_mreward_languages(mreward_dir)
         if not available:
@@ -1309,6 +1365,19 @@ def main() -> None:
         ]
         expected_groups.extend(
             [("multilingual-reward-bench", display) for _, display in mreward_pairs]
+        )
+
+    bias_grouped = None
+    bias_selected: List[str] = []
+    if args.benchmark in {ve.JUDGMENT_BENCHMARK, "all"}:
+        bias_grouped = ve._load_judgment_requests(
+            args.judgment_request_dir,
+            args.judgment_datasets,
+            limit_per_language=args.limit_per_language,
+        )
+        bias_selected = sorted(bias_grouped.keys())
+        expected_groups.extend(
+            [(ve.JUDGMENT_BENCHMARK, dataset) for dataset in bias_selected]
         )
 
     if not expected_groups:
@@ -1337,6 +1406,7 @@ def main() -> None:
                 "MM-Eval",
                 language_override=lang,
                 seed_value=seeds[0],
+                max_model_len=args.max_model_len,
             )
         elif mreward_pairs:
             mreward_dir = os.path.join("data", "eval_data", "multilingual-reward-bench")
@@ -1353,7 +1423,23 @@ def main() -> None:
                 "multilingual-reward-bench",
                 language_override=display_lang,
                 seed_value=seeds[0],
+                max_model_len=args.max_model_len,
             )
+        elif bias_grouped is not None and bias_selected:
+            dataset = bias_selected[0]
+            entries = bias_grouped[dataset]
+            if not entries:
+                raise ValueError("Judgment requests have no rows to build a debug prompt.")
+            prompts = ve._build_judgment_tasks(
+                entries[0],
+                dataset,
+                template,
+                lm_tokenizer,
+                seed_value=seeds[0],
+                max_model_len=args.max_model_len,
+            )
+            print(prompts[0][0])
+            return
         else:
             raise ValueError("No datasets loaded to build a debug prompt.")
         print(prompt)
@@ -1423,6 +1509,8 @@ def main() -> None:
             mm_grouped,
             mm_selected,
             mreward_pairs,
+            bias_grouped,
+            bias_selected,
             expected_groups,
             use_z_soft_prompt,
             use_compactor,
@@ -1455,6 +1543,11 @@ def main() -> None:
             seed=seeds[0],
             enable_prompt_embeds=args.enable_prompt_embeds,
         )
+        effective_len = ve._get_vllm_max_model_len(llm_handle)
+        if effective_len is not None and (
+            args.max_model_len is None or effective_len < args.max_model_len
+        ):
+            args.max_model_len = int(effective_len)
 
     seed_summaries: List[dict] = []
     for seed in seeds:
@@ -1468,6 +1561,7 @@ def main() -> None:
             mm_grouped,
             mm_selected,
             mreward_pairs,
+            bias_selected,
             expected_groups,
             use_z_soft_prompt,
             use_compactor,
@@ -1528,6 +1622,97 @@ def main() -> None:
             print(
                 f"{bench_name} accuracy mean {ci['confidence']:.0%} CI: [{ci['low']:.4f}, {ci['high']:.4f}]"
             )
+
+    bias_benchmarks = aggregate.get("bias_benchmarks", {})
+    if bias_benchmarks:
+        bias_rows: List[List[str]] = []
+        bias_language_rows: List[List[str]] = []
+        for name, stats in bias_benchmarks.items():
+            overall = stats.get("overall", {})
+            total_pairs = int(overall.get("total_pairs", 0))
+            human = overall.get("consistent_human_win", {}).get(
+                "formatted", "0.0000 ± 0.0000"
+            )
+            machine = overall.get("consistent_machine_win", {}).get(
+                "formatted", "0.0000 ± 0.0000"
+            )
+            severity = overall.get("bias_severity", {}).get(
+                "formatted", "0.0000 ± 0.0000"
+            )
+            bias_rows.append(
+                [
+                    name,
+                    "_overall",
+                    str(total_pairs),
+                    str(human),
+                    str(machine),
+                    str(severity),
+                ]
+            )
+            for group_name, group_stats in stats.get("by_group", {}).items():
+                total_pairs = int(group_stats.get("total_pairs", 0))
+                human = group_stats.get("consistent_human_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                machine = group_stats.get("consistent_machine_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                severity = group_stats.get("bias_severity", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                bias_rows.append(
+                    [
+                        name,
+                        str(group_name),
+                        str(total_pairs),
+                        str(human),
+                    str(machine),
+                    str(severity),
+                ]
+            )
+            for lang_name in sorted(stats.get("by_language", {}).keys()):
+                lang_stats = stats.get("by_language", {}).get(lang_name, {})
+                total_pairs = int(lang_stats.get("total_pairs", 0))
+                human = lang_stats.get("consistent_human_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                machine = lang_stats.get("consistent_machine_win", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                severity = lang_stats.get("bias_severity", {}).get(
+                    "formatted", "0.0000 ± 0.0000"
+                )
+                bias_language_rows.append(
+                    [
+                        name,
+                        str(lang_name),
+                        str(total_pairs),
+                        str(human),
+                        str(machine),
+                        str(severity),
+                    ]
+                )
+        headers = [
+            "Benchmark",
+            "Group",
+            "Total Pairs",
+            "Consistent Human",
+            "Consistent Machine",
+            "Bias Severity",
+        ]
+        print("")
+        print(ve._format_table(bias_rows, headers))
+        if bias_language_rows:
+            language_headers = [
+                "Benchmark",
+                "Language",
+                "Total Pairs",
+                "Consistent Human",
+                "Consistent Machine",
+                "Bias Severity",
+            ]
+            print("")
+            print(ve._format_table(bias_language_rows, language_headers))
 
     summary_path = os.path.join(args.output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as handle:
