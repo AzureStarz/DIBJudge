@@ -23,7 +23,7 @@ from dibjudge.data import _find_response_span
 from dibjudge.modeling import (
     DIBJudgeModel,
     LatentHead,
-    LatentResampler,
+    TokenMLP,
 )
 from dibjudge.vq import VectorQuantizerEMA
 import vanilla_evaluation as ve
@@ -267,32 +267,32 @@ class DIBJudgePromptBundle(torch.nn.Module):
         if enc_hidden is None:
             raise ValueError("Unable to resolve encoder hidden size.")
 
-        resampler_latents = state.get("task_resampler.latents")
-        if resampler_latents is None:
-            raise ValueError("Checkpoint missing task_resampler.latents.")
-        prompt_len, latent_dim = resampler_latents.shape
+        latent_dim = enc_hidden
         proj_weight = state.get("task_latent_to_lm.weight")
         if proj_weight is not None:
             lm_hidden = proj_weight.shape[0]
             if proj_weight.shape[1] != latent_dim:
-                raise ValueError("task_latent_to_lm input dim does not match resampler latents.")
+                raise ValueError("task_latent_to_lm input dim does not match encoder latents.")
         else:
             lm_hidden = latent_dim
         norm_type = "rms" if bool(self.config.get("use_rms_norm", False)) else "layernorm"
         norm_eps = float(self.config.get("rms_norm_eps", 1e-6))
         use_swiglu = bool(self.config.get("use_swiglu", False))
-        self.task_resampler = LatentResampler(
-            input_dim=enc_hidden,
-            latent_dim=latent_dim,
-            num_latents=prompt_len,
-            num_heads=int(self.config.get("task_resampler_heads", 8)),
-            num_layers=int(self.config.get("task_resampler_layers", 2)),
-            mlp_ratio=float(self.config.get("task_resampler_mlp_ratio", 4.0)),
-            dropout=float(self.config.get("task_resampler_dropout", 0.1)),
+        task_layers, task_hidden, _first_idx, task_dropout = _infer_branch_mlp_config(
+            state, "task_mlp."
+        )
+        task_hidden = int(self.config.get("task_mlp_hidden", task_hidden or 0))
+        task_layers = int(self.config.get("task_mlp_layers", task_layers or 0))
+        task_dropout = float(self.config.get("task_mlp_dropout", task_dropout))
+        self.task_mlp = TokenMLP(
+            enc_hidden,
+            enc_hidden,
+            hidden_dim=task_hidden,
+            layers=task_layers,
+            dropout=task_dropout,
             norm_type=norm_type,
             norm_eps=norm_eps,
             use_swiglu=use_swiglu,
-            attn_implementation=attn_implementation,
         )
         self.vq_task = VectorQuantizerEMA(
             num_codes=int(self.config.get("task_codebook_size", 1024)),
@@ -310,6 +310,22 @@ class DIBJudgePromptBundle(torch.nn.Module):
             self.task_latent_to_lm = torch.nn.Identity()
         else:
             self.task_latent_to_lm = torch.nn.Linear(latent_dim, lm_hidden)
+        gate_layers, gate_hidden, _first_idx, gate_dropout = _infer_branch_mlp_config(
+            state, "task_lm_gate."
+        )
+        gate_hidden = int(self.config.get("task_lm_gate_hidden", gate_hidden or 0))
+        gate_layers = int(self.config.get("task_lm_gate_layers", gate_layers or 1))
+        gate_dropout = float(self.config.get("task_lm_gate_dropout", gate_dropout))
+        self.task_lm_gate = TokenMLP(
+            2 * lm_hidden,
+            lm_hidden,
+            hidden_dim=gate_hidden,
+            layers=gate_layers,
+            dropout=gate_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
+        )
         compact_state = {
             k.replace("compact_head.", ""): v
             for k, v in state.items()
@@ -351,18 +367,26 @@ class DIBJudgePromptBundle(torch.nn.Module):
             for k, v in state.items()
             if k.startswith("task_latent_to_lm.")
         }
-        resampler_state = {
-            k.replace("task_resampler.", ""): v
+        task_mlp_state = {
+            k.replace("task_mlp.", ""): v
             for k, v in state.items()
-            if k.startswith("task_resampler.")
+            if k.startswith("task_mlp.")
         }
         vq_state = {k.replace("vq_task.", ""): v for k, v in state.items() if k.startswith("vq_task.")}
         self.shared_encoder.load_state_dict(shared_state, strict=False)
-        self.task_resampler.load_state_dict(resampler_state, strict=False)
+        if task_mlp_state:
+            self.task_mlp.load_state_dict(task_mlp_state, strict=False)
         if vq_state:
             self.vq_task.load_state_dict(vq_state, strict=False)
         if proj_state:
             self.task_latent_to_lm.load_state_dict(proj_state, strict=False)
+        gate_state = {
+            k.replace("task_lm_gate.", ""): v
+            for k, v in state.items()
+            if k.startswith("task_lm_gate.")
+        }
+        if gate_state:
+            self.task_lm_gate.load_state_dict(gate_state, strict=False)
         if self.compact_head is not None:
             self.compact_head.load_state_dict(compact_state, strict=False)
         self.compact_mu_id = None
@@ -384,8 +408,9 @@ class DIBJudgePromptBundle(torch.nn.Module):
             return_dict=True,
         )
         hidden = outputs.last_hidden_state
-        task_latents = self.task_resampler(hidden, attention_mask)
-        z_prompt = self.task_latent_to_lm(self.vq_task(task_latents).quantized)
+        task_tokens = self.task_mlp(hidden)
+        z_task = self.vq_task(task_tokens).quantized
+        z_prompt = self.task_latent_to_lm(z_task)
         compact_logits = None
         if self.compact_head is not None:
             compact_logits = self.compact_head(hidden).squeeze(-1)
@@ -465,6 +490,47 @@ def _build_response_token_types(
     return token_types
 
 
+def _apply_z_task_addition(
+    embeds: torch.Tensor,
+    response_types: torch.Tensor,
+    z_a: Optional[torch.Tensor],
+    z_b: Optional[torch.Tensor],
+    a_mask: Optional[torch.Tensor],
+    b_mask: Optional[torch.Tensor],
+    gate_mlp: Optional[torch.nn.Module],
+) -> torch.Tensor:
+    if z_a is None and z_b is None:
+        return embeds
+    addition = embeds.new_zeros(embeds.size())
+
+    def _select_tokens(z_tokens: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return z_tokens
+        mask_flat = mask.bool().view(-1)
+        tokens = z_tokens.view(-1, z_tokens.size(-1))
+        return tokens[mask_flat]
+
+    for label, z_tokens, mask in ((1, z_a, a_mask), (2, z_b, b_mask)):
+        if z_tokens is None:
+            continue
+        selected = _select_tokens(z_tokens, mask)
+        if selected.numel() == 0:
+            continue
+        positions = (response_types == label).nonzero(as_tuple=False).view(-1)
+        if positions.numel() == 0:
+            continue
+        count = min(positions.numel(), selected.size(0))
+        addition[positions[:count]] = selected[:count]
+
+    if gate_mlp is not None:
+        gate_inputs = torch.cat([embeds, addition], dim=-1)
+        gate_scale = torch.sigmoid(gate_mlp(gate_inputs)).to(
+            device=embeds.device, dtype=embeds.dtype
+        )
+        addition = addition * gate_scale
+    return embeds + addition
+
+
 def _build_prompt_embeds(
     bundle: Optional[DIBJudgePromptBundle],
     lm_embed,
@@ -476,7 +542,6 @@ def _build_prompt_embeds(
     max_response_len: Optional[int],
     device: torch.device,
     dtype: torch.dtype,
-    use_z_soft_prompt: bool,
     use_compactor: bool,
 ) -> torch.Tensor:
     def _combine(_prompt: str, resp: str) -> str:
@@ -504,6 +569,9 @@ def _build_prompt_embeds(
     pi_logits = embeds.new_zeros(embeds.size(0))
     z_a = None
     z_b = None
+    a_mask = None
+    b_mask = None
+    gate_mlp = None
     if bundle is not None:
         a_ids, a_mask = _tokenize_response(
             lm_tokenizer, _combine(user_prompt, response_a), max_response_len
@@ -529,6 +597,7 @@ def _build_prompt_embeds(
         )
         z_a = z_tokens[0]
         z_b = z_tokens[1] if z_tokens.size(0) > 1 else None
+        gate_mlp = bundle.task_lm_gate
         if use_compactor and compact_logits is not None:
             pi_a = compact_logits[0]
             pi_b = compact_logits[1] if compact_logits.size(0) > 1 else None
@@ -537,21 +606,18 @@ def _build_prompt_embeds(
                 pi_a.unsqueeze(0),
                 pi_b.unsqueeze(0) if pi_b is not None else None,
             ).squeeze(0)
-    elif use_z_soft_prompt or use_compactor:
-        raise ValueError("z soft prompt is enabled but no prompt bundle was provided.")
+    elif use_compactor:
+        raise ValueError("Compactor is enabled but no prompt bundle was provided.")
 
-    if use_z_soft_prompt:
-        a_idx = (response_types == 1).nonzero(as_tuple=False).view(-1)
-        b_idx = (response_types == 2).nonzero(as_tuple=False).view(-1)
-        inserts: List[Tuple[int, torch.Tensor]] = []
-        if a_idx.numel() > 0 and z_a is not None:
-            inserts.append((int(a_idx.min().item()), z_a))
-        if b_idx.numel() > 0 and z_b is not None:
-            inserts.append((int(b_idx.min().item()), z_b))
-        inserts.sort(key=lambda x: x[0])
-        embeds, attn, _labels, response_types, pi_logits = DIBJudgeModel._insert_prompt_tokens(
-            embeds, attn, None, response_types, pi_logits, inserts
-        )
+    embeds = _apply_z_task_addition(
+        embeds,
+        response_types,
+        z_a,
+        z_b,
+        a_mask.squeeze(0) if torch.is_tensor(a_mask) else None,
+        b_mask.squeeze(0) if torch.is_tensor(b_mask) else None,
+        gate_mlp,
+    )
 
     if bundle is None or not use_compactor:
         return embeds
@@ -596,7 +662,6 @@ def _build_prompt_embeds_batch(
     max_response_len: Optional[int],
     device: torch.device,
     dtype: torch.dtype,
-    use_z_soft_prompt: bool,
     use_compactor: bool,
 ) -> List[torch.Tensor]:
     if not prompts:
@@ -631,6 +696,8 @@ def _build_prompt_embeds_batch(
 
     z_tokens = None
     compact_logits = None
+    resp_mask = None
+    gate_mlp = None
     if bundle is not None:
         response_texts: List[str] = []
         for user_prompt, resp_a, resp_b in zip(user_prompts, responses_a, responses_b):
@@ -648,8 +715,9 @@ def _build_prompt_embeds_batch(
         resp_ids = resp_enc["input_ids"].to(device)
         resp_mask = resp_enc["attention_mask"].to(device)
         z_tokens, compact_logits = bundle.build_prompt_features(resp_ids, resp_mask)
-    elif use_z_soft_prompt or use_compactor:
-        raise ValueError("z soft prompt is enabled but no prompt bundle was provided.")
+        gate_mlp = bundle.task_lm_gate
+    elif use_compactor:
+        raise ValueError("Compactor is enabled but no prompt bundle was provided.")
 
     embeds_list: List[torch.Tensor] = []
     for i, prompt in enumerate(prompts):
@@ -681,19 +749,27 @@ def _build_prompt_embeds_batch(
                 pi_b.unsqueeze(0) if pi_b is not None else None,
             ).squeeze(0)
 
-        if use_z_soft_prompt:
-            a_idx = (response_types == 1).nonzero(as_tuple=False).view(-1)
-            b_idx = (response_types == 2).nonzero(as_tuple=False).view(-1)
-            inserts: List[Tuple[int, torch.Tensor]] = []
-            if a_idx.numel() > 0 and z_tokens is not None:
-                inserts.append((int(a_idx.min().item()), z_tokens[2 * i]))
-            if b_idx.numel() > 0 and z_tokens is not None:
-                if z_tokens.size(0) > (2 * i + 1):
-                    inserts.append((int(b_idx.min().item()), z_tokens[2 * i + 1]))
-            inserts.sort(key=lambda x: x[0])
-            embeds, attn, _labels, response_types, pi_logits = DIBJudgeModel._insert_prompt_tokens(
-                embeds, attn, None, response_types, pi_logits, inserts
-            )
+        z_a = None
+        z_b = None
+        a_mask = None
+        b_mask = None
+        if z_tokens is not None:
+            z_a = z_tokens[2 * i]
+            if z_tokens.size(0) > (2 * i + 1):
+                z_b = z_tokens[2 * i + 1]
+            if resp_mask is not None:
+                a_mask = resp_mask[2 * i]
+                if resp_mask.size(0) > (2 * i + 1):
+                    b_mask = resp_mask[2 * i + 1]
+        embeds = _apply_z_task_addition(
+            embeds,
+            response_types,
+            z_a,
+            z_b,
+            a_mask,
+            b_mask,
+            gate_mlp,
+        )
 
         if bundle is None or not use_compactor:
             embeds_list.append(embeds.detach().cpu())
@@ -739,7 +815,6 @@ def _prepare_seed_inputs(
     bias_grouped: Optional[Dict[str, List[dict]]],
     bias_selected: List[str],
     expected_groups: List[Tuple[str, str]],
-    use_z_soft_prompt: bool,
     use_compactor: bool,
     embed_resources: Optional[Dict[str, object]],
 ) -> Dict[str, object]:
@@ -867,7 +942,6 @@ def _prepare_seed_inputs(
                         args.max_model_len,
                         device,
                         dtype,
-                        use_z_soft_prompt,
                         use_compactor,
                     )
                     embed_prompts.extend(
@@ -898,7 +972,6 @@ def _evaluate_seed(
     mreward_pairs: List[Tuple[str, str]],
     bias_selected: List[str],
     expected_groups: List[Tuple[str, str]],
-    use_z_soft_prompt: bool,
     use_compactor: bool,
     llm_handle: Optional[LLM],
     prepared: Dict[str, object],
@@ -1275,12 +1348,6 @@ def main() -> None:
         help="Enable prompt embeddings in vLLM.",
     )
     parser.add_argument(
-        "--z-soft-prompt",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable z soft prompts (default: follow checkpoint config).",
-    )
-    parser.add_argument(
         "--use-compactor",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1308,15 +1375,6 @@ def main() -> None:
     attn_impl = _resolve_attn_impl(ckpt_config, args.attn_implementation)
     padding_side = _resolve_padding_side(ckpt_config, args.padding_side, attn_impl)
     use_compactor = bool(args.use_compactor)
-    if args.z_soft_prompt is None:
-        if ckpt_config is not None:
-            use_z_soft_prompt = bool(ckpt_config.get("z_soft_prompt", True))
-        else:
-            use_z_soft_prompt = True
-    else:
-        use_z_soft_prompt = bool(args.z_soft_prompt)
-    if use_z_soft_prompt and not args.enable_prompt_embeds and not args.debug_prompt_only:
-        raise ValueError("z soft prompt requires --enable-prompt-embeds.")
     if use_compactor and not args.enable_prompt_embeds and not args.debug_prompt_only:
         raise ValueError("compactor requires --enable-prompt-embeds.")
 
@@ -1474,15 +1532,14 @@ def main() -> None:
         lm_embed = None
         lm_for_embed = None
         if args.enable_prompt_embeds:
-            if use_z_soft_prompt or use_compactor:
-                bundle = _load_dibjudge_bundle(
-                    args.checkpoint,
-                    args.judge_encoder,
-                    device,
-                    dtype,
-                    args.trust_remote_code,
-                    attn_implementation=attn_impl,
-                )
+            bundle = _load_dibjudge_bundle(
+                args.checkpoint,
+                args.judge_encoder,
+                device,
+                dtype,
+                args.trust_remote_code,
+                attn_implementation=attn_impl,
+            )
             lm_for_embed = AutoModelForCausalLM.from_pretrained(
                 args.model,
                 dtype=dtype,
@@ -1512,7 +1569,6 @@ def main() -> None:
             bias_grouped,
             bias_selected,
             expected_groups,
-            use_z_soft_prompt,
             use_compactor,
             embed_resources,
         )
@@ -1563,7 +1619,6 @@ def main() -> None:
             mreward_pairs,
             bias_selected,
             expected_groups,
-            use_z_soft_prompt,
             use_compactor,
             llm_handle,
             prepared_by_seed[seed],

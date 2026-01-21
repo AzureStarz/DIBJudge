@@ -6,16 +6,13 @@ padding_side: left # tokenizer padding side (left|right)
 use_rms_norm: true # use RMSNorm in custom heads
 rms_norm_eps: 1.0e-6 # RMSNorm epsilon
 use_swiglu: true # use SwiGLU activations in custom heads
-z_prompt_len: 16 # number of task prompt tokens injected per response
 z_latent_dim: 0 # dimension of task latent representation
-bias_prompt_len: 1 # number of bias prompt tokens for proxy heads
 bias_mlp_hidden: 0 # hidden width for bias prompt MLP heads (0 = 2x encoder dim)
 bias_mlp_layers: 1 # number of hidden layers in bias prompt MLP heads
 bias_mlp_dropout: 0.05 # dropout rate for bias prompt MLP heads
-task_resampler_layers: 2 # number of cross-attn resampler layers
-task_resampler_heads: 8 # number of cross-attn heads in resampler
-task_resampler_mlp_ratio: 4.0 # MLP expansion ratio in resampler
-task_resampler_dropout: 0.05 # dropout rate in resampler
+task_mlp_hidden: 0 # hidden width for task MLP (0 = identity)
+task_mlp_layers: 0 # number of task MLP layers (0 = identity)
+task_mlp_dropout: 0.0 # dropout rate for task MLP
 encoder_trainable: last # which encoder layers to train (all|last|none)
 bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 0 # number of hidden layers for bias proxy heads

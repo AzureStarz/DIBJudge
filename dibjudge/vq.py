@@ -108,19 +108,45 @@ class VectorQuantizerEMA(nn.Module):
         )
         return per_codebook.mean()
 
+    def _counts_from_indices(
+        self, indices: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if indices.numel() == 0:
+            shape = (
+                (self.num_codebooks, self.num_codes) if self.is_pq else (self.num_codes,)
+            )
+            return indices.new_zeros(shape, dtype=dtype)
+        if self.is_pq:
+            counts = indices.new_zeros(
+                (self.num_codebooks, self.num_codes), dtype=dtype
+            )
+            idx = indices.transpose(0, 1).contiguous()
+            ones = torch.ones_like(idx, dtype=dtype)
+            counts.scatter_add_(1, idx, ones)
+            return counts
+        counts = torch.bincount(indices, minlength=self.num_codes)
+        return counts.to(dtype)
+
     def _ema_update(
-        self, flat_inputs: torch.Tensor, encodings: torch.Tensor
+        self,
+        flat_inputs: torch.Tensor,
+        indices: torch.Tensor,
+        counts: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if not self.use_ema:
             return None
-        if encodings.numel() == 0:
+        if indices.numel() == 0:
             return flat_inputs.new_tensor(0.0)
         with torch.no_grad():
+            if counts is None:
+                counts = self._counts_from_indices(indices, self.ema_cluster_size.dtype)
+            else:
+                counts = counts.to(dtype=self.ema_cluster_size.dtype)
             if self.is_pq:
-                self.ema_cluster_size.mul_(self.decay).add_(
-                    encodings.sum(0), alpha=1 - self.decay
-                )
-                dw = torch.einsum("nmk,nmd->mkd", encodings, flat_inputs)
+                self.ema_cluster_size.mul_(self.decay).add_(counts, alpha=1 - self.decay)
+                dw = torch.zeros_like(self.ema_w)
+                for idx in range(self.num_codebooks):
+                    dw[idx].index_add_(0, indices[:, idx], flat_inputs[:, idx, :])
                 self.ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
 
                 n = self.ema_cluster_size.sum(dim=1, keepdim=True)
@@ -155,10 +181,9 @@ class VectorQuantizerEMA(nn.Module):
                 else:
                     self.codebook.copy_(codebook)
             else:
-                self.ema_cluster_size.mul_(self.decay).add_(
-                    encodings.sum(0), alpha=1 - self.decay
-                )
-                dw = encodings.t() @ flat_inputs
+                self.ema_cluster_size.mul_(self.decay).add_(counts, alpha=1 - self.decay)
+                dw = torch.zeros_like(self.ema_w)
+                dw.index_add_(0, indices, flat_inputs)
                 self.ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
 
                 n = self.ema_cluster_size.sum()
@@ -292,6 +317,9 @@ class VectorQuantizerEMA(nn.Module):
             self.ema_cluster_size.fill_(1.0)
 
     def forward(self, inputs: torch.Tensor) -> VQOutput:
+        orig_dtype = inputs.dtype
+        if inputs.dtype != self.codebook.dtype:
+            inputs = inputs.to(dtype=self.codebook.dtype)
         flat_inputs = inputs.reshape(-1, self.dim)
         if self.is_pq:
             pq_inputs = flat_inputs.view(-1, self.num_codebooks, self.sub_dim)
@@ -300,20 +328,19 @@ class VectorQuantizerEMA(nn.Module):
             flat_inputs = pq_inputs.reshape(-1, self.dim)
             distances = self._distance_pq(pq_inputs)
             indices = distances.argmin(dim=2)
-            encodings = F.one_hot(indices, self.num_codes).type_as(pq_inputs)
             quantized_flat = self._embed_pq(indices).reshape(-1, self.dim)
         else:
             if self.normalize_inputs:
                 flat_inputs = F.normalize(flat_inputs, dim=1, eps=1e-6)
             distances = self._distance(flat_inputs)
             indices = distances.argmin(dim=1)
-            encodings = F.one_hot(indices, self.num_codes).type_as(flat_inputs)
             quantized_flat = F.embedding(indices, self.codebook)
+        counts = self._counts_from_indices(indices, flat_inputs.dtype)
 
         dead_fraction = None
         if self.training:
             dead_fraction = self._ema_update(
-                pq_inputs if self.is_pq else flat_inputs, encodings
+                pq_inputs if self.is_pq else flat_inputs, indices, counts
             )
 
         codebook_loss = (flat_inputs.detach() - quantized_flat).pow(2).mean()
@@ -322,8 +349,15 @@ class VectorQuantizerEMA(nn.Module):
 
         inputs_for_st = flat_inputs.view_as(inputs)
         quantized = inputs_for_st + (quantized_flat.view_as(inputs) - inputs_for_st).detach()
+        if quantized.dtype != orig_dtype:
+            quantized = quantized.to(dtype=orig_dtype)
 
-        avg_probs = encodings.mean(dim=0)
+        if self.is_pq:
+            denom = counts.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            avg_probs = counts / denom
+        else:
+            denom = counts.sum().clamp_min(1.0)
+            avg_probs = counts / denom
         if avg_probs.dim() == 1:
             perplexity = torch.exp(-torch.sum(avg_probs * (avg_probs + 1e-8).log()))
         else:
@@ -332,7 +366,7 @@ class VectorQuantizerEMA(nn.Module):
             )
             perplexity = per_codebook.mean()
         usage_loss = self._usage_loss(avg_probs)
-        usage = self.ema_cluster_size if self.use_ema else encodings.sum(dim=0)
+        usage = self.ema_cluster_size if self.use_ema else counts
         if dead_fraction is None:
             dead_fraction = (usage <= float(self.dead_code_threshold)).float().mean()
         if self.is_pq:

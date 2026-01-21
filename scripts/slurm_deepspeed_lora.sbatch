@@ -68,8 +68,8 @@ echo "Detected ${num_gpus} GPUs"
 #     --template mr3_templates \
 #     --tensor_parallel_size ${num_gpus}
 
-# deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
-#     --config configs/finetune_deepspeed.yaml
+deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
+    --config configs/finetune_deepspeed.yaml
 
 # bash scripts/slurm_dibjudge_evaluation.sbatch -- \
 #     --model outputs/vq_default/hf-epoch-1/lm \
@@ -88,9 +88,9 @@ echo "Detected ${num_gpus} GPUs"
 #     --tensor_parallel_size ${num_gpus}
 
 bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/vq_default/hf-epoch-3/lm \
-    --checkpoint outputs/vq_default/hf-epoch-3/dibjudge \
-    --output_dir results/Qwen3-4B/vq_default/hf-epoch-3 \
+    --model outputs/vq_default/hf-epoch-1/lm \
+    --checkpoint outputs/vq_default/hf-epoch-1/dibjudge \
+    --output_dir results/Qwen3-4B/vq_default/hf-epoch-1 \
     --languages zh \
     --template mr3_templates \
     --tensor_parallel_size ${num_gpus}

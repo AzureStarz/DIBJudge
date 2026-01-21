@@ -22,16 +22,6 @@ try:
     import torch.distributed.nn.functional as dist_nn
 except ImportError:  # pragma: no cover - torch distributed not available
     dist_nn = None
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import unpad_input
-    _FLASH_ATTN_AVAILABLE = True
-except ImportError:  # pragma: no cover - flash-attn not available
-    flash_attn_func = None
-    flash_attn_varlen_func = None
-    unpad_input = None
-    _FLASH_ATTN_AVAILABLE = False
-
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -333,12 +323,11 @@ class TokenReconstructionHead(nn.Module):
         return self.proj(tokens)
 
 
-class BranchMLP(nn.Module):
+class TokenMLP(nn.Module):
     def __init__(
         self,
         in_dim: int,
         out_dim: int,
-        prompt_len: int,
         hidden_dim: int = 0,
         layers: int = 1,
         dropout: float = 0.1,
@@ -347,7 +336,15 @@ class BranchMLP(nn.Module):
         use_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self.prompt_len = max(1, int(prompt_len))
+        self.use_identity = (
+            int(layers) <= 0 and int(hidden_dim) <= 0 and int(out_dim) == int(in_dim)
+        )
+        if self.use_identity:
+            self.ln = None
+            self.act = None
+            self.mlp = None
+            self.proj = None
+            return
         self.ln = _build_norm(norm_type, in_dim, eps=norm_eps)
         self.act = nn.SiLU() if use_swiglu else nn.GELU()
         proj_in = in_dim
@@ -362,16 +359,17 @@ class BranchMLP(nn.Module):
         )
         if self.mlp is not None:
             proj_in = hidden_dim
-        self.proj = nn.Linear(proj_in, self.prompt_len * out_dim)
+        self.proj = nn.Linear(proj_in, out_dim)
 
-    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
-        pooled = self.ln(pooled)
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.use_identity:
+            return tokens
+        tokens = self.ln(tokens)
         if self.mlp is not None:
-            pooled = self.mlp(pooled)
+            tokens = self.mlp(tokens)
         else:
-            pooled = self.act(pooled)
-        out = self.proj(pooled)
-        return out.view(pooled.size(0), self.prompt_len, -1)
+            tokens = self.act(tokens)
+        return self.proj(tokens)
 
 
 class FeedForward(nn.Module):
@@ -402,183 +400,6 @@ class FeedForward(nn.Module):
         return self.out(x)
 
 
-class LatentResamplerLayer(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        mlp_ratio: float,
-        dropout: float,
-        norm_type: str,
-        norm_eps: float,
-        use_swiglu: bool,
-        use_flash_attn: bool,
-    ) -> None:
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("dim must be divisible by num_heads.")
-        self.attn_norm = _build_norm(norm_type, dim, eps=norm_eps)
-        self.num_heads = int(num_heads)
-        self.head_dim = dim // self.num_heads
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        self.attn_dropout_p = float(dropout)
-        self.attn_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.use_flash_attn = bool(use_flash_attn) and _FLASH_ATTN_AVAILABLE
-        self.ff_norm = _build_norm(norm_type, dim, eps=norm_eps)
-        hidden_dim = max(1, int(dim * mlp_ratio))
-        self.ff = FeedForward(
-            dim,
-            hidden_dim=hidden_dim,
-            dropout=dropout,
-            use_swiglu=use_swiglu,
-        )
-
-    def forward(
-        self,
-        latents: torch.Tensor,
-        inputs: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        normed = self.attn_norm(latents)
-        q = self.q_proj(normed)
-        k = self.k_proj(inputs)
-        v = self.v_proj(inputs)
-        bsz, tgt_len, _ = q.shape
-        src_len = k.size(1)
-        q = q.view(bsz, tgt_len, self.num_heads, self.head_dim)
-        k = k.view(bsz, src_len, self.num_heads, self.head_dim)
-        v = v.view(bsz, src_len, self.num_heads, self.head_dim)
-        use_flash = (
-            self.use_flash_attn
-            and q.is_cuda
-            and q.dtype in (torch.float16, torch.bfloat16)
-        )
-        attn_out = None
-        if use_flash:
-            dropout_p = self.attn_dropout_p if self.training else 0.0
-            if key_padding_mask is None or not key_padding_mask.any():
-                attn_out = flash_attn_func(
-                    q,
-                    k,
-                    v,
-                    dropout_p=dropout_p,
-                    causal=False,
-                )
-            else:
-                attn_mask = ~key_padding_mask
-                kv = k.reshape(bsz, src_len, -1)
-                k_unpad_out = unpad_input(kv, attn_mask)
-                k_unpad, _indices, cu_seqlens_k, max_seqlen_k = k_unpad_out[:4]
-                k_unpad = k_unpad.view(-1, self.num_heads, self.head_dim)
-                vv = v.reshape(bsz, src_len, -1)
-                v_unpad_out = unpad_input(vv, attn_mask)
-                v_unpad, _indices, _cu, _max = v_unpad_out[:4]
-                v_unpad = v_unpad.view(-1, self.num_heads, self.head_dim)
-                q_unpad = q.reshape(bsz * tgt_len, self.num_heads, self.head_dim)
-                cu_seqlens_q = torch.arange(
-                    0,
-                    (bsz + 1) * tgt_len,
-                    step=tgt_len,
-                    device=q.device,
-                    dtype=torch.int32,
-                )
-                attn_out = flash_attn_varlen_func(
-                    q_unpad,
-                    k_unpad,
-                    v_unpad,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    tgt_len,
-                    max_seqlen_k,
-                    dropout_p=dropout_p,
-                    causal=False,
-                )
-                attn_out = attn_out.view(bsz, tgt_len, self.num_heads, self.head_dim)
-        if attn_out is None:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            attn_mask = None
-            if key_padding_mask is not None:
-                attn_mask = key_padding_mask[:, None, None, :].bool()
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_dropout_p if self.training else 0.0,
-                is_causal=False,
-            )
-            attn_out = attn_out.transpose(1, 2)
-        attn_out = attn_out.contiguous().view(bsz, tgt_len, -1)
-        attn_out = self.out_proj(attn_out)
-        latents = latents + self.attn_dropout(attn_out)
-        latents = latents + self.ff(self.ff_norm(latents))
-        return latents
-
-
-class LatentResampler(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        latent_dim: int,
-        num_latents: int,
-        num_heads: int,
-        num_layers: int,
-        mlp_ratio: float,
-        dropout: float,
-        norm_type: str,
-        norm_eps: float,
-        use_swiglu: bool,
-        attn_implementation: Optional[str],
-    ) -> None:
-        super().__init__()
-        if latent_dim % num_heads != 0:
-            raise ValueError("latent_dim must be divisible by num_heads.")
-        use_flash_attn = (
-            isinstance(attn_implementation, str)
-            and attn_implementation == "flash_attention_2"
-        )
-        self.input_proj = (
-            nn.Linear(input_dim, latent_dim) if input_dim != latent_dim else nn.Identity()
-        )
-        self.latents = nn.Parameter(torch.randn(num_latents, latent_dim) * 0.02)
-        self.layers = nn.ModuleList(
-            [
-                LatentResamplerLayer(
-                    dim=latent_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                    norm_type=norm_type,
-                    norm_eps=norm_eps,
-                    use_swiglu=use_swiglu,
-                    use_flash_attn=use_flash_attn,
-                )
-                for _ in range(max(1, int(num_layers)))
-            ]
-        )
-        self.final_norm = _build_norm(norm_type, latent_dim, eps=norm_eps)
-
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        batch = inputs.size(0)
-        latents = self.latents.unsqueeze(0).expand(batch, -1, -1)
-        key_padding_mask = None
-        if mask is not None:
-            key_padding_mask = ~mask.bool()
-        inputs = self.input_proj(inputs)
-        for layer in self.layers:
-            latents = layer(latents, inputs, key_padding_mask)
-        return self.final_norm(latents)
-
-
 @dataclass
 class DIBJudgeConfig:
     judge_encoder_name: str = "google/mt5-base"
@@ -590,14 +411,6 @@ class DIBJudgeConfig:
     rms_norm_eps: float = 1e-6
     use_swiglu: bool = False
     z_latent_dim: int = 256
-    z_prompt_prefix_len: int = 1
-    z_prompt_postfix_len: int = 1
-    z_prompt_len: int = 8
-    bias_prompt_len: int = 8
-    task_resampler_layers: int = 2
-    task_resampler_heads: int = 8
-    task_resampler_mlp_ratio: float = 4.0
-    task_resampler_dropout: float = 0.1
     task_codebook_size: int = 1024
     vq_num_codebooks: int = 4
     vq_commitment_gamma: float = 0.05
@@ -608,6 +421,12 @@ class DIBJudgeConfig:
     vq_reset_dead_codes: bool = True
     vq_align_samples: int = 512
     vq_normalize_inputs: bool = True
+    task_mlp_hidden: int = 0
+    task_mlp_layers: int = 0
+    task_mlp_dropout: float = 0.0
+    task_lm_gate_hidden: int = 0
+    task_lm_gate_layers: int = 1
+    task_lm_gate_dropout: float = 0.0
     bias_mlp_hidden: int = 0
     bias_mlp_layers: int = 1
     bias_mlp_dropout: float = 0.1
@@ -713,31 +532,16 @@ class DIBJudgeModel(nn.Module):
         if lm_hidden is None:
             raise ValueError("Unable to resolve judge LM hidden size.")
 
-        self.task_prompt_len = max(1, int(config.z_prompt_len))
-        self.bias_prompt_len = max(1, int(config.bias_prompt_len))
         norm_type = "rms" if bool(config.use_rms_norm) else "layernorm"
         norm_eps = float(config.rms_norm_eps)
         use_swiglu = bool(config.use_swiglu)
-        task_latent_dim = int(getattr(config, "z_latent_dim", 0))
-        if task_latent_dim <= 0:
-            task_latent_dim = encoder_hidden
-        resampler_heads = max(1, int(getattr(config, "task_resampler_heads", 8)))
-        resampler_layers = max(1, int(getattr(config, "task_resampler_layers", 2)))
-        resampler_mlp_ratio = float(getattr(config, "task_resampler_mlp_ratio", 4.0))
-        resampler_dropout = max(0.0, float(getattr(config, "task_resampler_dropout", 0.1)))
-        self.task_resampler = LatentResampler(
-            input_dim=encoder_hidden,
-            latent_dim=task_latent_dim,
-            num_latents=self.task_prompt_len,
-            num_heads=resampler_heads,
-            num_layers=resampler_layers,
-            mlp_ratio=resampler_mlp_ratio,
-            dropout=resampler_dropout,
-            norm_type=norm_type,
-            norm_eps=norm_eps,
-            use_swiglu=use_swiglu,
-            attn_implementation=attn_impl,
-        )
+        # configured_latent_dim = int(getattr(config, "z_latent_dim", 0))
+        task_latent_dim = encoder_hidden
+        # if configured_latent_dim > 0 and configured_latent_dim != encoder_hidden:
+        #     warnings.warn(
+        #         "z_latent_dim ignored; using shared encoder hidden size for Z_task.",
+        #         RuntimeWarning,
+        #     )
         self.vq_task = VectorQuantizerEMA(
             num_codes=int(getattr(config, "task_codebook_size", 1024)),
             dim=task_latent_dim,
@@ -758,10 +562,35 @@ class DIBJudgeModel(nn.Module):
             self.task_latent_to_encoder = nn.Identity()
         else:
             self.task_latent_to_encoder = nn.Linear(task_latent_dim, encoder_hidden)
-        self.bias_mlp = BranchMLP(
+        gate_hidden = int(getattr(config, "task_lm_gate_hidden", 0))
+        gate_layers = max(0, int(getattr(config, "task_lm_gate_layers", 1)))
+        gate_dropout = float(getattr(config, "task_lm_gate_dropout", 0.0))
+        self.task_lm_gate = TokenMLP(
+            2 * lm_hidden,
+            lm_hidden,
+            hidden_dim=gate_hidden,
+            layers=gate_layers,
+            dropout=gate_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
+        )
+        task_mlp_hidden = int(getattr(config, "task_mlp_hidden", 0))
+        task_mlp_layers = max(0, int(getattr(config, "task_mlp_layers", 0)))
+        task_mlp_dropout = float(getattr(config, "task_mlp_dropout", 0.0))
+        self.task_mlp = TokenMLP(
             encoder_hidden,
             encoder_hidden,
-            prompt_len=self.bias_prompt_len,
+            hidden_dim=task_mlp_hidden,
+            layers=task_mlp_layers,
+            dropout=task_mlp_dropout,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            use_swiglu=use_swiglu,
+        )
+        self.bias_mlp = TokenMLP(
+            encoder_hidden,
+            encoder_hidden,
             hidden_dim=bias_mlp_hidden,
             layers=max(0, int(getattr(config, "bias_mlp_layers", 0))),
             dropout=float(getattr(config, "bias_mlp_dropout", 0.0)),
@@ -934,10 +763,11 @@ class DIBJudgeModel(nn.Module):
         keep_prefixes = (
             "shared_encoder.",
             "judge_lm.",
-            "task_resampler.",
             "vq_task.",
             "task_latent_to_lm.",
             "task_latent_to_encoder.",
+            "task_lm_gate",
+            "task_mlp.",
             "bias_mlp.",
             "eng_domain_head.",
             "position_head.",
@@ -969,6 +799,45 @@ class DIBJudgeModel(nn.Module):
 
     def _resolve_bias_proxy_dropout(self) -> float:
         return max(0.0, float(self.config.bias_proxy_dropout))
+
+    def _resolve_encoder_layers(self) -> Optional[torch.nn.ModuleList]:
+        cached = getattr(self, "_encoder_layers_cache", None)
+        if cached is not None:
+            return cached
+        enc = self.shared_encoder
+        layer_paths = (
+            ("encoder", "block"),
+            ("encoder", "layers"),
+            ("encoder", "layer"),
+            ("encoder", "h"),
+            ("layers",),
+            ("layer",),
+            ("block",),
+            ("blocks",),
+            ("h",),
+        )
+        for path in layer_paths:
+            mod = enc
+            ok = True
+            for attr in path:
+                if not hasattr(mod, attr):
+                    ok = False
+                    break
+                mod = getattr(mod, attr)
+            if not ok:
+                continue
+            if isinstance(mod, (torch.nn.ModuleList, list)) and len(mod) > 0:
+                self._encoder_layers_cache = mod
+                return mod
+        self._encoder_layers_cache = None
+        return None
+
+    def _get_encoder_layer(self, idx: int) -> Optional[torch.nn.Module]:
+        layers = self._resolve_encoder_layers()
+        if not layers:
+            return None
+        idx = max(0, min(int(idx), len(layers) - 1))
+        return layers[idx]
 
     @staticmethod
     def _flatten_pair_inputs(
@@ -1053,6 +922,61 @@ class DIBJudgeModel(nn.Module):
         )
         enc_embed_layer = self.shared_encoder.get_input_embeddings() if use_ckpt else None
         idx = int(self.config.low_recon_layer)
+        hook_layer = self._get_encoder_layer(idx) if need_low_hidden else None
+
+        def _maybe_capture(output: object) -> Optional[torch.Tensor]:
+            if torch.is_tensor(output):
+                return output
+            if isinstance(output, (tuple, list)) and output:
+                first = output[0]
+                if torch.is_tensor(first):
+                    return first
+            return None
+
+        def _forward_encoder(
+            *,
+            input_ids: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            handle = None
+            captured: Dict[str, torch.Tensor] = {}
+            if hook_layer is not None:
+                def _hook(_module, _inputs, output):
+                    tensor = _maybe_capture(output)
+                    if tensor is not None:
+                        captured["tensor"] = tensor
+                handle = hook_layer.register_forward_hook(_hook)
+            try:
+                outputs = self.shared_encoder(
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    output_hidden_states=need_low_hidden and hook_layer is None,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            finally:
+                if handle is not None:
+                    handle.remove()
+            hidden = self._get_hidden(outputs)
+            low_hidden_local = None
+            if need_low_hidden:
+                if hook_layer is not None:
+                    low_hidden_local = captured.get("tensor")
+                    if low_hidden_local is None:
+                        raise ValueError("Shared encoder hook did not capture hidden states.")
+                else:
+                    hidden_states = getattr(outputs, "hidden_states", None)
+                    if not hidden_states:
+                        raise ValueError(
+                            "Shared encoder output missing hidden states for reconstruction."
+                        )
+                    idx_local = max(0, min(idx, len(hidden_states) - 1))
+                    low_hidden_local = hidden_states[idx_local]
+                if low_hidden_local is not None:
+                    low_hidden_local = low_hidden_local[:, :orig_len]
+            return hidden, low_hidden_local
 
         def _encode(
             inputs_ids: torch.Tensor, inputs_mask: torch.Tensor
@@ -1063,23 +987,9 @@ class DIBJudgeModel(nn.Module):
                     encoder_embeds = encoder_embeds.detach().requires_grad_(True)
 
                 def _run_encoder(inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
-                    outputs = self.shared_encoder(
-                        inputs_embeds=inputs_embeds,
-                        attention_mask=attention_mask,
-                        output_hidden_states=need_low_hidden,
-                        use_cache=False,
-                        return_dict=True,
+                    return _forward_encoder(
+                        inputs_embeds=inputs_embeds, attention_mask=attention_mask
                     )
-                    low_hidden_local = None
-                    if need_low_hidden:
-                        hidden_states = outputs.hidden_states
-                        if not hidden_states:
-                            raise ValueError(
-                                "Shared encoder output missing hidden states for reconstruction."
-                            )
-                        idx_local = max(0, min(idx, len(hidden_states) - 1))
-                        low_hidden_local = hidden_states[idx_local][:, :orig_len]
-                    return outputs.last_hidden_state, low_hidden_local
 
                 return checkpoint(
                     _run_encoder,
@@ -1087,23 +997,7 @@ class DIBJudgeModel(nn.Module):
                     inputs_mask,
                     use_reentrant=self._checkpoint_use_reentrant,
                 )
-            outputs = self.shared_encoder(
-                input_ids=inputs_ids,
-                attention_mask=inputs_mask,
-                output_hidden_states=need_low_hidden,
-                use_cache=False,
-            )
-            hidden = self._get_hidden(outputs)
-            low_hidden_local = None
-            if need_low_hidden:
-                hidden_states = getattr(outputs, "hidden_states", None)
-                if not hidden_states:
-                    raise ValueError(
-                        "Shared encoder output missing hidden states for reconstruction."
-                    )
-                idx_local = max(0, min(idx, len(hidden_states) - 1))
-                low_hidden_local = hidden_states[idx_local][:, :orig_len]
-            return hidden, low_hidden_local
+            return _forward_encoder(input_ids=inputs_ids, attention_mask=inputs_mask)
 
         if keep is not None and keep.numel() == orig_ids.size(0) and not keep.all():
             if keep.any():
@@ -1186,53 +1080,57 @@ class DIBJudgeModel(nn.Module):
         return pi_logits
 
     @staticmethod
-    def _insert_prompt_tokens(
-        embeds: torch.Tensor,
-        attn: torch.Tensor,
-        labels: Optional[torch.Tensor],
+    def _scatter_response_latents(
         response_types: torch.Tensor,
-        pi_logits: Optional[torch.Tensor],
-        inserts: List[Tuple[int, torch.Tensor]],
-        pi_fill: float = 10.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
-        new_embeds = embeds
-        new_attn = attn
-        new_labels = labels
-        new_resp = response_types
-        new_pi = pi_logits
-        offset = 0
-        for idx, prompt in inserts:
-            insert_at = max(0, min(int(idx) + offset, new_embeds.size(0)))
-            if prompt.numel() == 0:
+        latents: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        pairs: int,
+    ) -> torch.Tensor:
+        bsz = response_types.size(0)
+        if latents.size(0) != bsz * max(1, int(pairs)):
+            raise ValueError("Latents batch size does not match response types.")
+        seq_len = latents.size(1)
+        dim = latents.size(2)
+        pair_count = max(1, int(pairs))
+        if seq_len == 0 or dim == 0:
+            return latents.new_zeros(bsz, response_types.size(1), dim)
+        latents_pair = latents.view(bsz, pair_count, seq_len, dim)
+        mask_pair = (
+            mask.view(bsz, pair_count, seq_len) if torch.is_tensor(mask) else None
+        )
+        if mask_pair is None:
+            packed = latents_pair
+            valid_len = latents.new_full((bsz, pair_count), seq_len, dtype=torch.long)
+        else:
+            mask_bool = mask_pair.bool()
+            valid_len = mask_bool.sum(dim=-1)
+            if mask_bool.all():
+                packed = latents_pair
+            else:
+                positions = torch.arange(seq_len, device=latents.device).view(1, 1, seq_len)
+                key = positions + (~mask_bool) * seq_len
+                gather_idx = torch.argsort(key, dim=-1)
+                packed = latents_pair.gather(
+                    2, gather_idx.unsqueeze(-1).expand(-1, -1, -1, dim)
+                )
+        out = latents.new_zeros(bsz, response_types.size(1), dim)
+        for pair_idx, label in enumerate((1, 2)):
+            if pair_idx >= pair_count:
+                break
+            resp_mask = response_types.eq(label)
+            if not resp_mask.any():
                 continue
-            prompt_len = prompt.size(0)
-            new_embeds = torch.cat([new_embeds[:insert_at], prompt, new_embeds[insert_at:]], dim=0)
-            new_attn = torch.cat(
-                [new_attn[:insert_at], new_attn.new_ones(prompt_len), new_attn[insert_at:]], dim=0
+            resp_rank = resp_mask.long().cumsum(dim=1) - 1
+            valid = resp_mask & (resp_rank < valid_len[:, pair_idx].unsqueeze(1))
+            if not valid.any():
+                continue
+            max_idx = packed.size(2) - 1
+            gather_idx = resp_rank.clamp(min=0, max=max_idx)
+            selected = packed[:, pair_idx].gather(
+                1, gather_idx.unsqueeze(-1).expand(-1, -1, dim)
             )
-            if new_labels is not None:
-                new_labels = torch.cat(
-                    [
-                        new_labels[:insert_at],
-                        new_labels.new_full((prompt_len,), -100),
-                        new_labels[insert_at:],
-                    ],
-                    dim=0,
-                )
-            new_resp = torch.cat(
-                [new_resp[:insert_at], new_resp.new_zeros(prompt_len), new_resp[insert_at:]], dim=0
-            )
-            if new_pi is not None:
-                new_pi = torch.cat(
-                    [
-                        new_pi[:insert_at],
-                        new_pi.new_full((prompt_len,), float(pi_fill)),
-                        new_pi[insert_at:],
-                    ],
-                    dim=0,
-                )
-            offset += prompt_len
-        return new_embeds, new_attn, new_labels, new_resp, new_pi
+            out[valid] = selected[valid]
+        return out
 
     @staticmethod
     def _normalize_token_features(hidden: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -1639,7 +1537,7 @@ class DIBJudgeModel(nn.Module):
         labels: Optional[torch.Tensor] = None,
         pi_logits: Optional[torch.Tensor] = None,
         response_types: Optional[torch.Tensor] = None,
-        z_prompts: Optional[Dict[str, torch.Tensor]] = None,
+        z_task_addition: Optional[torch.Tensor] = None,
         compact_prior: Optional[torch.Tensor] = None,
         disable_compactor: bool = False,
         compute_compact_kl: bool = True,
@@ -1667,91 +1565,40 @@ class DIBJudgeModel(nn.Module):
         need_logits = bool(return_logits) or labels is None
         if use_ckpt and not inputs_embeds.requires_grad:
             inputs_embeds = inputs_embeds.detach().requires_grad_(True)
-        pad_side = getattr(self.config, "padding_side", None)
-        if isinstance(pad_side, str):
-            pad_side = pad_side.lower()
-        if pad_side not in {"left", "right"}:
-            pad_side = (
-                "left"
-                if attention_mask[:, -1].sum() == attention_mask.size(0)
-                else "right"
-            )
         compact_mask_loss = inputs_embeds.new_zeros(())
         compact_con_loss = inputs_embeds.new_zeros(())
         compact_kl_loss = inputs_embeds.new_zeros(())
         compact_pi_mean = inputs_embeds.new_zeros(())
         compact_mask_mean = inputs_embeds.new_zeros(())
         compact_pi_saturation = inputs_embeds.new_zeros(())
+        gated_mean = inputs_embeds.new_zeros(())
+        gated_add_norm = inputs_embeds.new_zeros(())
         if pi_logits is None:
             pi_logits = inputs_embeds.new_zeros(inputs_embeds.size(0), inputs_embeds.size(1))
-        if response_types is not None and z_prompts is not None:
-            def _pad_sequences(
-                sequences: List[torch.Tensor],
-                pad_value: float,
-            ) -> torch.Tensor:
-                if not sequences:
-                    raise ValueError("Expected non-empty sequence list for padding.")
-                max_len = max(seq.size(0) for seq in sequences)
-                if sequences[0].dim() == 1:
-                    padded = sequences[0].new_full(
-                        (len(sequences), max_len), pad_value
-                    )
-                    for i, seq in enumerate(sequences):
-                        length = seq.size(0)
-                        if pad_side == "left":
-                            padded[i, -length:] = seq
-                        else:
-                            padded[i, :length] = seq
-                    return padded
-                dim = sequences[0].size(-1)
-                padded = sequences[0].new_full(
-                    (len(sequences), max_len, dim), pad_value
+        if z_task_addition is not None:
+            if response_types is None:
+                warnings.warn(
+                    "z_task_addition provided without response types; skipping.",
+                    RuntimeWarning,
                 )
-                for i, seq in enumerate(sequences):
-                    length = seq.size(0)
-                    if pad_side == "left":
-                        padded[i, -length:, :] = seq
-                    else:
-                        padded[i, :length, :] = seq
-                return padded
-
-            embeds_list = []
-            attn_list = []
-            labels_list = []
-            resp_list = []
-            pi_list = []
-            for idx in range(inputs_embeds.size(0)):
-                embeds = inputs_embeds[idx]
-                attn = attention_mask[idx]
-                lbl = labels[idx] if labels is not None else None
-                resp = response_types[idx]
-                pi = pi_logits[idx] if pi_logits is not None else None
-                inserts = []
-                a_idx = (resp == 1).nonzero(as_tuple=False).view(-1)
-                if a_idx.numel() > 0 and "a" in z_prompts:
-                    inserts.append((int(a_idx[0].item()), z_prompts["a"][idx]))
-                b_idx = (resp == 2).nonzero(as_tuple=False).view(-1)
-                if b_idx.numel() > 0 and "b" in z_prompts:
-                    inserts.append((int(b_idx[0].item()), z_prompts["b"][idx]))
-                inserts.sort(key=lambda x: x[0])
-                embeds, attn, lbl, resp, pi = self._insert_prompt_tokens(
-                    embeds, attn, lbl, resp, pi, inserts
-                )
-                embeds_list.append(embeds)
-                attn_list.append(attn)
-                resp_list.append(resp)
-                pi_list.append(pi)
-                if lbl is not None:
-                    labels_list.append(lbl)
-
-            inputs_embeds = _pad_sequences(embeds_list, pad_value=0.0)
-            attention_mask = _pad_sequences(attn_list, pad_value=0)
-            response_types = _pad_sequences(resp_list, pad_value=0)
-            pi_logits = _pad_sequences(pi_list, pad_value=0.0)
-            if labels is not None:
-                labels = _pad_sequences(labels_list, pad_value=-100)
             else:
-                labels = None
+                if z_task_addition.shape != inputs_embeds.shape:
+                    raise ValueError("z_task_addition shape must match LM inputs.")
+                response_mask = response_types > 0
+                response_mask = response_mask & attention_mask.bool()
+                if response_mask.any():
+                    gate_inputs = torch.cat([inputs_embeds, z_task_addition], dim=-1)
+                    gate = torch.sigmoid(self.task_lm_gate(gate_inputs)).to(
+                        dtype=inputs_embeds.dtype, device=inputs_embeds.device
+                    )
+                    gated = z_task_addition.to(
+                        dtype=inputs_embeds.dtype, device=inputs_embeds.device
+                    )
+                    gated = gated * gate
+                    masked_gated = gated * response_mask.unsqueeze(-1).to(gated.dtype)
+                    inputs_embeds = inputs_embeds + masked_gated
+                    gated_mean = gate[response_mask].mean()
+                    gated_add_norm = masked_gated[response_mask].norm(dim=-1).mean()
         if disable_compactor:
             if use_ckpt and labels is not None and not need_logits:
                 def _run_lm_loss(lm_embeds: torch.Tensor, lm_attention: torch.Tensor) -> torch.Tensor:
@@ -1791,6 +1638,8 @@ class DIBJudgeModel(nn.Module):
                 "compact_pi_mean": inputs_embeds.new_zeros(()),
                 "compact_mask_mean": inputs_embeds.new_zeros(()),
                 "compact_pi_saturation": inputs_embeds.new_zeros(()),
+                "gated_mean": gated_mean,
+                "gated_add_norm": gated_add_norm,
             }
             if need_logits and lm_logits is not None:
                 result["logits"] = lm_logits
@@ -1947,6 +1796,8 @@ class DIBJudgeModel(nn.Module):
             "compact_pi_mean": compact_pi_mean,
             "compact_mask_mean": compact_mask_mean,
             "compact_pi_saturation": compact_pi_saturation,
+            "gated_mean": gated_mean,
+            "gated_add_norm": gated_add_norm,
         }
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1962,7 +1813,7 @@ class DIBJudgeModel(nn.Module):
                 labels=batch.get("lm_labels"),
                 pi_logits=None,
                 response_types=None,
-                z_prompts=None,
+                z_task_addition=None,
                 compact_prior=batch.get("compact_prior"),
                 disable_compactor=True,
                 compute_compact_kl=compute_compact_kl,
@@ -1970,6 +1821,8 @@ class DIBJudgeModel(nn.Module):
                 compact_kl_chunk_size=compact_kl_chunk_size,
                 return_logits=bool(batch.get("return_lm_logits", False)),
             )
+            gated_mean = lm_out.get("gated_mean", lm_out["loss"].new_zeros(()))
+            gated_add_norm = lm_out.get("gated_add_norm", lm_out["loss"].new_zeros(()))
             base = lm_out.get("logits")
             if base is None:
                 base = lm_out.get("loss")
@@ -2005,6 +1858,8 @@ class DIBJudgeModel(nn.Module):
                 "vq_task_avg_distance": zero,
                 "vq_align_loss": zero,
                 "disentangle_loss": zero,
+                "gated_mean": gated_mean,
+                "gated_add_norm": gated_add_norm,
             }
             if bool(batch.get("return_lm_logits", False)):
                 outputs["lm_logits"] = lm_out["logits"]
@@ -2027,13 +1882,11 @@ class DIBJudgeModel(nn.Module):
         else:
             bsz, pairs = orig_shape
 
-        bias_pooled = self._pool_hidden_mean(orig_hidden, orig_mask)
-
         disable_z_prompt = bool(batch.get("disable_z_prompt_insertion", False))
         if disable_z_prompt:
-            z_task_prompt = None
             z_task_pool = None
             z_bias_orig_pool = None
+            z_task_addition = None
             low_recon_mean_pred = None
             low_recon_logvar_pred = None
             low_recon_mean_target = None
@@ -2051,17 +1904,23 @@ class DIBJudgeModel(nn.Module):
             vq_task_dead_fraction = zero
             vq_task_avg_distance = zero
         else:
-            task_latents = self.task_resampler(orig_hidden, orig_mask)
+            task_latents = self.task_mlp(orig_hidden)
             vq_task = self.vq_task(task_latents)
             z_task = vq_task.quantized
             z_task_dropout = float(batch.get("z_task_dropout", 0.0))
-            z_task_prompt = self._apply_z_dropout(z_task, z_task_dropout)
-            z_task_prompt = self.task_latent_to_lm(z_task_prompt)
+            z_task_lm = self._apply_z_dropout(z_task, z_task_dropout)
+            lm_in_dtype = z_task_lm.dtype
+            proj_weight = getattr(self.task_latent_to_lm, "weight", None)
+            if proj_weight is not None and z_task_lm.dtype != proj_weight.dtype:
+                z_task_lm = z_task_lm.to(dtype=proj_weight.dtype)
+            z_task_lm = self.task_latent_to_lm(z_task_lm)
+            if z_task_lm.dtype != lm_in_dtype:
+                z_task_lm = z_task_lm.to(dtype=lm_in_dtype)
 
-            z_task_pool = z_task.mean(dim=1)
+            z_task_pool = self._pool_hidden_mean(task_latents, orig_mask)
             z_task_pool = self.task_latent_to_encoder(z_task_pool)
-            bias_tokens_orig = self.bias_mlp(bias_pooled)
-            z_bias_orig_pool = bias_tokens_orig.mean(dim=1)
+            bias_tokens_orig = self.bias_mlp(orig_hidden)
+            z_bias_orig_pool = self._pool_hidden_mean(bias_tokens_orig, orig_mask)
 
             if enable_low_recon and low_hidden is not None:
                 low_recon_mean_pred = self.low_recon_mean_head(z_bias_orig_pool)
@@ -2095,6 +1954,7 @@ class DIBJudgeModel(nn.Module):
             vq_task_usage_loss = vq_task.usage_loss
             vq_task_dead_fraction = vq_task.dead_fraction
             vq_task_avg_distance = vq_task.avg_distance
+            z_task_addition = None
         pi_logits = None
         lm_response_types = batch.get("lm_response_types")
         disable_compactor = bool(batch.get("disable_compactor", False))
@@ -2107,14 +1967,10 @@ class DIBJudgeModel(nn.Module):
                 pi_b = self.compact_head(orig_pair[:, 1]).squeeze(-1)
             pi_logits = self._scatter_compact_logits(lm_response_types, pi_a, pi_b)
 
-        z_prompts = None
         if lm_response_types is not None and not disable_z_prompt:
-            z_pair = z_task_prompt.view(
-                bsz, pairs, z_task_prompt.size(1), z_task_prompt.size(2)
+            z_task_addition = self._scatter_response_latents(
+                lm_response_types, z_task_lm, orig_mask, pairs
             )
-            z_prompts = {"a": z_pair[:, 0]}
-            if pairs > 1:
-                z_prompts["b"] = z_pair[:, 1]
 
         compute_compact_kl = bool(batch.get("compute_compact_kl", True))
         lm_out = self.lm_forward(
@@ -2123,7 +1979,7 @@ class DIBJudgeModel(nn.Module):
             labels=batch.get("lm_labels"),
             pi_logits=pi_logits,
             response_types=lm_response_types,
-            z_prompts=z_prompts,
+            z_task_addition=z_task_addition,
             compact_prior=batch.get("compact_prior"),
             disable_compactor=disable_compactor,
             compute_compact_kl=compute_compact_kl,
@@ -2131,6 +1987,8 @@ class DIBJudgeModel(nn.Module):
             compact_kl_chunk_size=compact_kl_chunk_size,
             return_logits=bool(batch.get("return_lm_logits", False)),
         )
+        gated_mean = lm_out.get("gated_mean", lm_out["loss"].new_zeros(()))
+        gated_add_norm = lm_out.get("gated_add_norm", lm_out["loss"].new_zeros(()))
         return_lm_logits = bool(batch.get("return_lm_logits", False))
 
         disentangle_loss = orig_hidden.new_zeros(())
@@ -2175,6 +2033,8 @@ class DIBJudgeModel(nn.Module):
             "vq_task_avg_distance": vq_task_avg_distance,
             "vq_align_loss": vq_align_loss,
             "disentangle_loss": disentangle_loss,
+            "gated_mean": gated_mean,
+            "gated_add_norm": gated_add_norm,
         }
         proxy_enabled = bool(batch.get("proxy_labels_enabled", True))
         if proxy_enabled and not disable_z_prompt:

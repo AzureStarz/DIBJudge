@@ -6,16 +6,15 @@ padding_side: left # tokenizer padding side (left|right)
 use_rms_norm: true # use RMSNorm in custom heads
 rms_norm_eps: 1.0e-6 # RMSNorm epsilon
 use_swiglu: true # use SwiGLU activations in custom heads
-z_prompt_len: 32 # number of task prompt tokens injected per response
-z_latent_dim: 256 # dimension of task latent representation
-bias_prompt_len: 1 # number of bias prompt tokens for proxy heads
 bias_mlp_hidden: 0 # hidden width for bias prompt MLP heads (0 = 2x encoder dim)
-bias_mlp_layers: 1 # number of hidden layers in bias prompt MLP heads
-bias_mlp_dropout: 0.05 # dropout rate for bias prompt MLP heads
-task_resampler_layers: 2 # number of cross-attn resampler layers
-task_resampler_heads: 8 # number of cross-attn heads in resampler
-task_resampler_mlp_ratio: 4.0 # MLP expansion ratio in resampler
-task_resampler_dropout: 0.05 # dropout rate in resampler
+bias_mlp_layers: 0 # number of hidden layers in bias prompt MLP heads
+bias_mlp_dropout: 0.0 # dropout rate for bias prompt MLP heads
+task_mlp_hidden: 0 # hidden width for task MLP (0 = identity)
+task_mlp_layers: 0 # number of task MLP layers (0 = identity)
+task_mlp_dropout: 0.0 # dropout rate for task MLP
+task_lm_gate_hidden: 0 # hidden width for task LM gate MLP (0 = identity)
+task_lm_gate_layers: 0 # number of task LM gate MLP layers
+task_lm_gate_dropout: 0.0 # dropout rate for task LM gate MLP
 task_codebook_size: 256 # VQ codebook size for task latents
 vq_num_codebooks: 4 # number of VQ codebooks (multi-codebook)
 vq_commitment_gamma: 0.05 # commitment loss weight inside VQ
@@ -26,7 +25,7 @@ vq_codebook_trainable: false # allow gradient updates to VQ codebook
 vq_dead_code_threshold: 0.1 # fraction threshold for dead codes
 vq_reset_dead_codes: true # reset dead codes to batch vectors
 vq_align_samples: 512 # samples for alignment loss buffer
-vq_usage_weight: 0.1 # weight for code usage regularization
+vq_usage_weight: 0.2 # weight for code usage regularization
 vq_init_samples: 0 # number of samples for kmeans++ init (0 = auto)
 vq_init_batch_size: 128 # batch size for VQ init (0 = per_device_train_batch_size)
 vq_init_spherical: true # normalize samples for VQ init
@@ -35,22 +34,22 @@ vq_warmup_ratio: 0.1 # warmup ratio for VQ commitment/usage losses
 encoder_trainable: last # which encoder layers to train (all|last|none)
 bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 0 # number of hidden layers for bias proxy heads
-bias_proxy_dropout: 0.05 # dropout for bias proxy heads
+bias_proxy_dropout: 0.0 # dropout for bias proxy heads
 low_recon_layer: 2 # encoder hidden layer index for low-level reconstruction
 compact_mu_token_id: -1 # token id to fill masked tokens (e.g., -1 for eos)
 compact_head_hidden: 0 # hidden width for compact head (0 = auto)
 compact_head_layers: 0 # number of hidden layers for compact head
-compact_head_dropout: 0.05 # dropout for compact head
+compact_head_dropout: 0.0 # dropout for compact head
 
 # data config
 data_path: data/train_data/mr3_preprocessed.jsonl # training dataset JSONL
 proxy_cache_path: data/train_data/mr3_preprocessed.Qwen3-4B.proxy.jsonl # precomputed proxy labels JSONL aligned to data_path
 require_both_responses: true # drop samples with empty response_B when response_B exists
-max_training_samples: 100000 # cap the number of training samples (0 = no cap)
+max_training_samples: 50000 # cap the number of training samples (0 = no cap)
 per_device_train_batch_size: 1 # micro-batch size per GPU
-num_workers: 4 # dataloader worker processes
+num_workers: 0 # dataloader worker processes
 max_response_len: 8192 # max token length for response branch inputs
-max_lm_len: 10000 # max token length for LM inputs
+max_lm_len: 12000 # max token length for LM inputs
 prefilter_long_prompts: true # drop samples with prompt_len >= max_lm_len before training
 prefilter_long_prompts_log_samples: 0 # number of dropped prompt samples to log
 prefilter_long_prompts_preview: 120 # max characters to show for dropped prompt previews
@@ -67,7 +66,7 @@ proxy_length_quantiles: true # build length bins from quantiles
 proxy_soft_labels: true # use soft labels for proxy bin losses
 
 # runtime config
-epochs: 3 # number of training epochs
+epochs: 1 # number of training epochs
 deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
 output_dir: outputs/vq_default # checkpoint output directory
 log_dir: logs/vq_default # log output directory
@@ -89,6 +88,8 @@ swanlab_log_steps: 1 # SwanLab logging interval
 debug_data: false # print batch shapes and lengths once
 debug_lm_sample: false # log one detokenized LM input sample before training
 debug_lm_sample_max_tokens: null # max LM tokens to detokenize (null = max_lm_len)
+debug_gate: false # run a single-batch gate sanity check before training
+debug_gate_max_tokens: 2048 # max tokens per sequence during debug gate (0 = full length)
 debug_aux_checks: false # enable gradient debug checks
 debug_aux_checks_interval: 10 # interval for debug checks
 debug_loss_spike: false # log batch diagnostics when lm_loss spikes
@@ -127,7 +128,7 @@ disable_compactor: true
 disable_z_prompt_insertion: false
 compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value
 kl_weight: 1.0 # schedule peak for compact KL loss
-z_dropout: 0.1 # schedule peak for task prompt dropout
+z_dropout: 0.0 # schedule peak for task prompt dropout
 
 
 # loss config

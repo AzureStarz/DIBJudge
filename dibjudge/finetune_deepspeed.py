@@ -8,6 +8,7 @@ import os
 import json
 import time
 import logging
+import traceback
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -507,22 +508,17 @@ def _collect_vq_task_samples(
         idx = torch.randperm(vectors.size(0), device=vectors.device)[:count]
         return vectors[idx]
 
-    def _sample_task_tokens(task_tokens: torch.Tensor, count: int) -> torch.Tensor:
+    def _sample_task_tokens(
+        task_tokens: torch.Tensor,
+        token_mask: Optional[torch.Tensor],
+        count: int,
+    ) -> torch.Tensor:
         if count <= 0 or task_tokens.numel() == 0:
             return task_tokens.new_zeros((0, task_tokens.size(-1)))
-        if task_tokens.dim() != 3:
+        if token_mask is None or not token_mask.any():
             flat = task_tokens.reshape(-1, task_tokens.size(-1))
             return _random_subset(flat, count)
-        prompt_len = task_tokens.size(1)
-        if prompt_len <= 1:
-            flat = task_tokens.reshape(-1, task_tokens.size(-1))
-            return _random_subset(flat, count)
-        per_pos = int(math.ceil(float(count) / float(prompt_len)))
-        per_pos = max(1, per_pos)
-        buckets = []
-        for idx in range(prompt_len):
-            buckets.append(_random_subset(task_tokens[:, idx, :], per_pos))
-        flat = torch.cat(buckets, dim=0)
+        flat = task_tokens[token_mask.bool()]
         return _random_subset(flat, count)
 
     try:
@@ -541,14 +537,11 @@ def _collect_vq_task_samples(
                     need_low_hidden=False,
                     response_mask=None,
                 )
-                resampler_dtype = next(model.task_resampler.parameters()).dtype
-                if hidden.dtype != resampler_dtype:
-                    hidden = hidden.to(dtype=resampler_dtype)
-                task_tokens = model.task_resampler(hidden, orig_mask)
+                task_tokens = model.task_mlp(hidden)
                 needed = max_samples - total
                 if needed <= 0:
                     break
-                flat = _sample_task_tokens(task_tokens, needed)
+                flat = _sample_task_tokens(task_tokens, orig_mask, needed)
                 samples.append(flat.detach().cpu())
                 total += flat.size(0)
                 if total >= max_samples:
@@ -563,13 +556,10 @@ def _collect_vq_task_samples(
                     need_low_hidden=False,
                     response_mask=None,
                 )
-                resampler_dtype = next(model.task_resampler.parameters()).dtype
-                if hidden.dtype != resampler_dtype:
-                    hidden = hidden.to(dtype=resampler_dtype)
-                task_tokens = model.task_resampler(hidden, orig_mask)
+                task_tokens = model.task_mlp(hidden)
                 needed = max_samples - total
                 if needed > 0:
-                    flat = _sample_task_tokens(task_tokens, needed)
+                    flat = _sample_task_tokens(task_tokens, orig_mask, needed)
                     samples.append(flat.detach().cpu())
                     total += flat.size(0)
     finally:
@@ -587,13 +577,13 @@ def _resolve_vq_init_samples(args: argparse.Namespace, dataset_len: int, rank: i
     requested = int(getattr(args, "vq_init_samples", 0))
     if requested > 0:
         return requested
-    prompt_len = max(1, int(getattr(args, "z_prompt_len", 1)))
     num_codes = max(1, int(getattr(args, "task_codebook_size", 1)))
     num_codebooks = max(1, int(getattr(args, "vq_num_codebooks", 1)))
-    target = int(num_codes * num_codebooks * prompt_len * 8)
+    token_scale = 128
+    target = int(num_codes * num_codebooks * token_scale)
     target = max(10000, target)
     if dataset_len > 0:
-        target = min(target, int(dataset_len) * prompt_len)
+        target = min(target, int(dataset_len) * token_scale)
     if rank == 0:
         _rank0_print(rank, f"[stage done] auto vq_init_samples={target}")
     return int(target)
@@ -1320,12 +1310,6 @@ def _save_hf_from_zero(
         rms_norm_eps=args.rms_norm_eps,
         use_swiglu=args.use_swiglu,
         z_latent_dim=args.z_latent_dim,
-        z_prompt_len=args.z_prompt_len,
-        bias_prompt_len=args.bias_prompt_len,
-        task_resampler_layers=args.task_resampler_layers,
-        task_resampler_heads=args.task_resampler_heads,
-        task_resampler_mlp_ratio=args.task_resampler_mlp_ratio,
-        task_resampler_dropout=args.task_resampler_dropout,
         task_codebook_size=args.task_codebook_size,
         vq_num_codebooks=args.vq_num_codebooks,
         vq_commitment_gamma=args.vq_commitment_gamma,
@@ -1336,8 +1320,12 @@ def _save_hf_from_zero(
         vq_dead_code_threshold=args.vq_dead_code_threshold,
         vq_reset_dead_codes=args.vq_reset_dead_codes,
         vq_align_samples=args.vq_align_samples,
-        z_prompt_prefix_len=args.z_prompt_prefix_len,
-        z_prompt_postfix_len=args.z_prompt_postfix_len,
+        task_mlp_hidden=args.task_mlp_hidden,
+        task_mlp_layers=args.task_mlp_layers,
+        task_mlp_dropout=args.task_mlp_dropout,
+        task_lm_gate_hidden=args.task_lm_gate_hidden,
+        task_lm_gate_layers=args.task_lm_gate_layers,
+        task_lm_gate_dropout=args.task_lm_gate_dropout,
         bias_mlp_hidden=args.bias_mlp_hidden,
         bias_mlp_layers=args.bias_mlp_layers,
         bias_mlp_dropout=args.bias_mlp_dropout,
@@ -1371,7 +1359,6 @@ def _save_hf_from_zero(
     with open(config_path, "w", encoding="utf-8") as handle:
         payload = asdict(config)
         payload["model_type"] = "dibjudge"
-        payload["z_soft_prompt"] = not bool(args.disable_z_prompt_insertion)
         payload["use_compactor"] = not bool(args.disable_compactor)
         json.dump(payload, handle, indent=2)
     dibjudge_state = _cast_state_dict(dibjudge_state, save_dtype)
@@ -1544,10 +1531,11 @@ def _build_optimizer_params(
         "head": [],
     }
     head_prefixes = (
-        "task_resampler.",
         "vq_task.",
         "task_latent_to_lm.",
         "task_latent_to_encoder.",
+        "task_lm_gate",
+        "task_mlp.",
         "bias_mlp.",
         "low_recon_head.",
         "low_recon_mean_head.",
@@ -1695,15 +1683,15 @@ def main() -> None:
         help="Enable TF32 matmul kernels for speed (Ampere+).",
     )
     parser.add_argument("--z-latent-dim", type=int, default=256)
-    parser.add_argument("--z-prompt-len", type=int, default=16)
-    parser.add_argument("--bias-prompt-len", type=int, default=8)
     parser.add_argument("--bias-mlp-hidden", type=int, default=0)
     parser.add_argument("--bias-mlp-layers", type=int, default=1)
     parser.add_argument("--bias-mlp-dropout", type=float, default=0.1)
-    parser.add_argument("--task-resampler-layers", type=int, default=2)
-    parser.add_argument("--task-resampler-heads", type=int, default=8)
-    parser.add_argument("--task-resampler-mlp-ratio", type=float, default=4.0)
-    parser.add_argument("--task-resampler-dropout", type=float, default=0.1)
+    parser.add_argument("--task-mlp-hidden", type=int, default=0)
+    parser.add_argument("--task-mlp-layers", type=int, default=0)
+    parser.add_argument("--task-mlp-dropout", type=float, default=0.0)
+    parser.add_argument("--task-lm-gate-hidden", type=int, default=0)
+    parser.add_argument("--task-lm-gate-layers", type=int, default=1)
+    parser.add_argument("--task-lm-gate-dropout", type=float, default=0.0)
     parser.add_argument("--task-codebook-size", type=int, default=1024)
     parser.add_argument("--vq-num-codebooks", type=int, default=4)
     parser.add_argument("--vq-commitment-gamma", type=float, default=0.05)
@@ -1772,8 +1760,6 @@ def main() -> None:
     )
     parser.add_argument("--bottleneck-noise-alpha", type=float, default=0.05)
     parser.add_argument("--bottleneck-noise-warmup-ratio", type=float, default=0.2)
-    parser.add_argument("--z-prompt-prefix-len", type=int, default=1)
-    parser.add_argument("--z-prompt-postfix-len", type=int, default=1)
     parser.add_argument(
         "--encoder-trainable",
         default="all",
@@ -1855,7 +1841,7 @@ def main() -> None:
     parser.add_argument(
         "--disable-z-prompt-insertion",
         action="store_true",
-        help="Disable insertion of task prompt tokens into the LM input.",
+        help="Disable task latent injection into the LM input.",
     )
     parser.add_argument(
         "--compact-keep-init",
@@ -2045,6 +2031,17 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--scheduler-type", default="cosine")
     parser.add_argument("--debug-data", action="store_true")
+    parser.add_argument(
+        "--debug-gate",
+        action="store_true",
+        help="Run a single-batch gate sanity check before training.",
+    )
+    parser.add_argument(
+        "--debug-gate-max-tokens",
+        type=int,
+        default=2048,
+        help="Max tokens per sequence during debug-gate (0 = full length).",
+    )
     parser.add_argument(
         "--debug-aux-checks",
         action=argparse.BooleanOptionalAction,
@@ -2386,12 +2383,6 @@ def main() -> None:
         rms_norm_eps=args.rms_norm_eps,
         use_swiglu=args.use_swiglu,
         z_latent_dim=args.z_latent_dim,
-        z_prompt_len=args.z_prompt_len,
-        bias_prompt_len=args.bias_prompt_len,
-        task_resampler_layers=args.task_resampler_layers,
-        task_resampler_heads=args.task_resampler_heads,
-        task_resampler_mlp_ratio=args.task_resampler_mlp_ratio,
-        task_resampler_dropout=args.task_resampler_dropout,
         task_codebook_size=args.task_codebook_size,
         vq_num_codebooks=args.vq_num_codebooks,
         vq_commitment_gamma=args.vq_commitment_gamma,
@@ -2402,11 +2393,15 @@ def main() -> None:
         vq_dead_code_threshold=args.vq_dead_code_threshold,
         vq_reset_dead_codes=args.vq_reset_dead_codes,
         vq_align_samples=args.vq_align_samples,
+        task_mlp_hidden=args.task_mlp_hidden,
+        task_mlp_layers=args.task_mlp_layers,
+        task_mlp_dropout=args.task_mlp_dropout,
+        task_lm_gate_hidden=args.task_lm_gate_hidden,
+        task_lm_gate_layers=args.task_lm_gate_layers,
+        task_lm_gate_dropout=args.task_lm_gate_dropout,
         bias_mlp_hidden=args.bias_mlp_hidden,
         bias_mlp_layers=args.bias_mlp_layers,
         bias_mlp_dropout=args.bias_mlp_dropout,
-        z_prompt_prefix_len=args.z_prompt_prefix_len,
-        z_prompt_postfix_len=args.z_prompt_postfix_len,
         low_recon_layer=args.low_recon_layer,
         bias_proxy_hidden=args.bias_proxy_hidden,
         bias_proxy_layers=args.bias_proxy_layers,
@@ -2468,7 +2463,7 @@ def main() -> None:
         args.disentangle_weight = 0.0
         _rank0_print(
             rank,
-            "[stage done] disable_z_prompt_insertion=true; skipping task prompt losses",
+            "[stage done] disable_z_prompt_insertion=true; skipping task latent losses",
         )
     _rank0_print(rank, "[stage done] model initialized")
     _maybe_apply_lora(model, args)
@@ -2497,6 +2492,137 @@ def main() -> None:
         )
     else:
         model.set_gradient_checkpointing(encoder=False, lm=False, use_reentrant=False)
+
+    if args.debug_gate and rank == 0:
+        debug_log_path = (
+            "/path/to/workspace/online1/"
+            "llm-as-judge-cultural-evaluation/DIBJudge/logs/debug_error.log"
+        )
+        try:
+            batch = next(iter(loader))
+            batch = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in batch.items()
+            }
+            batch = {
+                key: value[:1] if torch.is_tensor(value) and value.size(0) > 1 else value
+                for key, value in batch.items()
+            }
+            max_debug_tokens = int(getattr(args, "debug_gate_max_tokens", 0) or 0)
+            if max_debug_tokens > 0:
+                lm_keys = (
+                    "lm_input_ids",
+                    "lm_attention_mask",
+                    "lm_labels",
+                    "lm_response_types",
+                )
+                orig_keys = (
+                    "original_input_ids",
+                    "original_attention_mask",
+                    "original_response_mask",
+                )
+                if args.padding_side == "right":
+                    lm_mask = batch.get("lm_attention_mask")
+                    if torch.is_tensor(lm_mask):
+                        lm_len = int(lm_mask.sum().item())
+                        if lm_len > max_debug_tokens:
+                            start = lm_len - max_debug_tokens
+                            for key in lm_keys:
+                                if torch.is_tensor(batch.get(key)):
+                                    batch[key] = batch[key][..., start:lm_len]
+                    orig_mask = batch.get("original_attention_mask")
+                    if torch.is_tensor(orig_mask):
+                        orig_len = int(orig_mask.sum(dim=-1).max().item())
+                        if orig_len > max_debug_tokens:
+                            start = orig_len - max_debug_tokens
+                            for key in orig_keys:
+                                if torch.is_tensor(batch.get(key)):
+                                    batch[key] = batch[key][..., start:orig_len]
+                else:
+                    lm_ids = batch.get("lm_input_ids")
+                    if torch.is_tensor(lm_ids) and lm_ids.size(-1) > max_debug_tokens:
+                        for key in lm_keys:
+                            if torch.is_tensor(batch.get(key)):
+                                batch[key] = batch[key][..., -max_debug_tokens:]
+                    orig_ids = batch.get("original_input_ids")
+                    if torch.is_tensor(orig_ids) and orig_ids.size(-1) > max_debug_tokens:
+                        for key in orig_keys:
+                            if torch.is_tensor(batch.get(key)):
+                                batch[key] = batch[key][..., -max_debug_tokens:]
+            _rank0_print(rank, "[debug gate] running sanity check")
+            model.eval()
+            try:
+                model_dtype = next(model.shared_encoder.parameters()).dtype
+            except StopIteration:
+                model_dtype = None
+            if model_dtype not in (torch.float16, torch.bfloat16):
+                model_dtype = None
+            debug_amp_dtype = model_dtype
+            with torch.no_grad():
+                if debug_amp_dtype is not None:
+                    with torch.autocast(device_type="cuda", dtype=debug_amp_dtype):
+                        out_no = model(
+                            {
+                                **batch,
+                                "disable_z_prompt_insertion": True,
+                                "disable_compactor": True,
+                                "return_lm_logits": True,
+                            }
+                        )
+                        out_yes = model(
+                            {
+                                **batch,
+                                "disable_z_prompt_insertion": False,
+                                "disable_compactor": True,
+                                "return_lm_logits": True,
+                            }
+                        )
+                else:
+                    out_no = model(
+                        {
+                            **batch,
+                            "disable_z_prompt_insertion": True,
+                            "disable_compactor": True,
+                            "return_lm_logits": True,
+                        }
+                    )
+                    out_yes = model(
+                        {
+                            **batch,
+                            "disable_z_prompt_insertion": False,
+                            "disable_compactor": True,
+                            "return_lm_logits": True,
+                        }
+                    )
+            delta = float("nan")
+            if torch.is_tensor(out_no.get("lm_logits")) and torch.is_tensor(
+                out_yes.get("lm_logits")
+            ):
+                delta = (out_yes["lm_logits"] - out_no["lm_logits"]).abs().max().item()
+            gated_mean = out_yes.get("gated_mean", torch.tensor(0.0)).item()
+            gated_add_norm = out_yes.get("gated_add_norm", torch.tensor(0.0)).item()
+            _rank0_print(
+                rank,
+                "[debug gate] logit delta=",
+                delta,
+                "gated_mean=",
+                gated_mean,
+                "gated_add_norm=",
+                gated_add_norm,
+            )
+        except Exception as exc:
+            os.makedirs(os.path.dirname(debug_log_path), exist_ok=True)
+            with open(debug_log_path, "a", encoding="utf-8") as handle:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                handle.write(f"{timestamp} | debug_gate failure: {exc}\n")
+                handle.write(traceback.format_exc())
+                handle.write("\n")
+            _rank0_print(
+                rank,
+                f"[warn] debug_gate failed; details logged to {debug_log_path}",
+            )
+        finally:
+            model.train()
 
     vq_init_samples = _resolve_vq_init_samples(args, len(dataset), rank)
     args.vq_init_samples = vq_init_samples
@@ -2751,6 +2877,11 @@ def main() -> None:
             accum_boundary = step_index % args.grad_accum_steps == 0
             optim_step = step_index // args.grad_accum_steps
             current_grad_norm: Optional[float] = None
+            log_diag = (
+                swanlab_client is not None
+                and args.swanlab_log_steps > 0
+                and step % args.swanlab_log_steps == 0
+            )
             batch = {
                 k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
                 for k, v in batch.items()
@@ -2814,6 +2945,10 @@ def main() -> None:
                 vq_usage_loss = outputs.get(
                     "vq_task_usage_loss", outputs["lm_loss"].new_tensor(0.0)
                 )
+                gated_mean = outputs.get("gated_mean", outputs["lm_loss"].new_tensor(0.0))
+                gated_add_norm = outputs.get(
+                    "gated_add_norm", outputs["lm_loss"].new_tensor(0.0)
+                )
                 proxy_counts = {}
                 for name, key in (
                     ("nll", "proxy_nll_label"),
@@ -2856,44 +2991,55 @@ def main() -> None:
                     proxy_counts,
                     float(args.proxy_bin_ema),
                 )
-                diag_metrics.update(
-                    {
-                        "proxy_bin/weight_nll": float(proxy_bin_weights.get("nll", 0.0)),
-                        "proxy_bin/weight_ttr": float(proxy_bin_weights.get("ttr", 0.0)),
-                        "proxy_bin/weight_length": float(proxy_bin_weights.get("length", 0.0)),
-                        "proxy_bin/weight_sum": float(proxy_bin_weight_sum),
-                        "proxy_bin/ema_nll": float(proxy_bin_state.ema.get("nll") or 0.0),
-                        "proxy_bin/ema_ttr": float(proxy_bin_state.ema.get("ttr") or 0.0),
-                        "proxy_bin/ema_length": float(
-                            proxy_bin_state.ema.get("length") or 0.0
-                        ),
-                        "proxy_bin/count_nll": float(proxy_counts.get("nll", 0)),
-                        "proxy_bin/count_ttr": float(proxy_counts.get("ttr", 0)),
-                        "proxy_bin/count_length": float(proxy_counts.get("length", 0)),
-                        "proxy_bin/normalized": 1.0
-                        if bool(getattr(args, "proxy_bin_normalize", False))
-                        else 0.0,
-                    }
-                )
-                for name, target_key, label_key in (
-                    ("nll", "proxy_nll_target", "proxy_nll_label"),
-                    ("ttr", "proxy_ttr_target", "proxy_ttr_label"),
-                    ("length", "proxy_length_target", "proxy_length_label"),
-                ):
-                    hist_out = _proxy_bin_histogram(
-                        batch.get(target_key),
-                        batch.get(label_key),
-                        eps=float(args.proxy_bin_weight_eps),
+                if log_diag:
+                    diag_metrics.update(
+                        {
+                            "proxy_bin/weight_nll": float(
+                                proxy_bin_weights.get("nll", 0.0)
+                            ),
+                            "proxy_bin/weight_ttr": float(
+                                proxy_bin_weights.get("ttr", 0.0)
+                            ),
+                            "proxy_bin/weight_length": float(
+                                proxy_bin_weights.get("length", 0.0)
+                            ),
+                            "proxy_bin/weight_sum": float(proxy_bin_weight_sum),
+                            "proxy_bin/ema_nll": float(proxy_bin_state.ema.get("nll") or 0.0),
+                            "proxy_bin/ema_ttr": float(proxy_bin_state.ema.get("ttr") or 0.0),
+                            "proxy_bin/ema_length": float(
+                                proxy_bin_state.ema.get("length") or 0.0
+                            ),
+                            "proxy_bin/count_nll": float(proxy_counts.get("nll", 0)),
+                            "proxy_bin/count_ttr": float(proxy_counts.get("ttr", 0)),
+                            "proxy_bin/count_length": float(proxy_counts.get("length", 0)),
+                            "proxy_bin/normalized": 1.0
+                            if bool(getattr(args, "proxy_bin_normalize", False))
+                            else 0.0,
+                        }
                     )
-                    if hist_out is None:
-                        continue
-                    hist, probs, entropy = hist_out
-                    diag_metrics[f"proxy_bin_hist/{name}/count"] = float(hist.sum().item())
-                    diag_metrics[f"proxy_bin_hist/{name}/entropy"] = float(entropy.item())
-                    for idx in range(probs.numel()):
-                        diag_metrics[
-                            f"proxy_bin_hist/{name}/bin_{idx}"
-                        ] = float(probs[idx].item())
+                    for name, target_key, label_key in (
+                        ("nll", "proxy_nll_target", "proxy_nll_label"),
+                        ("ttr", "proxy_ttr_target", "proxy_ttr_label"),
+                        ("length", "proxy_length_target", "proxy_length_label"),
+                    ):
+                        hist_out = _proxy_bin_histogram(
+                            batch.get(target_key),
+                            batch.get(label_key),
+                            eps=float(args.proxy_bin_weight_eps),
+                        )
+                        if hist_out is None:
+                            continue
+                        hist, probs, entropy = hist_out
+                        diag_metrics[f"proxy_bin_hist/{name}/count"] = float(
+                            hist.sum().item()
+                        )
+                        diag_metrics[f"proxy_bin_hist/{name}/entropy"] = float(
+                            entropy.item()
+                        )
+                        for idx in range(probs.numel()):
+                            diag_metrics[
+                                f"proxy_bin_hist/{name}/bin_{idx}"
+                            ] = float(probs[idx].item())
                 disentangle_loss = outputs.get("disentangle_loss", outputs["lm_loss"].new_tensor(0.0))
                 mask_loss = outputs.get(
                     "compact_mask_loss", outputs["lm_loss"].new_tensor(0.0)
@@ -3163,6 +3309,8 @@ def main() -> None:
             step_metrics = {
                 "loss": float(raw_total_loss),
                 "lm_loss": float(raw_lm_loss),
+                "gated_mean": float(gated_mean.item()),
+                "gated_add_norm": float(gated_add_norm.item()),
                 "ema/loss": float(log_loss),
                 "ema/lm_loss": float(log_lm_loss),
                 **ema_component_metrics,
@@ -3260,6 +3408,8 @@ def main() -> None:
                         "raw/length_bin_mae": float(length_bin_mae.item()),
                         "raw/compact_mask_loss": float(mask_loss.item()),
                         "raw/compact_consistency_loss": float(consistency_loss.item()),
+                        "raw/gated_mean": float(gated_mean.item()),
+                        "raw/gated_add_norm": float(gated_add_norm.item()),
                         "compact_kl_loss": outputs["compact_kl_loss"].item(),
                         "low_recon_loss": low_recon_loss.item(),
                         "low_recon_mean_loss": low_recon_mean_loss.item(),
@@ -3276,6 +3426,8 @@ def main() -> None:
                         "nll_bin_mae": nll_bin_mae.item(),
                         "ttr_bin_mae": ttr_bin_mae.item(),
                         "length_bin_mae": length_bin_mae.item(),
+                        "gated_mean": gated_mean.item(),
+                        "gated_add_norm": gated_add_norm.item(),
                         "vq/task_commitment_loss": float(outputs.get("vq_task_commitment_loss", 0.0)),
                         "vq/task_codebook_loss": float(outputs.get("vq_task_codebook_loss", 0.0)),
                         "vq/task_perplexity": float(outputs.get("vq_task_perplexity", 0.0)),

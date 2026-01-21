@@ -33,7 +33,7 @@ def _wasserstein_1d(
     cdf_true = targets.cumsum(dim=-1)
     emd = (cdf_pred - cdf_true).abs().sum(dim=-1)
     idx = torch.arange(probs.size(-1), device=probs.device, dtype=probs.dtype)
-    pred_mean = (probs * idx).sum(dim=-1)
+    pred_mean = (probs.detach() * idx).sum(dim=-1)
     target_mean = (targets * idx).sum(dim=-1)
     mae = (pred_mean - target_mean).abs()
     return _masked_mean(emd, mask, fallback), _masked_mean(mae, mask, fallback)

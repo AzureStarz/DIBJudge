@@ -1,0 +1,94 @@
+# model config
+judge_encoder: model/Qwen3-Embedding-0.6B # shared encoder backbone
+lm: model/Qwen3-8B # causal LM backbone used for judging
+attn_implementation: flash_attention_2 # attention backend (flash_attention_2|sdpa|eager)
+padding_side: left # tokenizer padding side (left|right)
+use_rms_norm: true # use RMSNorm in custom heads
+rms_norm_eps: 1.0e-6 # RMSNorm epsilon
+use_swiglu: true # use SwiGLU activations in custom heads
+encoder_trainable: last # which encoder layers to train (all|last|none)
+bias_proxy_hidden: 0 # hidden width for proxy heads (0 = encoder dim)
+bias_proxy_layers: 0 # number of hidden layers for proxy heads
+bias_proxy_dropout: 0.05 # dropout for proxy heads
+compact_mu_token_id: -1 # token id to fill masked tokens (-1 uses '.' token)
+compact_mu_learnable: false # use learnable mu embedding instead of LM token embedding
+compact_head_hidden: 0 # hidden width for compact head (0 = auto)
+compact_head_layers: 0 # number of hidden layers for compact head
+compact_head_dropout: 0.05 # dropout for compact head
+
+# data config
+data_path: data/train_data/mr3_preprocessed.jsonl # training dataset JSONL
+proxy_cache_path: data/train_data/mr3_preprocessed.Qwen3-8B.proxy.jsonl # proxy labels JSONL aligned to data_path
+require_both_responses: true # drop samples with empty response_B when response_B exists
+max_training_samples: 10000 # cap the number of training samples (0 = no cap)
+per_device_train_batch_size: 1 # micro-batch size per GPU
+num_workers: 4 # dataloader worker processes
+max_response_len: 8192 # max token length for response branch inputs
+max_lm_len: 10000 # max token length for LM inputs
+proxy_nll_bins: "0,2.3026,2.9957,3.6889,4.3820,5.0752,13.8155" # bins for NLL ordinal regression
+proxy_nll_quantiles: false # build NLL bins from quantiles
+proxy_ttr_bins: "0,0.2,0.4,0.6,0.8,1.0" # bins for TTR ordinal regression
+proxy_ttr_quantiles: false # build TTR bins from quantiles
+proxy_length_bins: "0,50,100,200,400,1000000" # bins for length ordinal regression
+proxy_length_quantiles: true # build length bins from quantiles
+proxy_soft_labels: true # use soft labels for proxy bin losses
+
+# runtime config
+epochs: 1 # number of training epochs
+deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
+output_dir: outputs/compact_proxy_8B # checkpoint output directory
+log_dir: logs/compact_proxy_8B # log output directory
+save_every_steps: 10000 # checkpoint save interval (0 = disabled)
+save_at_end: true # save a checkpoint at end of training
+bf16: true # enable bfloat16 training
+allow_tf32: true # enable TF32 matmul kernels for speed
+gradient_checkpointing: false # enable gradient checkpointing
+lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
+compact_kl_chunk_size: 128 # optional chunk size for compact KL (0 = disabled)
+
+# optimizer config
+encoder_lr: 2.0e-5 # learning rate for shared encoder
+lm_lr: 2.0e-5 # learning rate for judge LM (if unfrozen)
+head_lr: 2.0e-4 # learning rate for heads (compact + proxy)
+weight_decay: 0.01 # weight decay for main params
+head_weight_decay: 0 # weight decay for head params
+max_grad_norm: 1.0 # gradient clipping norm
+grad_accum_steps: 8 # gradient accumulation steps
+
+# scheduler config
+warmup_steps: 0 # explicit warmup steps (0 = use warmup_ratio)
+warmup_ratio: 0.03 # warmup ratio of total steps
+scheduler_type: cosine # scheduler type for HF scheduler
+
+# compactor config
+compact_keep_init: 0.8 # schedule base keep ratio for compact masking
+compact_keep_min: 0.5 # schedule minimum keep ratio target
+disable_compactor: false # disable compact masking and compact losses
+compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value (negative disables)
+compact_mask_loss_type: bce # mask loss type for compactor prior (bce or kl)
+compact_prior_eps: 1.0e-6 # clamp epsilon for compact prior loss (<= 0 disables)
+compact_select_mode: prior # compactor selection mode (prior or topk)
+compact_topk_ratio: -1.0 # top-k ratio (<= 0 uses compact_prior)
+compact_topk_count: 0 # fixed top-k count per sample (0 uses ratio)
+compact_topk_temperature: 1.0 # temperature for soft top-k straight-through mask
+compact_topk_gumbel: true # add Gumbel noise to top-k sampling during training
+compact_topk_use_prior: false # apply compact prior loss when using top-k
+kl_weight: 1.0 # schedule peak for compact KL loss
+
+# loss config
+mask_loss_weight: 1.0 # weight for compact mask loss
+consistency_loss_weight: 1.0 # weight for compact consistency loss
+budget_loss_weight: 1.0 # weight for compact budget loss
+mask_group_weight: 1.0 # weight for (mask_loss + consistency_loss + budget_loss) group loss
+lambda_bias: 0.5 # schedule peak for proxy losses
+proxy_loss_enabled: true # enable proxy task losses during training
+nll_bin_weight: 0.5 # weight for NLL bin loss
+ttr_bin_weight: 0.5 # weight for TTR bin loss
+length_bin_weight: 0.5 # weight for length bin loss
+proxy_bin_weighting: ema_inverse # weighting strategy for proxy bin losses (static|ema_inverse)
+proxy_bin_normalize: true # normalize proxy bin weights (weighted average)
+proxy_bin_ema: 0.95 # EMA decay for proxy bin loss scale tracking
+proxy_bin_weight_eps: 1.0e-6 # epsilon for inverse-EMA proxy weighting
+proxy_bin_min_weight: 0.0 # min per-loss proxy bin weight (0 = disabled)
+proxy_bin_max_weight: 10.0 # max per-loss proxy bin weight (0 = disabled)
+proxy_bin_warmup_steps: 200 # warmup steps before dynamic proxy weighting

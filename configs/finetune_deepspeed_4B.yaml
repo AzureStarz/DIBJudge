@@ -6,32 +6,50 @@ padding_side: left # tokenizer padding side (left|right)
 use_rms_norm: true # use RMSNorm in custom heads
 rms_norm_eps: 1.0e-6 # RMSNorm epsilon
 use_swiglu: true # use SwiGLU activations in custom heads
-z_latent_dim: 0 # dimension of task latent representation
 bias_mlp_hidden: 0 # hidden width for bias prompt MLP heads (0 = 2x encoder dim)
-bias_mlp_layers: 1 # number of hidden layers in bias prompt MLP heads
-bias_mlp_dropout: 0.05 # dropout rate for bias prompt MLP heads
+bias_mlp_layers: 0 # number of hidden layers in bias prompt MLP heads
+bias_mlp_dropout: 0.0 # dropout rate for bias prompt MLP heads
 task_mlp_hidden: 0 # hidden width for task MLP (0 = identity)
 task_mlp_layers: 0 # number of task MLP layers (0 = identity)
 task_mlp_dropout: 0.0 # dropout rate for task MLP
+task_lm_gate_hidden: 0 # hidden width for task LM gate MLP (0 = identity)
+task_lm_gate_layers: 0 # number of task LM gate MLP layers
+task_lm_gate_dropout: 0.0 # dropout rate for task LM gate MLP
+task_codebook_size: 128 # VQ codebook size for task latents
+vq_num_codebooks: 4 # number of VQ codebooks (multi-codebook)
+vq_commitment_gamma: 0.05 # commitment loss weight inside VQ
+vq_ema_decay: 0.99 # EMA decay for VQ codebooks
+vq_use_ema: true # use EMA updates for VQ codebooks
+vq_normalize_inputs: true # normalize inputs before VQ
+vq_codebook_trainable: false # allow gradient updates to VQ codebook
+vq_dead_code_threshold: 0.1 # fraction threshold for dead codes
+vq_reset_dead_codes: true # reset dead codes to batch vectors
+vq_align_samples: 512 # samples for alignment loss buffer
+vq_usage_weight: 0.2 # weight for code usage regularization
+vq_init_samples: 0 # number of samples for kmeans++ init (0 = auto)
+vq_init_batch_size: 128 # batch size for VQ init (0 = per_device_train_batch_size)
+vq_init_spherical: true # normalize samples for VQ init
+vq_init_seed: 42 # random seed for VQ init sampling
+vq_warmup_ratio: 0.1 # warmup ratio for VQ commitment/usage losses
 encoder_trainable: last # which encoder layers to train (all|last|none)
 bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 0 # number of hidden layers for bias proxy heads
-bias_proxy_dropout: 0.05 # dropout for bias proxy heads
+bias_proxy_dropout: 0.0 # dropout for bias proxy heads
 low_recon_layer: 2 # encoder hidden layer index for low-level reconstruction
 compact_mu_token_id: -1 # token id to fill masked tokens (e.g., -1 for eos)
 compact_head_hidden: 0 # hidden width for compact head (0 = auto)
 compact_head_layers: 0 # number of hidden layers for compact head
-compact_head_dropout: 0.05 # dropout for compact head
+compact_head_dropout: 0.0 # dropout for compact head
 
 # data config
 data_path: data/train_data/mr3_preprocessed.jsonl # training dataset JSONL
-proxy_cache_path: null # precomputed proxy labels JSONL aligned to data_path
+proxy_cache_path: data/train_data/mr3_preprocessed.Qwen3-4B.proxy.jsonl # precomputed proxy labels JSONL aligned to data_path
 require_both_responses: true # drop samples with empty response_B when response_B exists
-max_training_samples: 10000 # cap the number of training samples (0 = no cap)
+max_training_samples: 50000 # cap the number of training samples (0 = no cap)
 per_device_train_batch_size: 1 # micro-batch size per GPU
-num_workers: 4 # dataloader worker processes
+num_workers: 0 # dataloader worker processes
 max_response_len: 8192 # max token length for response branch inputs
-max_lm_len: 11000 # max token length for LM inputs
+max_lm_len: 12000 # max token length for LM inputs
 prefilter_long_prompts: true # drop samples with prompt_len >= max_lm_len before training
 prefilter_long_prompts_log_samples: 0 # number of dropped prompt samples to log
 prefilter_long_prompts_preview: 120 # max characters to show for dropped prompt previews
@@ -50,19 +68,19 @@ proxy_soft_labels: true # use soft labels for proxy bin losses
 # runtime config
 epochs: 1 # number of training epochs
 deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
-output_dir: outputs/no_proxy # checkpoint output directory
-log_dir: logs/no_proxy # log output directory
-save_every_steps: 0 # checkpoint save interval (0 = disabled)
+output_dir: outputs/vq_default_4B # checkpoint output directory
+log_dir: logs/vq_default_4B # log output directory
+save_every_steps: 10000 # checkpoint save interval (0 = disabled)
 save_at_end: true # save a checkpoint at end of training
 bf16: true # enable bfloat16 training
 allow_tf32: true # enable TF32 matmul kernels for speed
 gradient_checkpointing: false # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
-lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
+lm_loss_chunk_size: 0 # optional chunk size for causal LM loss (0 = disabled)
 compact_kl_chunk_size: 128 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
-swanlab_run_name: no_proxy # SwanLab run name
+swanlab_run_name: vq_default_4B # SwanLab run name
 swanlab_tags: null # SwanLab tags list or null
 swanlab_log_steps: 1 # SwanLab logging interval
 
@@ -70,6 +88,8 @@ swanlab_log_steps: 1 # SwanLab logging interval
 debug_data: false # print batch shapes and lengths once
 debug_lm_sample: false # log one detokenized LM input sample before training
 debug_lm_sample_max_tokens: null # max LM tokens to detokenize (null = max_lm_len)
+debug_gate: false # run a single-batch gate sanity check before training
+debug_gate_max_tokens: 2048 # max tokens per sequence during debug gate (0 = full length)
 debug_aux_checks: false # enable gradient debug checks
 debug_aux_checks_interval: 10 # interval for debug checks
 debug_loss_spike: false # log batch diagnostics when lm_loss spikes
@@ -104,17 +124,18 @@ scheduler_type: cosine # scheduler type for HF scheduler
 # compactor config
 compact_keep_init: 0.9 # schedule base keep ratio for compact masking
 compact_keep_min: 0.5 # schedule minimum keep ratio target
-disable_compactor: false
+disable_compactor: true
 disable_z_prompt_insertion: false
 compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value
 kl_weight: 1.0 # schedule peak for compact KL loss
-z_dropout: 0.1 # schedule peak for task prompt dropout
+z_dropout: 0.0 # schedule peak for task prompt dropout
 
 
 # loss config
 mask_loss_weight: 1.0 # weight for compact mask loss
 consistency_loss_weight: 1.0 # weight for compact consistency loss
-mask_group_weight: 2.0 # weight for (mask_loss + consistency_loss) group loss
+mask_group_weight: 1.0 # weight for (mask_loss + consistency_loss) group loss
+lambda_compression: 0.5 # schedule peak for VQ compression loss
 lambda_bias: 0.5 # schedule peak for bias losses
 low_recon_weight: 0.5 # weight for low-level reconstruction loss
 low_recon_mean_weight: 1.0 # weight for mean reconstruction term
@@ -124,6 +145,8 @@ low_recon_mag_bins: "0,0.5,1.0,1.5,2.0,3.0" # bins for token-magnitude histogram
 nll_bin_weight: 0.5 # weight for NLL bin loss
 ttr_bin_weight: 0.5 # weight for TTR bin loss
 length_bin_weight: 0.5 # weight for length bin loss
+vq_task_weight: 0.5 # weight for VQ task loss
+vq_align_weight: 0.1 # weight for VQ alignment loss
 proxy_bin_weighting: ema_inverse # weighting strategy for proxy bin losses (static|ema_inverse)
 proxy_bin_normalize: true # normalize proxy bin weights (weighted average)
 proxy_bin_ema: 0.95 # EMA decay for proxy bin loss scale tracking
@@ -133,7 +156,7 @@ proxy_bin_max_weight: 10.0 # max per-loss proxy bin weight (0 = disabled)
 proxy_bin_warmup_steps: 200 # warmup steps before dynamic proxy weighting
 disentangle_weight: 0.5 # schedule peak for disentanglement loss
 disentangle_cos_weight: 1.0 # per-sample cosine disentanglement weight
-disentangle_cov_weight: 0.1 # cross-covariance disentanglement weight
+disentangle_cov_weight: 0.5 # cross-covariance disentanglement weight
 disentangle_cov_min_batch: 4 # min batch size to enable cross-covariance
 disentangle_cov_eps: 1.0e-6 # epsilon for covariance normalization
 disentangle_cov_gather: true # gather z_task/z_bias across ranks for cov
