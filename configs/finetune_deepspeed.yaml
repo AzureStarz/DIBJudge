@@ -7,49 +7,32 @@ use_rms_norm: true # use RMSNorm in custom heads
 rms_norm_eps: 1.0e-6 # RMSNorm epsilon
 use_swiglu: true # use SwiGLU activations in custom heads
 bias_mlp_hidden: 0 # hidden width for bias prompt MLP heads (0 = 2x encoder dim)
-bias_mlp_layers: 0 # number of hidden layers in bias prompt MLP heads
-bias_mlp_dropout: 0.0 # dropout rate for bias prompt MLP heads
+bias_mlp_layers: 2 # number of hidden layers in bias prompt MLP heads
+bias_mlp_dropout: 0.05 # dropout rate for bias prompt MLP heads
 task_mlp_hidden: 0 # hidden width for task MLP (0 = identity)
-task_mlp_layers: 0 # number of task MLP layers (0 = identity)
-task_mlp_dropout: 0.0 # dropout rate for task MLP
-task_lm_gate_hidden: 0 # hidden width for task LM gate MLP (0 = identity)
-task_lm_gate_layers: 0 # number of task LM gate MLP layers
-task_lm_gate_dropout: 0.0 # dropout rate for task LM gate MLP
-task_codebook_size: 256 # VQ codebook size for task latents
-vq_num_codebooks: 4 # number of VQ codebooks (multi-codebook)
-vq_commitment_gamma: 0.05 # commitment loss weight inside VQ
-vq_ema_decay: 0.99 # EMA decay for VQ codebooks
-vq_use_ema: true # use EMA updates for VQ codebooks
-vq_normalize_inputs: true # normalize inputs before VQ
-vq_codebook_trainable: false # allow gradient updates to VQ codebook
-vq_dead_code_threshold: 0.1 # fraction threshold for dead codes
-vq_reset_dead_codes: true # reset dead codes to batch vectors
-vq_align_samples: 512 # samples for alignment loss buffer
-vq_usage_weight: 0.2 # weight for code usage regularization
-vq_init_samples: 0 # number of samples for kmeans++ init (0 = auto)
-vq_init_batch_size: 128 # batch size for VQ init (0 = per_device_train_batch_size)
-vq_init_spherical: true # normalize samples for VQ init
-vq_init_seed: 42 # random seed for VQ init sampling
-vq_warmup_ratio: 0.1 # warmup ratio for VQ commitment/usage losses
+task_mlp_layers: 2 # number of task MLP layers (0 = identity)
+task_mlp_dropout: 0.05 # dropout rate for task MLP
+use_vib: true # enable VIB branch
+vib_hidden: 0 # hidden width for VIB MLP (0 = encoder dim)
+vib_layers: 2 # number of VIB MLP layers
+vib_dropout: 0.05 # dropout rate for VIB MLP
+vib_logvar_min: -5.0 # clamp min for VIB log-variance
+vib_logvar_max: 5.0 # clamp max for VIB log-variance
 encoder_trainable: last # which encoder layers to train (all|last|none)
 bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 0 # number of hidden layers for bias proxy heads
-bias_proxy_dropout: 0.0 # dropout for bias proxy heads
+bias_proxy_dropout: 0.05 # dropout for bias proxy heads
 low_recon_layer: 2 # encoder hidden layer index for low-level reconstruction
-compact_mu_token_id: -1 # token id to fill masked tokens (e.g., -1 for eos)
-compact_head_hidden: 0 # hidden width for compact head (0 = auto)
-compact_head_layers: 0 # number of hidden layers for compact head
-compact_head_dropout: 0.0 # dropout for compact head
 
 # data config
 data_path: data/train_data/mr3_preprocessed.jsonl # training dataset JSONL
 proxy_cache_path: data/train_data/mr3_preprocessed.Qwen3-4B.proxy.jsonl # precomputed proxy labels JSONL aligned to data_path
 require_both_responses: true # drop samples with empty response_B when response_B exists
-max_training_samples: 50000 # cap the number of training samples (0 = no cap)
+max_training_samples: 100000 # cap the number of training samples (0 = no cap)
 per_device_train_batch_size: 1 # micro-batch size per GPU
 num_workers: 0 # dataloader worker processes
 max_response_len: 8192 # max token length for response branch inputs
-max_lm_len: 12000 # max token length for LM inputs
+max_lm_len: 10000 # max token length for LM inputs
 prefilter_long_prompts: true # drop samples with prompt_len >= max_lm_len before training
 prefilter_long_prompts_log_samples: 0 # number of dropped prompt samples to log
 prefilter_long_prompts_preview: 120 # max characters to show for dropped prompt previews
@@ -66,21 +49,20 @@ proxy_length_quantiles: true # build length bins from quantiles
 proxy_soft_labels: true # use soft labels for proxy bin losses
 
 # runtime config
-epochs: 1 # number of training epochs
+epochs: 3 # number of training epochs
 deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
-output_dir: outputs/vq_default # checkpoint output directory
-log_dir: logs/vq_default # log output directory
-save_every_steps: 10000 # checkpoint save interval (0 = disabled)
+output_dir: outputs/100k_e2_vib_default_4B # checkpoint output directory
+log_dir: logs/100k_e2_vib_default_4B # log output directory
+save_every_steps: 50000 # checkpoint save interval (0 = disabled)
 save_at_end: true # save a checkpoint at end of training
 bf16: true # enable bfloat16 training
 allow_tf32: true # enable TF32 matmul kernels for speed
 gradient_checkpointing: false # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
 lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
-compact_kl_chunk_size: 128 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
-swanlab_run_name: vq_default # SwanLab run name
+swanlab_run_name: 100k_e3_vib_default_4B # SwanLab run name
 swanlab_tags: null # SwanLab tags list or null
 swanlab_log_steps: 1 # SwanLab logging interval
 
@@ -88,8 +70,6 @@ swanlab_log_steps: 1 # SwanLab logging interval
 debug_data: false # print batch shapes and lengths once
 debug_lm_sample: false # log one detokenized LM input sample before training
 debug_lm_sample_max_tokens: null # max LM tokens to detokenize (null = max_lm_len)
-debug_gate: false # run a single-batch gate sanity check before training
-debug_gate_max_tokens: 2048 # max tokens per sequence during debug gate (0 = full length)
 debug_aux_checks: false # enable gradient debug checks
 debug_aux_checks_interval: 10 # interval for debug checks
 debug_loss_spike: false # log batch diagnostics when lm_loss spikes
@@ -101,41 +81,31 @@ debug_loss_spike_preview: 120 # max characters for prompt/output previews on spi
 # LoRA config
 use_lora: true # enable LoRA for the judge LM
 freeze_lm_when_no_lora: true # freeze LM if LoRA is disabled
-lora_r: 8 # LoRA rank
-lora_alpha: 16 # LoRA scaling alpha
+lora_r: 16 # LoRA rank
+lora_alpha: 32 # LoRA scaling alpha
 lora_dropout: 0.05 # LoRA dropout
 lora_targets: q_proj,k_proj,v_proj,o_proj # comma-separated module names for LoRA
 
 # optimizer config
-encoder_lr: 2.0e-5 # learning rate for shared encoder
-lm_lr: 2.0e-5 # learning rate for judge LM (if unfrozen)
+encoder_lr: 1.0e-5 # learning rate for shared encoder
+lm_lr: 1.0e-5 # learning rate for judge LM (if unfrozen)
 lora_lr: 2.0e-4 # learning rate for LoRA params
-head_lr: 2.0e-4 # learning rate for heads (task/bias/resampler/prompt)
+head_lr: 1.0e-4 # learning rate for heads (task/bias/resampler/prompt)
 weight_decay: 0.01 # weight decay for main params
-head_weight_decay: 0 # weight decay for head params
+head_weight_decay: 0.01 # weight decay for head params
 max_grad_norm: 1.0 # gradient clipping norm
-grad_accum_steps: 16 # gradient accumulation steps
+grad_accum_steps: 4 # gradient accumulation steps
 
 # scheduler config
 warmup_steps: 0 # explicit warmup steps (0 = use warmup_ratio)
 warmup_ratio: 0.03 # warmup ratio of total steps
 scheduler_type: cosine # scheduler type for HF scheduler
 
-# compactor config
-compact_keep_init: 0.9 # schedule base keep ratio for compact masking
-compact_keep_min: 0.5 # schedule minimum keep ratio target
-disable_compactor: true
-disable_z_prompt_insertion: false
-compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value
-kl_weight: 1.0 # schedule peak for compact KL loss
-z_dropout: 0.0 # schedule peak for task prompt dropout
-
+# prompt injection config
+disable_z_prompt_insertion: false # disable task latent injection into LM input
 
 # loss config
-mask_loss_weight: 1.0 # weight for compact mask loss
-consistency_loss_weight: 1.0 # weight for compact consistency loss
-mask_group_weight: 1.0 # weight for (mask_loss + consistency_loss) group loss
-lambda_compression: 0.5 # schedule peak for VQ compression loss
+lambda_compression: 0.5 # schedule peak for VIB compression loss
 lambda_bias: 0.5 # schedule peak for bias losses
 low_recon_weight: 0.5 # weight for low-level reconstruction loss
 low_recon_mean_weight: 1.0 # weight for mean reconstruction term
@@ -145,8 +115,7 @@ low_recon_mag_bins: "0,0.5,1.0,1.5,2.0,3.0" # bins for token-magnitude histogram
 nll_bin_weight: 0.5 # weight for NLL bin loss
 ttr_bin_weight: 0.5 # weight for TTR bin loss
 length_bin_weight: 0.5 # weight for length bin loss
-vq_task_weight: 0.5 # weight for VQ task loss
-vq_align_weight: 0.1 # weight for VQ alignment loss
+vib_kl_weight: 1e-4 # weight for VIB KL loss
 proxy_bin_weighting: ema_inverse # weighting strategy for proxy bin losses (static|ema_inverse)
 proxy_bin_normalize: true # normalize proxy bin weights (weighted average)
 proxy_bin_ema: 0.95 # EMA decay for proxy bin loss scale tracking

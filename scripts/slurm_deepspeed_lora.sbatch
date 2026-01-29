@@ -72,28 +72,47 @@ deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
     --config configs/finetune_deepspeed.yaml
 
 # bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-#     --model outputs/vq_default/hf-epoch-1/lm \
-#     --checkpoint outputs/vq_default/hf-epoch-1/dibjudge \
-#     --output_dir results/Qwen3-4B/vq_default/hf-epoch-1 \
-#     --languages zh \
-#     --template mr3_templates \
-#     --tensor_parallel_size ${num_gpus}
-
-# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-#     --model outputs/vq_default/hf-epoch-2/lm \
-#     --checkpoint outputs/vq_default/hf-epoch-2/dibjudge \
-#     --output_dir results/Qwen3-4B/vq_default/hf-epoch-2 \
+#     --model outputs/vib_default/hf-epoch-1/lm \
+#     --checkpoint outputs/vib_default/hf-epoch-1/dibjudge \
+#     --output_dir results/Qwen3-4B/vib_default/hf-epoch-1 \
 #     --languages zh \
 #     --template mr3_templates \
 #     --tensor_parallel_size ${num_gpus}
 
 bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/vq_default/hf-epoch-1/lm \
-    --checkpoint outputs/vq_default/hf-epoch-1/dibjudge \
-    --output_dir results/Qwen3-4B/vq_default/hf-epoch-1 \
+    --model outputs/100k_e3_vib_default_4B/hf-epoch-3/lm \
+    --checkpoint outputs/100k_e3_vib_default_4B/hf-epoch-3/dibjudge \
+    --output_dir results/DIBJudge/100k_e3_vib_default_4B/hf-epoch-3 \
     --languages zh \
     --template mr3_templates \
     --tensor_parallel_size ${num_gpus}
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/10k_e3_vib_default_4B/hf-epoch-1/lm \
+#     --checkpoint outputs/10k_e3_vib_default_4B/hf-epoch-1/dibjudge \
+#     --output_dir results/DIBJudge/10k_e3_vib_default_4B/hf-epoch-1 \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
+
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/10k_e3_vib_default_4B/hf-epoch-2/lm \
+#     --checkpoint outputs/10k_e3_vib_default_4B/hf-epoch-2/dibjudge \
+#     --output_dir results/DIBJudge/10k_e3_vib_default_4B/hf-epoch-2 \
+#     --languages zh \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
+
+
+# bash scripts/slurm_dibjudge_evaluation.sbatch -- \
+#     --model outputs/10k_e3_vib_default_4B/hf-epoch-3/lm \
+#     --checkpoint outputs/10k_e3_vib_default_4B/hf-epoch-3/dibjudge \
+#     --output_dir results/DIBJudge/10k_e3_vib_default_4B/hf-epoch-3 \
+#     --languages zh \
+#     --embed-distributed \
+#     --template mr3_templates \
+#     --tensor_parallel_size ${num_gpus}
 
 # deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
 #     --config configs/finetune_deepspeed_50k.yaml

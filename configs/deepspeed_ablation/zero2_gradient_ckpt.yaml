@@ -17,10 +17,6 @@ bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 1 # number of hidden layers for bias proxy heads
 bias_proxy_dropout: 0.05 # dropout for bias proxy heads
 low_recon_layer: 2 # encoder hidden layer index for low-level reconstruction
-compact_mu_token_id: -1 # token id to fill masked tokens (e.g., -1 for eos)
-compact_head_hidden: 0 # hidden width for compact head (0 = auto)
-compact_head_layers: 0 # number of hidden layers for compact head
-compact_head_dropout: 0.05 # dropout for compact head
 
 # data config
 data_path: data/train_data/mr3_preprocessed.jsonl # training dataset JSONL
@@ -58,7 +54,6 @@ allow_tf32: true # enable TF32 matmul kernels for speed
 gradient_checkpointing: true # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
 lm_loss_chunk_size: 256 # optional chunk size for causal LM loss (0 = disabled)
-compact_kl_chunk_size: 128 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
 swanlab_run_name: zero2_gradient_ckpt # SwanLab run name
@@ -101,18 +96,10 @@ warmup_ratio: 0.03 # warmup ratio of total steps
 scheduler_type: cosine # scheduler type for HF scheduler
 
 # compactor config
-compact_keep_init: 0.9 # initial keep ratio for compact masking
-disable_compactor: true
 disable_z_prompt_insertion: true
-compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value
-kl_weight: 1.0 # weight for compact KL loss
-z_dropout: 0.0 # fixed z dropout for task prompts
 
 
 # loss config
-mask_loss_weight: 0.0 # weight for compact mask loss
-consistency_loss_weight: 0.0 # weight for compact consistency loss
-mask_group_weight: 0.0 # weight for (mask_loss + consistency_loss) group loss
 lambda_bias: 0.0 # global scale for bias losses
 low_recon_weight: 0.0 # weight for low-level reconstruction loss
 nll_bin_weight: 0.0 # weight for NLL bin loss

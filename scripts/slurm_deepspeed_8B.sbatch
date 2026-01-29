@@ -32,10 +32,9 @@ deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
     --config configs/finetune_deepspeed_8B.yaml
 
 bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/8B_bernoulli_default/hf-epoch-1/lm \
-    --checkpoint outputs/8B_bernoulli_default/hf-epoch-1/dibjudge \
-    --output_dir results/DIBJudge/8B_bernoulli_default/hf-epoch-1 \
+    --model outputs/100k_e3_vib_default_8B/hf-epoch-1/lm \
+    --checkpoint outputs/100k_e3_vib_default_8B/hf-epoch-1/dibjudge \
+    --output_dir results/DIBJudge/100k_e3_vib_default_8B/hf-epoch-1 \
     --languages zh \
     --template mr3_templates \
-    --use-compactor \
     --tensor_parallel_size ${num_gpus}

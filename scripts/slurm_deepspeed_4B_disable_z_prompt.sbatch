@@ -29,13 +29,13 @@ num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 echo "Detected ${num_gpus} GPUs"
 
 deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed \
-    --config configs/finetune_deepspeed_4B.yaml
+    --config configs/finetune_deepspeed_4B_disable_z_prompt.yaml
 
 bash scripts/slurm_dibjudge_evaluation.sbatch -- \
-    --model outputs/10k_e3_vib_default_4B/hf-epoch-2/lm \
-    --checkpoint outputs/10k_e3_vib_default_4B/hf-epoch-2/dibjudge \
-    --output_dir results/DIBJudge/10k_e3_vib_default_4B/hf-epoch-2 \
+    --model outputs/10k_e3_vib_default_4B_disable_z_prompt/hf-epoch-2/lm \
+    --checkpoint outputs/10k_e3_vib_default_4B_disable_z_prompt/hf-epoch-2/dibjudge \
+    --output_dir results/DIBJudge/10k_e3_vib_default_4B_disable_z_prompt/hf-epoch-2 \
     --languages zh \
     --template mr3_templates \
-    --enable-prompt-embeds \
+    --no-enable-prompt-embeds \
     --tensor_parallel_size ${num_gpus}

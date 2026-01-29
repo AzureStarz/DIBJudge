@@ -7,26 +7,32 @@ use_rms_norm: true # use RMSNorm in custom heads
 rms_norm_eps: 1.0e-6 # RMSNorm epsilon
 use_swiglu: true # use SwiGLU activations in custom heads
 bias_mlp_hidden: 0 # hidden width for bias prompt MLP heads (0 = 2x encoder dim)
-bias_mlp_layers: 0 # number of hidden layers in bias prompt MLP heads
-bias_mlp_dropout: 0.05 # dropout rate for bias prompt MLP heads
+bias_mlp_layers: 2 # number of hidden layers in bias prompt MLP heads
+bias_mlp_dropout: 0.0 # dropout rate for bias prompt MLP heads
 task_mlp_hidden: 0 # hidden width for task MLP (0 = identity)
-task_mlp_layers: 0 # number of task MLP layers (0 = identity)
+task_mlp_layers: 2 # number of task MLP layers (0 = identity)
 task_mlp_dropout: 0.0 # dropout rate for task MLP
+use_vib: true # enable VIB branch
+vib_hidden: 0 # hidden width for VIB MLP (0 = encoder dim)
+vib_layers: 2 # number of VIB MLP layers
+vib_dropout: 0.0 # dropout rate for VIB MLP
+vib_logvar_min: -5.0 # clamp min for VIB log-variance
+vib_logvar_max: 5.0 # clamp max for VIB log-variance
 encoder_trainable: last # which encoder layers to train (all|last|none)
 bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
-bias_proxy_layers: 1 # number of hidden layers for bias proxy heads
-bias_proxy_dropout: 0.05 # dropout for bias proxy heads
+bias_proxy_layers: 0 # number of hidden layers for bias proxy heads
+bias_proxy_dropout: 0.0 # dropout for bias proxy heads
 low_recon_layer: 2 # encoder hidden layer index for low-level reconstruction
 
 # data config
 data_path: data/train_data/mr3_preprocessed.jsonl # training dataset JSONL
-proxy_cache_path: null # precomputed proxy labels JSONL aligned to data_path
+proxy_cache_path: data/train_data/mr3_preprocessed.Qwen3-4B.proxy.jsonl # precomputed proxy labels JSONL aligned to data_path
 require_both_responses: true # drop samples with empty response_B when response_B exists
-max_training_samples: 10000 # cap the number of training samples (0 = no cap)
+max_training_samples: 50000 # cap the number of training samples (0 = no cap)
 per_device_train_batch_size: 1 # micro-batch size per GPU
-num_workers: 4 # dataloader worker processes
+num_workers: 0 # dataloader worker processes
 max_response_len: 8192 # max token length for response branch inputs
-max_lm_len: 16384 # max token length for LM inputs
+max_lm_len: 12000 # max token length for LM inputs
 prefilter_long_prompts: true # drop samples with prompt_len >= max_lm_len before training
 prefilter_long_prompts_log_samples: 0 # number of dropped prompt samples to log
 prefilter_long_prompts_preview: 120 # max characters to show for dropped prompt previews
@@ -43,20 +49,20 @@ proxy_length_quantiles: true # build length bins from quantiles
 proxy_soft_labels: true # use soft labels for proxy bin losses
 
 # runtime config
-epochs: 1 # number of training epochs
-deepspeed_config: configs/deepspeed/ds_z2_config.json # DeepSpeed json config path
-output_dir: outputs/zero2_no_gradient_ckpt # checkpoint output directory
-log_dir: logs/zero2_no_gradient_ckpt # log output directory
-save_every_steps: 0 # checkpoint save interval (0 = disabled)
+epochs: 3 # number of training epochs
+deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
+output_dir: outputs/50k_e3_vib_default_4B_disable_z_prompt # checkpoint output directory
+log_dir: logs/50k_e3_vib_default_4B_disable_z_prompt # log output directory
+save_every_steps: 10000 # checkpoint save interval (0 = disabled)
 save_at_end: true # save a checkpoint at end of training
 bf16: true # enable bfloat16 training
 allow_tf32: true # enable TF32 matmul kernels for speed
 gradient_checkpointing: false # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
-lm_loss_chunk_size: 256 # optional chunk size for causal LM loss (0 = disabled)
+lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
-swanlab_run_name: zero2_no_gradient_ckpt # SwanLab run name
+swanlab_run_name: 50k_e3_vib_default_4B_disable_z_prompt # SwanLab run name
 swanlab_tags: null # SwanLab tags list or null
 swanlab_log_steps: 1 # SwanLab logging interval
 
@@ -75,34 +81,53 @@ debug_loss_spike_preview: 120 # max characters for prompt/output previews on spi
 # LoRA config
 use_lora: true # enable LoRA for the judge LM
 freeze_lm_when_no_lora: true # freeze LM if LoRA is disabled
-lora_r: 8 # LoRA rank
-lora_alpha: 16 # LoRA scaling alpha
+lora_r: 16 # LoRA rank
+lora_alpha: 32 # LoRA scaling alpha
 lora_dropout: 0.05 # LoRA dropout
 lora_targets: q_proj,k_proj,v_proj,o_proj # comma-separated module names for LoRA
 
 # optimizer config
-encoder_lr: 2.0e-5 # learning rate for shared encoder
-lm_lr: 2.0e-5 # learning rate for judge LM (if unfrozen)
+encoder_lr: 1.0e-5 # learning rate for shared encoder
+lm_lr: 1.0e-5 # learning rate for judge LM (if unfrozen)
 lora_lr: 2.0e-4 # learning rate for LoRA params
 head_lr: 2.0e-4 # learning rate for heads (task/bias/resampler/prompt)
 weight_decay: 0.01 # weight decay for main params
-head_weight_decay: 0 # weight decay for head params
+head_weight_decay: 0.01 # weight decay for head params
 max_grad_norm: 1.0 # gradient clipping norm
-grad_accum_steps: 16 # gradient accumulation steps
+grad_accum_steps: 8 # gradient accumulation steps
 
 # scheduler config
 warmup_steps: 0 # explicit warmup steps (0 = use warmup_ratio)
 warmup_ratio: 0.03 # warmup ratio of total steps
 scheduler_type: cosine # scheduler type for HF scheduler
 
-# compactor config
-disable_z_prompt_insertion: true
-
+# prompt injection config
+disable_z_prompt_insertion: true # disable task latent injection into LM input
 
 # loss config
-lambda_bias: 0.0 # global scale for bias losses
-low_recon_weight: 0.0 # weight for low-level reconstruction loss
-nll_bin_weight: 0.0 # weight for NLL bin loss
-ttr_bin_weight: 0.0 # weight for TTR bin loss
-length_bin_weight: 0.0 # weight for length bin loss
-disentangle_weight: 0.0 # global scale for disentanglement loss
+lambda_compression: 0.5 # schedule peak for VIB compression loss
+lambda_bias: 0.5 # schedule peak for bias losses
+low_recon_weight: 0.5 # weight for low-level reconstruction loss
+low_recon_mean_weight: 1.0 # weight for mean reconstruction term
+low_recon_logvar_weight: 0.25 # weight for log-variance reconstruction term
+low_recon_mag_weight: 0.25 # weight for normalized token-magnitude reconstruction term
+low_recon_mag_bins: "0,0.5,1.0,1.5,2.0,3.0" # bins for token-magnitude histogram
+nll_bin_weight: 0.5 # weight for NLL bin loss
+ttr_bin_weight: 0.5 # weight for TTR bin loss
+length_bin_weight: 0.5 # weight for length bin loss
+vib_kl_weight: 1e-4 # weight for VIB KL loss
+proxy_bin_weighting: ema_inverse # weighting strategy for proxy bin losses (static|ema_inverse)
+proxy_bin_normalize: true # normalize proxy bin weights (weighted average)
+proxy_bin_ema: 0.95 # EMA decay for proxy bin loss scale tracking
+proxy_bin_weight_eps: 1.0e-6 # epsilon for inverse-EMA proxy weighting
+proxy_bin_min_weight: 0.0 # min per-loss proxy bin weight (0 = disabled)
+proxy_bin_max_weight: 10.0 # max per-loss proxy bin weight (0 = disabled)
+proxy_bin_warmup_steps: 200 # warmup steps before dynamic proxy weighting
+disentangle_weight: 0.5 # schedule peak for disentanglement loss
+disentangle_cos_weight: 1.0 # per-sample cosine disentanglement weight
+disentangle_cov_weight: 0.5 # cross-covariance disentanglement weight
+disentangle_cov_min_batch: 4 # min batch size to enable cross-covariance
+disentangle_cov_eps: 1.0e-6 # epsilon for covariance normalization
+disentangle_cov_gather: true # gather z_task/z_bias across ranks for cov
+disentangle_cov_full_grad: false # enable cross-rank gradients (slower)
+disentangle_cov_queue_size: 512 # FIFO size for detached cov queue

@@ -4,6 +4,12 @@
   "gradient_accumulation_steps": "auto",
   "gradient_clipping": "auto",
   "zero_allow_untested_optimizer": true,
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": true,
+    "contiguous_memory_optimization": true,
+    "synchronize_checkpoint_boundary": true
+  },
   "fp16": {
     "enabled": "auto",
     "loss_scale": 0,

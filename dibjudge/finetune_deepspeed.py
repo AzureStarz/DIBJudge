@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import math
 import warnings
 import os
@@ -146,38 +147,10 @@ def _build_dib_schedule(
             return cap if auto else 0.0
         return min(value, cap)
 
-    def _clamp01(value: float) -> float:
-        return min(max(float(value), 0.0), 1.0)
-
-    base_keep = min(max(float(args.compact_keep_init), 0.0), 1.0)
-    keep_min_arg = float(getattr(args, "compact_keep_min", -1.0))
-    if keep_min_arg > 0.0:
-        keep_min = _clamp01(keep_min_arg)
-    else:
-        keep_min_floor = 0.65 if small else 0.60
-        keep_min = max(keep_min_floor, base_keep - (0.25 if small else 0.30))
-        keep_min = _clamp01(keep_min)
-
     stage1_end = 0.20
     stage2_end = 0.45
     stage3_end = 0.75
-
-    keep_stage3 = _clamp01(max(keep_min, 0.40))
-    keep_stage2 = _clamp01(max(0.70, keep_stage3))
-    keep_stage1 = _clamp01(max(1.0, keep_stage2))
-
-    kl_cap = 0.8 if small else 1.5
-    kl_peak = _cap_positive(
-        float(args.kl_weight),
-        kl_cap,
-        auto=False,
-    )
     disentangle_peak = max(0.0, float(args.disentangle_weight))
-    z_peak = _cap_positive(
-        float(args.z_dropout),
-        0.15 if small else 0.25,
-        auto=True,
-    )
     lambda_bias_peak = _cap_positive(
         float(args.lambda_bias),
         0.5 if small else 1.0,
@@ -188,27 +161,8 @@ def _build_dib_schedule(
         0.5 if small else 1.0,
         auto=False,
     )
-    vq_warmup = min(max(float(getattr(args, "vq_warmup_ratio", 0.1)), 0.0), 1.0)
-    vq_ramp_end = stage2_end + (stage3_end - stage2_end) * vq_warmup
-    vq_ramp_end = min(1.0, max(stage2_end + 0.05, vq_ramp_end))
-
-    keep_points = [
-        (0.0, keep_stage1),
-        (stage1_end, keep_stage1),
-        (stage2_end, keep_stage2),
-        (stage3_end, keep_stage3),
-        (1.0, keep_stage3),
-    ]
 
     return {
-        "keep_ratio": keep_points,
-        "kl_weight": [
-            (0.0, 0.0),
-            (stage1_end, 0.0),
-            (stage2_end, 0.20 * kl_peak),
-            (stage3_end, 1.00 * kl_peak),
-            (1.0, 0.70 * kl_peak),
-        ],
         "disentangle_weight": [
             (0.0, 0.0),
             (stage1_end, 0.0),
@@ -216,27 +170,9 @@ def _build_dib_schedule(
             (stage3_end, 1.00 * disentangle_peak),
             (1.0, 1.00 * disentangle_peak),
         ],
-        "z_dropout": [
-            (0.0, 0.0),
-            (stage1_end, 0.0),
-            (stage2_end, 0.40 * z_peak),
-            (stage3_end, 1.00 * z_peak),
-            (1.0, 0.20 * z_peak),
-        ],
-        "vq_commit_scale": (
-            [(0.0, 1.0), (1.0, 1.0)]
-            if vq_warmup <= 0.0
-            else [
-                (0.0, 0.0),
-                (stage1_end, 0.0),
-                (stage2_end, 0.40),
-                (vq_ramp_end, 1.00),
-                (1.0, 1.00),
-            ]
-        ),
         "lambda_compression": [
-            (0.0, 0.00 * lambda_compression_peak),
-            (stage1_end, 0.00 * lambda_compression_peak),
+            (0.0, 0.05 * lambda_compression_peak),
+            (stage1_end, 0.10 * lambda_compression_peak),
             (stage2_end, 0.35 * lambda_compression_peak),
             (stage3_end, 1.00 * lambda_compression_peak),
             (1.0, 1.00 * lambda_compression_peak),
@@ -247,20 +183,6 @@ def _build_dib_schedule(
             (stage2_end, 0.50 * lambda_bias_peak),
             (stage3_end, 1.00 * lambda_bias_peak),
             (1.0, 0.90 * lambda_bias_peak),
-        ],
-        "vq_usage_weight": [
-            (0.0, 0.0),
-            (stage1_end, 0.0),
-            (stage2_end, 0.50 * float(args.vq_usage_weight)),
-            (stage3_end, 1.00 * float(args.vq_usage_weight)),
-            (1.0, 1.00 * float(args.vq_usage_weight)),
-        ],
-        "vq_align_weight": [
-            (0.0, 0.0),
-            (stage1_end, 0.0),
-            (stage2_end, 0.20 * float(args.vq_align_weight)),
-            (stage3_end, 0.60 * float(args.vq_align_weight)),
-            (1.0, 0.50 * float(args.vq_align_weight)),
         ],
     }
 
@@ -287,26 +209,18 @@ def _log_dib_schedule(
         points_set.update(p for p, _ in points)
     points = sorted(points_set)
     max_step = max(0, int(total_steps) - 1)
-    keep_points = schedule.get("keep_ratio", [])
-    keep_min = min((val for _, val in keep_points), default=0.0)
     lines = [
-        f"[schedule] curriculum (dataset={dataset_size} total_steps={total_steps} keep_min={keep_min:.2f})",
-        "progress  step  keep_ratio  kl_weight  z_dropout  vq_commit  lambda_comp  lambda_bias  disentangle  vq_usage  vq_align",
+        f"[schedule] curriculum (dataset={dataset_size} total_steps={total_steps})",
+        "progress  step  lambda_comp  lambda_bias  disentangle",
     ]
     for p in points:
         vals = _eval_dib_schedule(schedule, p)
         step = int(round(float(p) * max_step))
         lines.append(
             f"{p:>7.2f} {step:>6d} "
-            f"{vals['keep_ratio']:>10.3f} "
-            f"{vals['kl_weight']:>9.3f} "
-            f"{vals['z_dropout']:>9.3f} "
-            f"{vals['vq_commit_scale']:>9.3f} "
             f"{vals['lambda_compression']:>11.3f} "
             f"{vals['lambda_bias']:>11.3f} "
-            f"{vals['disentangle_weight']:>11.3f} "
-            f"{vals['vq_usage_weight']:>8.3f} "
-            f"{vals['vq_align_weight']:>8.3f}"
+            f"{vals['disentangle_weight']:>11.3f}"
         )
     _rank0_print(rank, "\n".join(lines))
 
@@ -342,6 +256,129 @@ def _maybe_tqdm(iterable, rank: int, desc: str):
         return iterable
     total = len(iterable) if hasattr(iterable, "__len__") else None
     return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+
+
+def _load_ds_config(config: object) -> object:
+    if isinstance(config, str) and os.path.isfile(config):
+        with open(config, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    return config
+
+
+def _configure_deepspeed_activation_checkpointing(
+    ds_config: object, rank: int
+) -> Tuple[Optional[object], bool]:
+    if not isinstance(ds_config, dict):
+        return None, True
+    cfg = ds_config.get("activation_checkpointing")
+    if not cfg:
+        return None, True
+    try:
+        import deepspeed.checkpointing as ds_checkpoint
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] deepspeed.checkpointing unavailable: {exc}")
+        return None, True
+    if hasattr(ds_checkpoint, "is_configured"):
+        try:
+            if ds_checkpoint.is_configured():
+                return ds_checkpoint.checkpoint, False
+        except Exception:
+            pass
+    cfg = cfg if isinstance(cfg, dict) else {}
+    kwargs = {
+        "partition_activations": bool(cfg.get("partition_activations", False)),
+        "cpu_checkpointing": bool(cfg.get("cpu_checkpointing", False)),
+        "contiguous_memory_optimization": bool(
+            cfg.get("contiguous_memory_optimization", False)
+        ),
+        "synchronize_checkpoint_boundary": bool(
+            cfg.get("synchronize_checkpoint_boundary", False)
+        ),
+    }
+    if "profile" in cfg:
+        kwargs["profile"] = bool(cfg["profile"])
+    try:
+        sig = inspect.signature(ds_checkpoint.configure)
+        allowed = set(sig.parameters.keys())
+        kwargs = {key: value for key, value in kwargs.items() if key in allowed}
+        ds_checkpoint.configure(**kwargs)
+        _rank0_print(rank, "[stage done] deepspeed activation checkpointing configured")
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to configure deepspeed checkpointing: {exc}")
+        return None, True
+    return ds_checkpoint.checkpoint, False
+
+
+
+
+def _move_batch_to_device(
+    batch: Dict[str, object],
+    device: torch.device,
+    keys: Optional[Iterable[str]] = None,
+) -> Dict[str, object]:
+    """Move only required tensors to GPU to reduce peak memory."""
+    key_set = set(keys) if keys is not None else None
+    moved: Dict[str, object] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and (key_set is None or key in key_set):
+            moved[key] = value.to(device, non_blocking=True)
+        else:
+            moved[key] = value
+    return moved
+
+
+def _warn_if_zero3_offload_inactive(
+    engine, ds_config: object, rank: int
+) -> None:
+    zero_stage_cfg = _resolve_zero_stage(ds_config)
+    if zero_stage_cfg != 3:
+        return
+    expected_offload = _resolve_zero_offload(ds_config)
+    stage_runtime = getattr(engine, "zero_optimization_stage", None)
+    if callable(stage_runtime):
+        try:
+            stage_runtime = stage_runtime()
+        except Exception:
+            stage_runtime = None
+    if stage_runtime is None:
+        stage_runtime = getattr(engine, "zero_optimization_stage", None)
+    if stage_runtime is not None:
+        try:
+            if int(stage_runtime) != 3:
+                _rank0_print(
+                    rank,
+                    f"[warn] DeepSpeed reports zero_stage={stage_runtime}; expected 3",
+                )
+        except (TypeError, ValueError):
+            pass
+    total_elems = 0
+    cuda_elems = 0
+    total_bytes = 0
+    cuda_bytes = 0
+    for param in engine.module.parameters():
+        numel = param.numel()
+        total_elems += numel
+        total_bytes += numel * param.element_size()
+        if param.is_cuda:
+            cuda_elems += numel
+            cuda_bytes += numel * param.element_size()
+    if total_elems == 0:
+        return
+    frac = cuda_elems / max(1, total_elems)
+    if expected_offload and cuda_bytes > 0:
+        if frac >= 0.05 or cuda_bytes >= 200 * 1024 * 1024:
+            _rank0_print(
+                rank,
+                "[warn] ZeRO-3 offload expected but a large share of parameters remain on GPU "
+                f"({cuda_bytes / (1024**2):.1f} MB, {frac:.1%}). "
+                "Offload may be inactive or overridden by device_map.",
+            )
+        else:
+            _rank0_print(
+                rank,
+                "[warn] ZeRO-3 offload expected but some parameters remain on GPU "
+                f"({cuda_bytes / (1024**2):.1f} MB, {frac:.1%}).",
+            )
 
 
 def _install_checkpoint_warning_hook(rank: int, log_path: Optional[str] = None) -> None:
@@ -476,117 +513,6 @@ def _param_grad_norm(params: List[torch.nn.Parameter], device: torch.device) -> 
         total += grad.pow(2).sum()
     return float(total.sqrt().item())
 
-
-
-def _collect_vq_task_samples(
-    model: DIBJudgeModel,
-    dataset: DIBJudgeDataset,
-    collator: DIBJudgeCollator,
-    max_samples: int,
-    batch_size: int,
-    device: torch.device,
-    seed: int,
-    rank: int,
-) -> Optional[torch.Tensor]:
-    if max_samples <= 0 or len(dataset) == 0:
-        return None
-    batch_size = max(1, int(batch_size))
-    generator = torch.Generator()
-    generator.manual_seed(int(seed))
-    indices = torch.randperm(len(dataset), generator=generator).tolist()
-    samples: List[torch.Tensor] = []
-    total = 0
-    batch_examples = []
-    model_was_training = model.training
-    model.eval()
-
-    def _random_subset(vectors: torch.Tensor, count: int) -> torch.Tensor:
-        if count <= 0 or vectors.numel() == 0:
-            return vectors.new_zeros((0, vectors.size(-1)))
-        if vectors.size(0) <= count:
-            return vectors
-        idx = torch.randperm(vectors.size(0), device=vectors.device)[:count]
-        return vectors[idx]
-
-    def _sample_task_tokens(
-        task_tokens: torch.Tensor,
-        token_mask: Optional[torch.Tensor],
-        count: int,
-    ) -> torch.Tensor:
-        if count <= 0 or task_tokens.numel() == 0:
-            return task_tokens.new_zeros((0, task_tokens.size(-1)))
-        if token_mask is None or not token_mask.any():
-            flat = task_tokens.reshape(-1, task_tokens.size(-1))
-            return _random_subset(flat, count)
-        flat = task_tokens[token_mask.bool()]
-        return _random_subset(flat, count)
-
-    try:
-        with torch.no_grad():
-            for idx in indices:
-                batch_examples.append(dataset[idx])
-                if len(batch_examples) < batch_size:
-                    continue
-                batch = collator(batch_examples)
-                batch_examples = []
-                orig_ids = batch["original_input_ids"].to(device)
-                orig_mask = batch["original_attention_mask"].to(device)
-                hidden, orig_mask, _orig_shape, _ = model._encode_bias_bundle(
-                    orig_ids,
-                    orig_mask,
-                    need_low_hidden=False,
-                    response_mask=None,
-                )
-                task_tokens = model.task_mlp(hidden)
-                needed = max_samples - total
-                if needed <= 0:
-                    break
-                flat = _sample_task_tokens(task_tokens, orig_mask, needed)
-                samples.append(flat.detach().cpu())
-                total += flat.size(0)
-                if total >= max_samples:
-                    break
-            if batch_examples and total < max_samples:
-                batch = collator(batch_examples)
-                orig_ids = batch["original_input_ids"].to(device)
-                orig_mask = batch["original_attention_mask"].to(device)
-                hidden, orig_mask, _orig_shape, _ = model._encode_bias_bundle(
-                    orig_ids,
-                    orig_mask,
-                    need_low_hidden=False,
-                    response_mask=None,
-                )
-                task_tokens = model.task_mlp(hidden)
-                needed = max_samples - total
-                if needed > 0:
-                    flat = _sample_task_tokens(task_tokens, orig_mask, needed)
-                    samples.append(flat.detach().cpu())
-                    total += flat.size(0)
-    finally:
-        if model_was_training:
-            model.train()
-    if not samples:
-        _rank0_print(rank, "[warn] VQ init requested but no samples were collected.")
-        return None
-    collected = torch.cat(samples, dim=0)
-    _rank0_print(rank, f"[stage done] collected {collected.size(0)} VQ init samples")
-    return collected
-
-
-def _resolve_vq_init_samples(args: argparse.Namespace, dataset_len: int, rank: int) -> int:
-    requested = int(getattr(args, "vq_init_samples", 0))
-    if requested > 0:
-        return requested
-    num_codes = max(1, int(getattr(args, "task_codebook_size", 1)))
-    num_codebooks = max(1, int(getattr(args, "vq_num_codebooks", 1)))
-    token_scale = 128
-    target = int(num_codes * num_codebooks * token_scale)
-    target = max(10000, target)
-    if dataset_len > 0:
-        target = min(target, int(dataset_len) * token_scale)
-    if rank == 0:
-        _rank0_print(rank, f"[stage done] auto vq_init_samples={target}")
-    return int(target)
 
 
 def _grad_norm_from_loss(
@@ -756,6 +682,32 @@ def _resolve_zero_stage(config: object) -> Optional[int]:
         return int(stage)
     except (TypeError, ValueError):
         return None
+
+
+def _resolve_zero_offload(config: object) -> bool:
+    cfg = None
+    if isinstance(config, str) and os.path.isfile(config):
+        try:
+            with open(config, "r", encoding="utf-8") as handle:
+                cfg = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return False
+    elif isinstance(config, dict):
+        cfg = config
+    if not isinstance(cfg, dict):
+        return False
+    zero_opt = cfg.get("zero_optimization")
+    if not isinstance(zero_opt, dict):
+        return False
+    for key in ("offload_optimizer", "offload_param"):
+        offload = zero_opt.get(key)
+        if isinstance(offload, dict):
+            device = str(offload.get("device", "")).lower()
+            if device in {"cpu", "nvme"}:
+                return True
+        elif isinstance(offload, bool) and offload:
+            return True
+    return False
 
 
 def _parse_bins(text: str, cast=float) -> List:
@@ -1310,22 +1262,15 @@ def _save_hf_from_zero(
         rms_norm_eps=args.rms_norm_eps,
         use_swiglu=args.use_swiglu,
         z_latent_dim=args.z_latent_dim,
-        task_codebook_size=args.task_codebook_size,
-        vq_num_codebooks=args.vq_num_codebooks,
-        vq_commitment_gamma=args.vq_commitment_gamma,
-        vq_ema_decay=args.vq_ema_decay,
-        vq_use_ema=args.vq_use_ema,
-        vq_normalize_inputs=args.vq_normalize_inputs,
-        vq_codebook_trainable=args.vq_codebook_trainable,
-        vq_dead_code_threshold=args.vq_dead_code_threshold,
-        vq_reset_dead_codes=args.vq_reset_dead_codes,
-        vq_align_samples=args.vq_align_samples,
+        use_vib=args.use_vib,
         task_mlp_hidden=args.task_mlp_hidden,
         task_mlp_layers=args.task_mlp_layers,
         task_mlp_dropout=args.task_mlp_dropout,
-        task_lm_gate_hidden=args.task_lm_gate_hidden,
-        task_lm_gate_layers=args.task_lm_gate_layers,
-        task_lm_gate_dropout=args.task_lm_gate_dropout,
+        vib_hidden=args.vib_hidden,
+        vib_layers=args.vib_layers,
+        vib_dropout=args.vib_dropout,
+        vib_logvar_min=args.vib_logvar_min,
+        vib_logvar_max=args.vib_logvar_max,
         bias_mlp_hidden=args.bias_mlp_hidden,
         bias_mlp_layers=args.bias_mlp_layers,
         bias_mlp_dropout=args.bias_mlp_dropout,
@@ -1338,14 +1283,7 @@ def _save_hf_from_zero(
             _parse_bins(getattr(args, "low_recon_mag_bins", None), float)
             or DIBJudgeConfig.low_recon_mag_bins
         ),
-        compact_prior=args.compact_keep_init,
-        compact_mu_token_id=args.compact_mu_token_id,
-        compact_head_hidden=args.compact_head_hidden,
-        compact_head_layers=args.compact_head_layers,
-        compact_head_dropout=args.compact_head_dropout,
-        compact_pi_init=args.compact_pi_init,
         lm_loss_chunk_size=args.lm_loss_chunk_size,
-        compact_kl_chunk_size=args.compact_kl_chunk_size,
         disentangle_cos_weight=args.disentangle_cos_weight,
         disentangle_cov_weight=args.disentangle_cov_weight,
         disentangle_cov_min_batch=args.disentangle_cov_min_batch,
@@ -1359,7 +1297,6 @@ def _save_hf_from_zero(
     with open(config_path, "w", encoding="utf-8") as handle:
         payload = asdict(config)
         payload["model_type"] = "dibjudge"
-        payload["use_compactor"] = not bool(args.disable_compactor)
         json.dump(payload, handle, indent=2)
     dibjudge_state = _cast_state_dict(dibjudge_state, save_dtype)
     _save_state_dict(dibjudge_state, dibjudge_dir, rank)
@@ -1376,6 +1313,58 @@ def _print_trainable_params(model: torch.nn.Module, rank: int) -> None:
             trainable += count
     pct = (100.0 * trainable / total) if total else 0.0
     _rank0_print(rank, f"[params] trainable={trainable:,} total={total:,} ({pct:.2f}%)")
+
+
+def _find_param_group_lr(
+    optimizer: Optional[torch.optim.Optimizer], param: torch.nn.Parameter
+) -> Optional[float]:
+    if optimizer is None:
+        return None
+    target_id = id(param)
+    for group in optimizer.param_groups:
+        params = group.get("params")
+        if not params:
+            continue
+        for p in params:
+            if p is param or id(p) == target_id:
+                return float(group.get("lr", 0.0))
+    return None
+
+
+def _log_vib_status(
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    rank: int,
+) -> None:
+    use_vib = bool(getattr(getattr(model, "config", None), "use_vib", True))
+    # use_vib = True
+    if not use_vib:
+        _rank0_print(rank, "[vib] disabled")
+        return
+    vib_to_lm = getattr(model, "vib_to_lm", None)
+    vib_task = getattr(model, "vib_task", None)
+    if vib_to_lm is None or vib_task is None:
+        _rank0_print(rank, "[warn] use_vib true but vib modules are missing")
+        return
+    vib_to_lm_param = getattr(vib_to_lm, "weight", None)
+    if vib_to_lm_param is not None:
+        lr = _find_param_group_lr(optimizer, vib_to_lm_param)
+        _rank0_print(
+            rank,
+            "[vib] vib_to_lm",
+            f"requires_grad={bool(vib_to_lm_param.requires_grad)}",
+            f"lr={lr if lr is not None else 'n/a'}",
+            f"norm={float(vib_to_lm_param.detach().norm().item()):.6f}",
+        )
+    vib_task_params = list(vib_task.parameters())
+    vib_task_trainable = sum(p.numel() for p in vib_task_params if p.requires_grad)
+    vib_task_total = sum(p.numel() for p in vib_task_params)
+    _rank0_print(
+        rank,
+        "[vib] vib_task",
+        f"trainable={vib_task_trainable:,}",
+        f"total={vib_task_total:,}",
+    )
 
 
 def _set_lm_trainable(model: DIBJudgeModel, trainable: bool, rank: int) -> None:
@@ -1531,11 +1520,10 @@ def _build_optimizer_params(
         "head": [],
     }
     head_prefixes = (
-        "vq_task.",
-        "task_latent_to_lm.",
         "task_latent_to_encoder.",
-        "task_lm_gate",
         "task_mlp.",
+        "vib_task.",
+        "vib_to_lm.",
         "bias_mlp.",
         "low_recon_head.",
         "low_recon_mean_head.",
@@ -1544,7 +1532,6 @@ def _build_optimizer_params(
         "length_bin_head.",
         "nll_bin_head.",
         "ttr_bin_head.",
-        "compact_head.",
     )
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -1591,11 +1578,27 @@ def _build_optimizer(
     args: argparse.Namespace,
     rank: int,
     zero_stage: Optional[int],
+    zero_offload: bool,
 ) -> torch.optim.Optimizer:
     use_low_precision = bool(args.bf16) or str(getattr(args, "torch_dtype", "")).lower() in {
         "float16",
         "bfloat16",
     }
+    if zero_offload:
+        try:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+        except ImportError as exc:
+            _rank0_print(
+                rank,
+                "[warn] DeepSpeedCPUAdam unavailable; "
+                f"falling back to AdamW ({exc}).",
+            )
+        else:
+            _rank0_print(
+                rank,
+                "[stage done] using DeepSpeedCPUAdam for ZeRO-Offload",
+            )
+            return DeepSpeedCPUAdam(optimizer_params)
     if zero_stage == 0 and args.use_lora and use_low_precision:
         try:
             from deepspeed.ops.adam import FusedAdam
@@ -1689,74 +1692,32 @@ def main() -> None:
     parser.add_argument("--task-mlp-hidden", type=int, default=0)
     parser.add_argument("--task-mlp-layers", type=int, default=0)
     parser.add_argument("--task-mlp-dropout", type=float, default=0.0)
-    parser.add_argument("--task-lm-gate-hidden", type=int, default=0)
-    parser.add_argument("--task-lm-gate-layers", type=int, default=1)
-    parser.add_argument("--task-lm-gate-dropout", type=float, default=0.0)
-    parser.add_argument("--task-codebook-size", type=int, default=1024)
-    parser.add_argument("--vq-num-codebooks", type=int, default=4)
-    parser.add_argument("--vq-commitment-gamma", type=float, default=0.05)
-    parser.add_argument("--vq-ema-decay", type=float, default=0.99)
+    parser.add_argument("--vib-hidden", type=int, default=0)
+    parser.add_argument("--vib-layers", type=int, default=2)
+    parser.add_argument("--vib-dropout", type=float, default=0.0)
     parser.add_argument(
-        "--vq-use-ema",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use EMA updates for VQ codebooks.",
-    )
-    parser.add_argument(
-        "--vq-normalize-inputs",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Normalize encoder outputs before VQ.",
-    )
-    parser.add_argument(
-        "--vq-codebook-trainable",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Allow gradient updates to VQ codebooks in addition to EMA.",
-    )
-    parser.add_argument("--vq-dead-code-threshold", type=float, default=0.1)
-    parser.add_argument(
-        "--vq-reset-dead-codes",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Reset dead codes to random batch vectors.",
-    )
-    parser.add_argument("--vq-align-samples", type=int, default=512)
-    parser.add_argument(
-        "--vq-usage-weight",
+        "--vib-logvar-min",
         type=float,
-        default=0.1,
-        help="Weight for code usage regularization.",
+        default=-10.0,
+        help="Clamp minimum for VIB log-variance to stabilize KL.",
     )
     parser.add_argument(
-        "--vq-init-samples",
-        type=int,
-        default=0,
-        help="Number of task tokens to sample for VQ codebook kmeans++ init (0 = auto).",
+        "--vib-logvar-max",
+        type=float,
+        default=10.0,
+        help="Clamp maximum for VIB log-variance to stabilize KL.",
     )
     parser.add_argument(
-        "--vq-init-batch-size",
-        type=int,
-        default=0,
-        help="Batch size for VQ init forward passes (0 = per_device_train_batch_size).",
+        "--vib-kl-weight",
+        type=float,
+        default=1.0,
+        help="Weight for VIB KL loss (multiplied by lambda_compression).",
     )
     parser.add_argument(
-        "--vq-init-spherical",
+        "--use-vib",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Normalize samples before VQ codebook initialization.",
-    )
-    parser.add_argument(
-        "--vq-init-seed",
-        type=int,
-        default=0,
-        help="Random seed for VQ codebook init sampling.",
-    )
-    parser.add_argument(
-        "--vq-warmup-ratio",
-        type=float,
-        default=0.1,
-        help="Linear warmup ratio for VQ commitment/usage losses (0-1).",
+        help="Enable the VIB branch.",
     )
     parser.add_argument("--bottleneck-noise-alpha", type=float, default=0.05)
     parser.add_argument("--bottleneck-noise-warmup-ratio", type=float, default=0.2)
@@ -1782,10 +1743,6 @@ def main() -> None:
     parser.add_argument("--bias-proxy-layers", type=int, default=-1)
     parser.add_argument("--bias-proxy-dropout", type=float, default=-1.0)
     parser.add_argument("--low-recon-layer", type=int, default=2)
-    parser.add_argument("--compact-mu-token-id", type=int, default=-1)
-    parser.add_argument("--compact-head-hidden", type=int, default=0)
-    parser.add_argument("--compact-head-layers", type=int, default=1)
-    parser.add_argument("--compact-head-dropout", type=float, default=0.1)
     parser.add_argument("--deepspeed-config", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--log-dir", default=None)
@@ -1825,50 +1782,11 @@ def main() -> None:
         help="Comma-separated module names for LoRA injection.",
     )
     parser.add_argument("--lambda-compression", type=float, default=1.0)
-    parser.add_argument("--mask-loss-weight", type=float, default=1.0)
-    parser.add_argument("--consistency-loss-weight", type=float, default=1.0)
-    parser.add_argument(
-        "--mask-group-weight",
-        type=float,
-        default=0.5,
-        help="Weight for (mask_loss + consistency_loss) group loss.",
-    )
-    parser.add_argument(
-        "--disable-compactor",
-        action="store_true",
-        help="Disable compact masking and compact losses (KL/mask/consistency).",
-    )
     parser.add_argument(
         "--disable-z-prompt-insertion",
         action="store_true",
         help="Disable task latent injection into the LM input.",
     )
-    parser.add_argument(
-        "--compact-keep-init",
-        type=float,
-        default=0.9,
-        help="Fixed keep ratio for compact masking.",
-    )
-    parser.add_argument(
-        "--compact-keep-min",
-        type=float,
-        default=-1.0,
-        help="Optional schedule minimum keep ratio (<= 0 disables).",
-    )
-    parser.add_argument(
-        "--compact-pi-init",
-        type=float,
-        default=0.95,
-        help="Initialize compact head bias so sigmoid(pi) ~= this value.",
-    )
-    parser.add_argument("--kl-weight", type=float, default=1.0)
-    parser.add_argument(
-        "--compact-kl-chunk-size",
-        type=int,
-        default=0,
-        help="Optional chunk size for compact KL computation (0 = disabled).",
-    )
-    parser.add_argument("--z-dropout", type=float, default=0.0)
     parser.add_argument(
         "--lm-loss-chunk-size",
         type=int,
@@ -1895,8 +1813,6 @@ def main() -> None:
     )
     parser.add_argument("--ttr-bin-weight", type=float, default=0.5)
     parser.add_argument("--length-bin-weight", type=float, default=0.5)
-    parser.add_argument("--vq-task-weight", type=float, default=1.0)
-    parser.add_argument("--vq-align-weight", type=float, default=0.0)
     parser.add_argument(
         "--proxy-bin-weighting",
         default="static",
@@ -2031,17 +1947,6 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--scheduler-type", default="cosine")
     parser.add_argument("--debug-data", action="store_true")
-    parser.add_argument(
-        "--debug-gate",
-        action="store_true",
-        help="Run a single-batch gate sanity check before training.",
-    )
-    parser.add_argument(
-        "--debug-gate-max-tokens",
-        type=int,
-        default=2048,
-        help="Max tokens per sequence during debug-gate (0 = full length).",
-    )
     parser.add_argument(
         "--debug-aux-checks",
         action=argparse.BooleanOptionalAction,
@@ -2230,13 +2135,6 @@ def main() -> None:
         padding_side = lm_tok.padding_side
     args.padding_side = padding_side
 
-    mu_id = lm_tok.convert_tokens_to_ids(".")
-    if mu_id is None or mu_id == lm_tok.unk_token_id:
-        mu_id = lm_tok.eos_token_id
-    if mu_id is None:
-        mu_id = lm_tok.pad_token_id or 0
-    args.compact_mu_token_id = int(mu_id)
-
     length_bins = _parse_bins(args.proxy_length_bins, float)
     if len(length_bins) < 2:
         length_bins = list(ProxyTaskConfig().length_bins)
@@ -2373,32 +2271,36 @@ def main() -> None:
                         f"[lm sample] labels='{label_decoded}'",
                     )
 
-    compact_prior = args.compact_keep_init
+    ds_config = _load_ds_config(args.deepspeed_config)
+    zero_stage = _resolve_zero_stage(ds_config)
+    zero_offload = _resolve_zero_offload(ds_config)
+    use_zero3 = zero_stage == 3
+    if not args.gradient_checkpointing and isinstance(ds_config, dict):
+        if ds_config.get("activation_checkpointing"):
+            args.gradient_checkpointing = True
+            _rank0_print(
+                rank,
+                "[stage done] enabling gradient checkpointing from deepspeed activation_checkpointing",
+            )
+    if use_zero3:
+        _rank0_print(
+            rank,
+            "[stage done] ZeRO-3 detected; keeping model on CPU before DeepSpeed init",
+        )
+
     model = DIBJudgeModel.init_from_backbones(
         judge_encoder_name=args.judge_encoder,
         judge_lm_name=args.lm,
         attn_implementation=args.attn_implementation,
         padding_side=args.padding_side,
+        force_cpu_backbone=use_zero3,
         use_rms_norm=args.use_rms_norm,
         rms_norm_eps=args.rms_norm_eps,
         use_swiglu=args.use_swiglu,
         z_latent_dim=args.z_latent_dim,
-        task_codebook_size=args.task_codebook_size,
-        vq_num_codebooks=args.vq_num_codebooks,
-        vq_commitment_gamma=args.vq_commitment_gamma,
-        vq_ema_decay=args.vq_ema_decay,
-        vq_use_ema=args.vq_use_ema,
-        vq_normalize_inputs=args.vq_normalize_inputs,
-        vq_codebook_trainable=args.vq_codebook_trainable,
-        vq_dead_code_threshold=args.vq_dead_code_threshold,
-        vq_reset_dead_codes=args.vq_reset_dead_codes,
-        vq_align_samples=args.vq_align_samples,
         task_mlp_hidden=args.task_mlp_hidden,
         task_mlp_layers=args.task_mlp_layers,
         task_mlp_dropout=args.task_mlp_dropout,
-        task_lm_gate_hidden=args.task_lm_gate_hidden,
-        task_lm_gate_layers=args.task_lm_gate_layers,
-        task_lm_gate_dropout=args.task_lm_gate_dropout,
         bias_mlp_hidden=args.bias_mlp_hidden,
         bias_mlp_layers=args.bias_mlp_layers,
         bias_mlp_dropout=args.bias_mlp_dropout,
@@ -2406,14 +2308,7 @@ def main() -> None:
         bias_proxy_hidden=args.bias_proxy_hidden,
         bias_proxy_layers=args.bias_proxy_layers,
         bias_proxy_dropout=args.bias_proxy_dropout,
-        compact_prior=compact_prior,
-        compact_mu_token_id=args.compact_mu_token_id,
-        compact_head_hidden=args.compact_head_hidden,
-        compact_head_layers=args.compact_head_layers,
-        compact_head_dropout=args.compact_head_dropout,
-        compact_pi_init=args.compact_pi_init,
         lm_loss_chunk_size=args.lm_loss_chunk_size,
-        compact_kl_chunk_size=args.compact_kl_chunk_size,
         low_recon_mag_bins=tuple(mag_bins),
         disentangle_cos_weight=args.disentangle_cos_weight,
         disentangle_cov_weight=args.disentangle_cov_weight,
@@ -2425,8 +2320,17 @@ def main() -> None:
         proxy_nll_classes=max(2, len(nll_bins) - 1),
         proxy_ttr_classes=max(2, len(ttr_bins) - 1),
         proxy_length_classes=max(2, len(length_bins) - 1),
-    ).to(device)
-    if args.benchmark_disentangle_overhead:
+    )
+    if use_zero3:
+        model = model.to("cpu")
+    else:
+        model = model.to(device)
+    if args.benchmark_disentangle_overhead and use_zero3:
+        _rank0_print(
+            rank,
+            "[warn] skipping disentangle benchmark before DeepSpeed init under ZeRO-3",
+        )
+    elif args.benchmark_disentangle_overhead:
         bench_bsz = max(1, int(args.per_device_train_batch_size))
         bench_dim = getattr(model.shared_encoder.config, "hidden_size", None)
         if bench_dim is None:
@@ -2493,167 +2397,9 @@ def main() -> None:
     else:
         model.set_gradient_checkpointing(encoder=False, lm=False, use_reentrant=False)
 
-    if args.debug_gate and rank == 0:
-        debug_log_path = (
-            "/path/to/workspace/online1/"
-            "llm-as-judge-cultural-evaluation/DIBJudge/logs/debug_error.log"
-        )
-        try:
-            batch = next(iter(loader))
-            batch = {
-                key: value.to(device) if torch.is_tensor(value) else value
-                for key, value in batch.items()
-            }
-            batch = {
-                key: value[:1] if torch.is_tensor(value) and value.size(0) > 1 else value
-                for key, value in batch.items()
-            }
-            max_debug_tokens = int(getattr(args, "debug_gate_max_tokens", 0) or 0)
-            if max_debug_tokens > 0:
-                lm_keys = (
-                    "lm_input_ids",
-                    "lm_attention_mask",
-                    "lm_labels",
-                    "lm_response_types",
-                )
-                orig_keys = (
-                    "original_input_ids",
-                    "original_attention_mask",
-                    "original_response_mask",
-                )
-                if args.padding_side == "right":
-                    lm_mask = batch.get("lm_attention_mask")
-                    if torch.is_tensor(lm_mask):
-                        lm_len = int(lm_mask.sum().item())
-                        if lm_len > max_debug_tokens:
-                            start = lm_len - max_debug_tokens
-                            for key in lm_keys:
-                                if torch.is_tensor(batch.get(key)):
-                                    batch[key] = batch[key][..., start:lm_len]
-                    orig_mask = batch.get("original_attention_mask")
-                    if torch.is_tensor(orig_mask):
-                        orig_len = int(orig_mask.sum(dim=-1).max().item())
-                        if orig_len > max_debug_tokens:
-                            start = orig_len - max_debug_tokens
-                            for key in orig_keys:
-                                if torch.is_tensor(batch.get(key)):
-                                    batch[key] = batch[key][..., start:orig_len]
-                else:
-                    lm_ids = batch.get("lm_input_ids")
-                    if torch.is_tensor(lm_ids) and lm_ids.size(-1) > max_debug_tokens:
-                        for key in lm_keys:
-                            if torch.is_tensor(batch.get(key)):
-                                batch[key] = batch[key][..., -max_debug_tokens:]
-                    orig_ids = batch.get("original_input_ids")
-                    if torch.is_tensor(orig_ids) and orig_ids.size(-1) > max_debug_tokens:
-                        for key in orig_keys:
-                            if torch.is_tensor(batch.get(key)):
-                                batch[key] = batch[key][..., -max_debug_tokens:]
-            _rank0_print(rank, "[debug gate] running sanity check")
-            model.eval()
-            try:
-                model_dtype = next(model.shared_encoder.parameters()).dtype
-            except StopIteration:
-                model_dtype = None
-            if model_dtype not in (torch.float16, torch.bfloat16):
-                model_dtype = None
-            debug_amp_dtype = model_dtype
-            with torch.no_grad():
-                if debug_amp_dtype is not None:
-                    with torch.autocast(device_type="cuda", dtype=debug_amp_dtype):
-                        out_no = model(
-                            {
-                                **batch,
-                                "disable_z_prompt_insertion": True,
-                                "disable_compactor": True,
-                                "return_lm_logits": True,
-                            }
-                        )
-                        out_yes = model(
-                            {
-                                **batch,
-                                "disable_z_prompt_insertion": False,
-                                "disable_compactor": True,
-                                "return_lm_logits": True,
-                            }
-                        )
-                else:
-                    out_no = model(
-                        {
-                            **batch,
-                            "disable_z_prompt_insertion": True,
-                            "disable_compactor": True,
-                            "return_lm_logits": True,
-                        }
-                    )
-                    out_yes = model(
-                        {
-                            **batch,
-                            "disable_z_prompt_insertion": False,
-                            "disable_compactor": True,
-                            "return_lm_logits": True,
-                        }
-                    )
-            delta = float("nan")
-            if torch.is_tensor(out_no.get("lm_logits")) and torch.is_tensor(
-                out_yes.get("lm_logits")
-            ):
-                delta = (out_yes["lm_logits"] - out_no["lm_logits"]).abs().max().item()
-            gated_mean = out_yes.get("gated_mean", torch.tensor(0.0)).item()
-            gated_add_norm = out_yes.get("gated_add_norm", torch.tensor(0.0)).item()
-            _rank0_print(
-                rank,
-                "[debug gate] logit delta=",
-                delta,
-                "gated_mean=",
-                gated_mean,
-                "gated_add_norm=",
-                gated_add_norm,
-            )
-        except Exception as exc:
-            os.makedirs(os.path.dirname(debug_log_path), exist_ok=True)
-            with open(debug_log_path, "a", encoding="utf-8") as handle:
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                handle.write(f"{timestamp} | debug_gate failure: {exc}\n")
-                handle.write(traceback.format_exc())
-                handle.write("\n")
-            _rank0_print(
-                rank,
-                f"[warn] debug_gate failed; details logged to {debug_log_path}",
-            )
-        finally:
-            model.train()
-
-    vq_init_samples = _resolve_vq_init_samples(args, len(dataset), rank)
-    args.vq_init_samples = vq_init_samples
-    if vq_init_samples > 0:
-        init_batch_size = (
-            int(args.vq_init_batch_size)
-            if int(args.vq_init_batch_size) > 0
-            else int(args.per_device_train_batch_size)
-        )
-        samples = _collect_vq_task_samples(
-            model,
-            dataset=dataset,
-            collator=collator,
-            max_samples=int(vq_init_samples),
-            batch_size=init_batch_size,
-            device=device,
-            seed=int(args.vq_init_seed),
-            rank=rank,
-        )
-        if samples is not None:
-            model.vq_task.initialize_codebook(
-                samples,
-                max_samples=int(vq_init_samples),
-                seed=int(args.vq_init_seed),
-                spherical=bool(args.vq_init_spherical),
-            )
-            _rank0_print(rank, "[stage done] VQ codebook initialized with kmeans++")
-            if dist is not None and dist.is_available() and dist.is_initialized():
-                dist.broadcast(model.vq_task.codebook, src=0)
-                dist.broadcast(model.vq_task.ema_w, src=0)
-                dist.broadcast(model.vq_task.ema_cluster_size, src=0)
+    ds_config = _load_ds_config(args.deepspeed_config)
+    zero_stage = _resolve_zero_stage(ds_config)
+    zero_offload = _resolve_zero_offload(ds_config)
 
     optimizer_params = _build_optimizer_params(
         model,
@@ -2664,8 +2410,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         head_weight_decay=args.head_weight_decay,
     )
-    zero_stage = _resolve_zero_stage(args.deepspeed_config)
-    optimizer = _build_optimizer(optimizer_params, args, rank, zero_stage)
+    optimizer = _build_optimizer(optimizer_params, args, rank, zero_stage, zero_offload)
 
     steps_per_epoch = math.ceil(len(dataset) / max(1, args.per_device_train_batch_size))
     if world_size > 1:
@@ -2685,10 +2430,6 @@ def main() -> None:
             num_training_steps=total_update_steps,
         )
 
-    ds_config = args.deepspeed_config
-    if isinstance(ds_config, str) and os.path.isfile(ds_config):
-        with open(ds_config, "r", encoding="utf-8") as handle:
-            ds_config = json.load(handle)
     if isinstance(ds_config, dict):
         if sched_name in {"none", "disable", "disabled"} and "scheduler" in ds_config:
             _rank0_print(
@@ -2719,6 +2460,16 @@ def main() -> None:
     engine, optimizer, _, _ = deepspeed.initialize(**ds_kwargs)
     _rank0_print(rank, "[stage done] deepspeed initialized")
     _print_trainable_params(engine.module, rank)
+    _log_vib_status(engine.module, optimizer, rank)
+    _warn_if_zero3_offload_inactive(engine, ds_config, rank)
+    ckpt_fn, ckpt_reentrant = _configure_deepspeed_activation_checkpointing(
+        ds_config, rank
+    )
+    if ckpt_fn is not None:
+        engine.module.set_activation_checkpointing(
+            ckpt_fn, supports_reentrant=ckpt_reentrant
+        )
+    device = next(engine.module.parameters()).device
     model_dtype = None
     for param in engine.module.parameters():
         if param.requires_grad:
@@ -2752,21 +2503,15 @@ def main() -> None:
         rank,
         "Loss config:",
         {
-            "disable_compactor": args.disable_compactor,
             "disable_z_prompt_insertion": args.disable_z_prompt_insertion,
+            "use_vib": args.use_vib,
             "lambda_compression": args.lambda_compression,
             "lambda_bias": args.lambda_bias,
-            "compact_keep_init": args.compact_keep_init,
-            "kl_weight": args.kl_weight,
-            "z_dropout": args.z_dropout,
             "low_recon_weight": args.low_recon_weight,
             "low_recon_mean_weight": args.low_recon_mean_weight,
             "low_recon_logvar_weight": args.low_recon_logvar_weight,
             "low_recon_mag_weight": args.low_recon_mag_weight,
-            "vq_task_weight": args.vq_task_weight,
-            "vq_usage_weight": args.vq_usage_weight,
-            "vq_align_weight": args.vq_align_weight,
-            "vq_warmup_ratio": args.vq_warmup_ratio,
+            "vib_kl_weight": args.vib_kl_weight,
             "disentangle_weight": args.disentangle_weight,
             "disentangle_cos_weight": args.disentangle_cos_weight,
             "disentangle_cov_weight": args.disentangle_cov_weight,
@@ -2775,9 +2520,6 @@ def main() -> None:
             "disentangle_cov_full_grad": args.disentangle_cov_full_grad,
             "disentangle_cov_queue_size": args.disentangle_cov_queue_size,
             "length_bin_weight": args.length_bin_weight,
-            "mask_loss_weight": args.mask_loss_weight,
-            "consistency_loss_weight": args.consistency_loss_weight,
-            "mask_group_weight": args.mask_group_weight,
         },
     )
     _rank0_print(
@@ -2811,14 +2553,11 @@ def main() -> None:
     ema_log_lm_loss: Optional[float] = None
     log_ema_decay = 0.98
     ema_component_values: Dict[str, Optional[float]] = {
-        "compact_kl_loss": None,
         "low_recon_loss": None,
         "low_recon_mean_loss": None,
         "low_recon_logvar_loss": None,
         "low_recon_mag_loss": None,
-        "vq_task_loss": None,
-        "vq_align_loss": None,
-        "vq_usage_loss": None,
+        "vib_kl_loss": None,
         "disentangle_loss": None,
         "nll_bin_loss": None,
         "ttr_bin_loss": None,
@@ -2827,11 +2566,22 @@ def main() -> None:
         "nll_bin_mae": None,
         "ttr_bin_mae": None,
         "length_bin_mae": None,
-        "compact_mask_loss": None,
-        "compact_consistency_loss": None,
     }
     proxy_bin_state = _init_proxy_bin_weight_state()
     last_update_diag: Dict[str, float] = {}
+    gpu_batch_keys = {
+        "lm_input_ids",
+        "lm_attention_mask",
+        "lm_labels",
+        "lm_response_types",
+        "response_mask",
+        "proxy_length_label",
+        "proxy_length_target",
+        "proxy_nll_label",
+        "proxy_nll_target",
+        "proxy_ttr_label",
+        "proxy_ttr_target",
+    }
     for epoch in range(1, args.epochs + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -2842,14 +2592,11 @@ def main() -> None:
         totals = {
             "loss": 0.0,
             "lm_loss": 0.0,
-            "compact_kl_loss": 0.0,
             "low_recon_loss": 0.0,
             "low_recon_mean_loss": 0.0,
             "low_recon_logvar_loss": 0.0,
             "low_recon_mag_loss": 0.0,
-            "vq_task_loss": 0.0,
-            "vq_align_loss": 0.0,
-            "vq_usage_loss": 0.0,
+            "vib_kl_loss": 0.0,
             "disentangle_loss": 0.0,
             "nll_bin_loss": 0.0,
             "ttr_bin_loss": 0.0,
@@ -2858,12 +2605,6 @@ def main() -> None:
             "nll_bin_mae": 0.0,
             "ttr_bin_mae": 0.0,
             "length_bin_mae": 0.0,
-            "vq_task_perplexity": 0.0,
-            "vq_task_dead_fraction": 0.0,
-            "vq_task_avg_distance": 0.0,
-            "mask_group_loss": 0.0,
-            "mask_loss": 0.0,
-            "consistency_loss": 0.0,
             "lm_drop_count": 0.0,
             "lm_drop_seen": 0.0,
             "lm_drop_maxlen": 0.0,
@@ -2882,18 +2623,11 @@ def main() -> None:
                 and args.swanlab_log_steps > 0
                 and step % args.swanlab_log_steps == 0
             )
-            batch = {
-                k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
-                for k, v in batch.items()
-            }
-            device = batch["lm_input_ids"].device
-            disable_compactor = bool(args.disable_compactor)
+            batch = _move_batch_to_device(batch, device, keys=gpu_batch_keys)
             disable_z_prompt_insertion = bool(args.disable_z_prompt_insertion)
             denom = max(1, total_steps - 1)
             progress = min(1.0, float(step) / float(denom))
             sched_values = _eval_dib_schedule(schedule, progress)
-            keep_ratio = min(max(sched_values["keep_ratio"], 0.0), 1.0)
-            kl_weight = max(0.0, sched_values["kl_weight"])
             lambda_compression = max(0.0, sched_values["lambda_compression"])
             lambda_bias = max(0.0, sched_values["lambda_bias"])
             low_recon_scale = float(args.low_recon_weight)
@@ -2901,22 +2635,7 @@ def main() -> None:
             low_recon_logvar_weight = float(args.low_recon_logvar_weight)
             low_recon_mag_weight = float(args.low_recon_mag_weight)
             disentangle_weight = max(0.0, sched_values["disentangle_weight"])
-            mask_group_weight = float(args.mask_group_weight)
-            vq_commit_scale = max(0.0, min(1.0, sched_values["vq_commit_scale"]))
-            vq_usage_weight = max(0.0, sched_values.get("vq_usage_weight", args.vq_usage_weight))
-            vq_align_weight = max(0.0, sched_values.get("vq_align_weight", args.vq_align_weight))
-            if disable_compactor:
-                keep_ratio = 1.0
-                kl_weight = 0.0
-                mask_group_weight = 0.0
-            z_dropout = max(0.0, sched_values["z_dropout"])
-            if disable_z_prompt_insertion:
-                z_dropout = 0.0
-            batch["compact_prior"] = keep_ratio
-            batch["z_task_dropout"] = z_dropout
-            batch["disable_compactor"] = disable_compactor
             batch["disable_z_prompt_insertion"] = disable_z_prompt_insertion
-            batch["compute_compact_kl"] = kl_weight > 0.0
             batch["enable_low_recon"] = low_recon_scale > 0.0 and (
                 low_recon_mean_weight > 0.0
                 or low_recon_logvar_weight > 0.0
@@ -2940,14 +2659,8 @@ def main() -> None:
                 nll_bin_mae = proxy_losses.get("nll_bin_mae", outputs["lm_loss"].new_tensor(0.0))
                 ttr_bin_mae = proxy_losses.get("ttr_bin_mae", outputs["lm_loss"].new_tensor(0.0))
                 length_bin_mae = proxy_losses.get("length_bin_mae", outputs["lm_loss"].new_tensor(0.0))
-                vq_task_loss = outputs.get("vq_task_loss", outputs["lm_loss"].new_tensor(0.0))
-                vq_align_loss = outputs.get("vq_align_loss", outputs["lm_loss"].new_tensor(0.0))
-                vq_usage_loss = outputs.get(
-                    "vq_task_usage_loss", outputs["lm_loss"].new_tensor(0.0)
-                )
-                gated_mean = outputs.get("gated_mean", outputs["lm_loss"].new_tensor(0.0))
-                gated_add_norm = outputs.get(
-                    "gated_add_norm", outputs["lm_loss"].new_tensor(0.0)
+                vib_kl_loss = outputs.get(
+                    "vib_kl_loss", outputs["lm_loss"].new_tensor(0.0)
                 )
                 proxy_counts = {}
                 for name, key in (
@@ -3040,32 +2753,20 @@ def main() -> None:
                             diag_metrics[
                                 f"proxy_bin_hist/{name}/bin_{idx}"
                             ] = float(probs[idx].item())
-                disentangle_loss = outputs.get("disentangle_loss", outputs["lm_loss"].new_tensor(0.0))
-                mask_loss = outputs.get(
-                    "compact_mask_loss", outputs["lm_loss"].new_tensor(0.0)
+                disentangle_loss = outputs.get(
+                    "disentangle_loss", outputs["lm_loss"].new_tensor(0.0)
                 )
-                consistency_loss = outputs.get(
-                    "compact_con_loss", outputs["lm_loss"].new_tensor(0.0)
-                )
-                mask_group_loss = (
-                    args.mask_loss_weight * mask_loss
-                    + args.consistency_loss_weight * consistency_loss
-                )
-                vq_loss = (
-                    args.vq_task_weight * vq_task_loss * vq_commit_scale
-                    + vq_align_weight * vq_align_loss
-                    + vq_usage_weight * vq_usage_loss * vq_commit_scale
-                )
+                vib_loss = args.vib_kl_weight * vib_kl_loss
+                compression_loss = vib_loss
                 bias_loss = (
                     + low_recon_scale
                     * (low_recon_loss + low_recon_mag_weight * low_recon_mag_loss)
                     + proxy_bin_loss
                 )
-                core_lm_loss = outputs["lm_loss"] + kl_weight * outputs["compact_kl_loss"]
+                core_lm_loss = outputs["lm_loss"]
             total_loss = (
                 core_lm_loss
-                + (mask_group_weight * mask_group_loss)
-                + lambda_compression * vq_loss
+                + lambda_compression * compression_loss
                 + lambda_bias * bias_loss
                 + disentangle_weight * disentangle_loss
             )
@@ -3075,14 +2776,11 @@ def main() -> None:
             ema_log_loss = _ema_update(ema_log_loss, raw_total_loss, log_ema_decay)
             ema_log_lm_loss = _ema_update(ema_log_lm_loss, raw_lm_loss, log_ema_decay)
             raw_component_metrics = {
-                "compact_kl_loss": float(outputs["compact_kl_loss"].item()),
                 "low_recon_loss": float(low_recon_loss.item()),
                 "low_recon_mean_loss": float(low_recon_mean_loss.item()),
                 "low_recon_logvar_loss": float(low_recon_logvar_loss.item()),
                 "low_recon_mag_loss": float(low_recon_mag_loss.item()),
-                "vq_task_loss": float(vq_task_loss.item()),
-                "vq_align_loss": float(vq_align_loss.item()),
-                "vq_usage_loss": float(vq_usage_loss.item()),
+                "vib_kl_loss": float(vib_kl_loss.item()),
                 "disentangle_loss": float(disentangle_loss.item()),
                 "nll_bin_loss": float(nll_bin_loss.item()),
                 "ttr_bin_loss": float(ttr_bin_loss.item()),
@@ -3091,8 +2789,6 @@ def main() -> None:
                 "nll_bin_mae": float(nll_bin_mae.item()),
                 "ttr_bin_mae": float(ttr_bin_mae.item()),
                 "length_bin_mae": float(length_bin_mae.item()),
-                "compact_mask_loss": float(mask_loss.item()),
-                "compact_consistency_loss": float(consistency_loss.item()),
             }
             ema_component_metrics: Dict[str, float] = {}
             for name, value in raw_component_metrics.items():
@@ -3268,14 +2964,11 @@ def main() -> None:
             engine.step()
             totals["loss"] += total_loss.item()
             totals["lm_loss"] += outputs["lm_loss"].item()
-            totals["compact_kl_loss"] += outputs["compact_kl_loss"].item()
             totals["low_recon_loss"] += low_recon_loss.item()
             totals["low_recon_mean_loss"] += low_recon_mean_loss.item()
             totals["low_recon_logvar_loss"] += low_recon_logvar_loss.item()
             totals["low_recon_mag_loss"] += low_recon_mag_loss.item()
-            totals["vq_task_loss"] += vq_task_loss.item()
-            totals["vq_align_loss"] += vq_align_loss.item()
-            totals["vq_usage_loss"] += vq_usage_loss.item()
+            totals["vib_kl_loss"] += vib_kl_loss.item()
             totals["disentangle_loss"] += disentangle_loss.item()
             totals["nll_bin_loss"] += nll_bin_loss.item()
             totals["ttr_bin_loss"] += ttr_bin_loss.item()
@@ -3284,12 +2977,6 @@ def main() -> None:
             totals["nll_bin_mae"] += nll_bin_mae.item()
             totals["ttr_bin_mae"] += ttr_bin_mae.item()
             totals["length_bin_mae"] += length_bin_mae.item()
-            totals["vq_task_perplexity"] += float(outputs.get("vq_task_perplexity", 0.0))
-            totals["vq_task_dead_fraction"] += float(outputs.get("vq_task_dead_fraction", 0.0))
-            totals["vq_task_avg_distance"] += float(outputs.get("vq_task_avg_distance", 0.0))
-            totals["mask_group_loss"] += mask_group_loss.item()
-            totals["mask_loss"] += mask_loss.item()
-            totals["consistency_loss"] += consistency_loss.item()
             drop_count = batch.get("debug_lm_drop_count")
             drop_seen = batch.get("debug_lm_drop_seen")
             drop_maxlen = batch.get("debug_lm_drop_maxlen_count")
@@ -3309,8 +2996,6 @@ def main() -> None:
             step_metrics = {
                 "loss": float(raw_total_loss),
                 "lm_loss": float(raw_lm_loss),
-                "gated_mean": float(gated_mean.item()),
-                "gated_add_norm": float(gated_add_norm.item()),
                 "ema/loss": float(log_loss),
                 "ema/lm_loss": float(log_lm_loss),
                 **ema_component_metrics,
@@ -3375,29 +3060,19 @@ def main() -> None:
                         "mem/allocated_mb": torch.cuda.memory_allocated() / (1024**2),
                         "mem/reserved_mb": torch.cuda.memory_reserved() / (1024**2),
                     }
-                vq_health_metrics = {
-                    "vq/health/task_loss": float(vq_task_loss.item()),
-                    "vq/health/usage_loss": float(vq_usage_loss.item()),
-                    "vq/health/align_loss": float(vq_align_loss.item()),
-                    "vq/health/perplexity": float(outputs.get("vq_task_perplexity", 0.0)),
-                    "vq/health/dead_fraction": float(outputs.get("vq_task_dead_fraction", 0.0)),
-                    "vq/health/avg_distance": float(outputs.get("vq_task_avg_distance", 0.0)),
-                }
+                vib_metrics = {"vib/kl_loss": float(vib_kl_loss.item())}
                 log_swanlab(
                     swanlab_client,
                     {
                         **step_metrics,
-                        **vq_health_metrics,
+                        **vib_metrics,
                         "raw/loss": raw_total_loss,
                         "raw/lm_loss": raw_lm_loss,
-                        "raw/compact_kl_loss": float(outputs["compact_kl_loss"].item()),
                         "raw/low_recon_loss": float(low_recon_loss.item()),
                         "raw/low_recon_mean_loss": float(low_recon_mean_loss.item()),
                         "raw/low_recon_logvar_loss": float(low_recon_logvar_loss.item()),
                         "raw/low_recon_mag_loss": float(low_recon_mag_loss.item()),
-                        "raw/vq_task_loss": float(vq_task_loss.item()),
-                        "raw/vq_align_loss": float(vq_align_loss.item()),
-                        "raw/vq_usage_loss": float(vq_usage_loss.item()),
+                        "raw/vib_kl_loss": float(vib_kl_loss.item()),
                         "raw/disentangle_loss": float(disentangle_loss.item()),
                         "raw/nll_bin_loss": float(nll_bin_loss.item()),
                         "raw/ttr_bin_loss": float(ttr_bin_loss.item()),
@@ -3406,18 +3081,14 @@ def main() -> None:
                         "raw/nll_bin_mae": float(nll_bin_mae.item()),
                         "raw/ttr_bin_mae": float(ttr_bin_mae.item()),
                         "raw/length_bin_mae": float(length_bin_mae.item()),
-                        "raw/compact_mask_loss": float(mask_loss.item()),
-                        "raw/compact_consistency_loss": float(consistency_loss.item()),
-                        "raw/gated_mean": float(gated_mean.item()),
-                        "raw/gated_add_norm": float(gated_add_norm.item()),
-                        "compact_kl_loss": outputs["compact_kl_loss"].item(),
+                        "raw/robust_add_norm": float(
+                            outputs.get("robust_add_norm", 0.0)
+                        ),
                         "low_recon_loss": low_recon_loss.item(),
                         "low_recon_mean_loss": low_recon_mean_loss.item(),
                         "low_recon_logvar_loss": low_recon_logvar_loss.item(),
                         "low_recon_mag_loss": low_recon_mag_loss.item(),
-                        "vq_task_loss": vq_task_loss.item(),
-                        "vq_align_loss": vq_align_loss.item(),
-                        "vq_usage_loss": vq_usage_loss.item(),
+                        "vib_kl_loss": vib_kl_loss.item(),
                         "disentangle_loss": disentangle_loss.item(),
                         "nll_bin_loss": nll_bin_loss.item(),
                         "ttr_bin_loss": ttr_bin_loss.item(),
@@ -3426,29 +3097,9 @@ def main() -> None:
                         "nll_bin_mae": nll_bin_mae.item(),
                         "ttr_bin_mae": ttr_bin_mae.item(),
                         "length_bin_mae": length_bin_mae.item(),
-                        "gated_mean": gated_mean.item(),
-                        "gated_add_norm": gated_add_norm.item(),
-                        "vq/task_commitment_loss": float(outputs.get("vq_task_commitment_loss", 0.0)),
-                        "vq/task_codebook_loss": float(outputs.get("vq_task_codebook_loss", 0.0)),
-                        "vq/task_perplexity": float(outputs.get("vq_task_perplexity", 0.0)),
-                        "vq/task_usage_loss": float(outputs.get("vq_task_usage_loss", 0.0)),
-                        "vq/task_dead_fraction": float(outputs.get("vq_task_dead_fraction", 0.0)),
-                        "vq/task_avg_distance": float(outputs.get("vq_task_avg_distance", 0.0)),
-                        "compact/mask_loss": mask_loss.item(),
-                        "compact/consistency_loss": consistency_loss.item(),
-                        "compact/pi_mean": float(outputs.get("compact_pi_mean", 0.0)),
-                        "compact/mask_mean": float(outputs.get("compact_mask_mean", 0.0)),
-                        "compact/pi_saturation": float(outputs.get("compact_pi_saturation", 0.0)),
-                        "compact/kl_loss": outputs["compact_kl_loss"].item(),
                         "weights/lambda_bias": lambda_bias,
                         "weights/lambda_compression": lambda_compression,
-                        "weights/vq_task": args.vq_task_weight,
-                        "weights/vq_usage": vq_usage_weight,
-                        "weights/vq_align": vq_align_weight,
-                        "weights/vq_commit_scale": vq_commit_scale,
-                        "weights/kl_weight": kl_weight,
-                        "weights/keep_ratio": keep_ratio,
-                        "weights/z_task_dropout": z_dropout,
+                        "weights/vib_kl": args.vib_kl_weight,
                         "weights/low_recon": args.low_recon_weight,
                         "weights/low_recon_mean": args.low_recon_mean_weight,
                         "weights/low_recon_logvar": args.low_recon_logvar_weight,
@@ -3457,9 +3108,6 @@ def main() -> None:
                         "weights/nll_bin": args.nll_bin_weight,
                         "weights/ttr_bin": args.ttr_bin_weight,
                         "weights/length_bin": args.length_bin_weight,
-                        "weights/mask_group": mask_group_weight,
-                        "weights/mask_loss": args.mask_loss_weight,
-                        "weights/consistency_loss": args.consistency_loss_weight,
                         "data/lm_drop_count": float(drop_count.item()) if torch.is_tensor(drop_count) else 0.0,
                         "data/lm_drop_seen": float(drop_seen.item()) if torch.is_tensor(drop_seen) else 0.0,
                         "data/lm_drop_ratio": float(

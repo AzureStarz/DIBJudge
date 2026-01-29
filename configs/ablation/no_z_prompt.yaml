@@ -18,10 +18,6 @@ bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 0 # number of hidden layers for bias proxy heads
 bias_proxy_dropout: 0.05 # dropout for bias proxy heads
 low_recon_layer: 2 # encoder hidden layer index for low-level reconstruction
-compact_mu_token_id: -1 # token id to fill masked tokens (e.g., -1 for eos)
-compact_head_hidden: 0 # hidden width for compact head (0 = auto)
-compact_head_layers: 0 # number of hidden layers for compact head
-compact_head_dropout: 0.05 # dropout for compact head
 
 # data config
 data_path: data/train_data/mr3_preprocessed.jsonl # training dataset JSONL
@@ -59,7 +55,6 @@ allow_tf32: true # enable TF32 matmul kernels for speed
 gradient_checkpointing: false # enable gradient checkpointing
 torch_autocast: false # enable torch.autocast outside DeepSpeed
 lm_loss_chunk_size: 512 # optional chunk size for causal LM loss (0 = disabled)
-compact_kl_chunk_size: 128 # optional chunk size for compact KL (0 = disabled)
 use_swanlab: true # enable SwanLab logging
 swanlab_project: dibjudge # SwanLab project name
 swanlab_run_name: no_z_prompt # SwanLab run name
@@ -102,19 +97,10 @@ warmup_ratio: 0.03 # warmup ratio of total steps
 scheduler_type: cosine # scheduler type for HF scheduler
 
 # compactor config
-compact_keep_init: 0.9 # schedule base keep ratio for compact masking
-compact_keep_min: 0.5 # schedule minimum keep ratio target
-disable_compactor: false
 disable_z_prompt_insertion: true
-compact_pi_init: 0.95 # initialize compact head bias so sigmoid(pi) ~= this value
-kl_weight: 1.0 # schedule peak for compact KL loss
-z_dropout: 0.1 # schedule peak for task prompt dropout
 
 
 # loss config
-mask_loss_weight: 1.0 # weight for compact mask loss
-consistency_loss_weight: 1.0 # weight for compact consistency loss
-mask_group_weight: 2.0 # weight for (mask_loss + consistency_loss) group loss
 lambda_bias: 0.5 # schedule peak for bias losses
 low_recon_weight: 0.5 # weight for low-level reconstruction loss
 low_recon_mean_weight: 1.0 # weight for mean reconstruction term

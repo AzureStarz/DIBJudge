@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
@@ -99,6 +100,128 @@ def _maybe_tqdm(iterable, rank: int, desc: str):
     return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
 
 
+def _load_ds_config(config: object) -> object:
+    if isinstance(config, str) and os.path.isfile(config):
+        with open(config, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    return config
+
+
+def _configure_deepspeed_activation_checkpointing(
+    ds_config: object, rank: int
+) -> Tuple[Optional[object], bool]:
+    if not isinstance(ds_config, dict):
+        return None, True
+    cfg = ds_config.get("activation_checkpointing")
+    if not cfg:
+        return None, True
+    try:
+        import deepspeed.checkpointing as ds_checkpoint
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] deepspeed.checkpointing unavailable: {exc}")
+        return None, True
+    if hasattr(ds_checkpoint, "is_configured"):
+        try:
+            if ds_checkpoint.is_configured():
+                return ds_checkpoint.checkpoint, False
+        except Exception:
+            pass
+    cfg = cfg if isinstance(cfg, dict) else {}
+    kwargs = {
+        "partition_activations": bool(cfg.get("partition_activations", False)),
+        "cpu_checkpointing": bool(cfg.get("cpu_checkpointing", False)),
+        "contiguous_memory_optimization": bool(
+            cfg.get("contiguous_memory_optimization", False)
+        ),
+        "synchronize_checkpoint_boundary": bool(
+            cfg.get("synchronize_checkpoint_boundary", False)
+        ),
+    }
+    if "profile" in cfg:
+        kwargs["profile"] = bool(cfg["profile"])
+    try:
+        sig = inspect.signature(ds_checkpoint.configure)
+        allowed = set(sig.parameters.keys())
+        kwargs = {key: value for key, value in kwargs.items() if key in allowed}
+        ds_checkpoint.configure(**kwargs)
+        _rank0_print(rank, "[stage done] deepspeed activation checkpointing configured")
+    except Exception as exc:
+        _rank0_print(rank, f"[warn] failed to configure deepspeed checkpointing: {exc}")
+        return None, True
+    return ds_checkpoint.checkpoint, False
+
+
+
+
+def _move_batch_to_device(
+    batch: Dict[str, object],
+    device: torch.device,
+    keys: Optional[Iterable[str]] = None,
+) -> Dict[str, object]:
+    """Move only required tensors to GPU to reduce peak memory."""
+    key_set = set(keys) if keys is not None else None
+    moved: Dict[str, object] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and (key_set is None or key in key_set):
+            moved[key] = value.to(device, non_blocking=True)
+        else:
+            moved[key] = value
+    return moved
+
+
+def _warn_if_zero3_offload_inactive(
+    engine, ds_config: object, rank: int
+) -> None:
+    zero_stage_cfg = _resolve_zero_stage(ds_config)
+    if zero_stage_cfg != 3:
+        return
+    expected_offload = _resolve_zero_offload(ds_config)
+    stage_runtime = getattr(engine, "zero_optimization_stage", None)
+    if callable(stage_runtime):
+        try:
+            stage_runtime = stage_runtime()
+        except Exception:
+            stage_runtime = None
+    if stage_runtime is None:
+        stage_runtime = getattr(engine, "zero_optimization_stage", None)
+    if stage_runtime is not None:
+        try:
+            if int(stage_runtime) != 3:
+                _rank0_print(
+                    rank,
+                    f"[warn] DeepSpeed reports zero_stage={stage_runtime}; expected 3",
+                )
+        except (TypeError, ValueError):
+            pass
+    total_elems = 0
+    cuda_elems = 0
+    total_bytes = 0
+    cuda_bytes = 0
+    for param in engine.module.parameters():
+        numel = param.numel()
+        total_elems += numel
+        total_bytes += numel * param.element_size()
+        if param.is_cuda:
+            cuda_elems += numel
+            cuda_bytes += numel * param.element_size()
+    if total_elems == 0:
+        return
+    frac = cuda_elems / max(1, total_elems)
+    if expected_offload and cuda_bytes > 0:
+        if frac >= 0.05 or cuda_bytes >= 200 * 1024 * 1024:
+            _rank0_print(
+                rank,
+                "[warn] ZeRO-3 offload expected but a large share of parameters remain on GPU "
+                f"({cuda_bytes / (1024**2):.1f} MB, {frac:.1%}).",
+            )
+        else:
+            _rank0_print(
+                rank,
+                "[warn] ZeRO-3 offload expected but some parameters remain on GPU "
+                f"({cuda_bytes / (1024**2):.1f} MB, {frac:.1%}).",
+            )
+
+
 def _resolve_torch_dtype(value: Optional[object]) -> Optional[torch.dtype]:
     if value is None:
         return None
@@ -174,10 +297,30 @@ def _prefilter_long_prompts(
 
 
 class CheckpointedCausalLM(torch.nn.Module):
-    def __init__(self, model: torch.nn.Module, use_reentrant: bool = True) -> None:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        use_reentrant: bool = True,
+        checkpoint_fn=torch_checkpoint,
+        *,
+        supports_reentrant: bool = True,
+    ) -> None:
         super().__init__()
         self.model = model
         self.use_reentrant = bool(use_reentrant)
+        self.checkpoint_fn = checkpoint_fn
+        self.checkpoint_supports_reentrant = bool(supports_reentrant)
+
+    def set_activation_checkpointing(
+        self, checkpoint_fn, *, supports_reentrant: bool = True
+    ) -> None:
+        self.checkpoint_fn = checkpoint_fn
+        self.checkpoint_supports_reentrant = bool(supports_reentrant)
+
+    def _checkpoint_call(self, fn, *args):
+        if not self.checkpoint_supports_reentrant:
+            return self.checkpoint_fn(fn, *args)
+        return self.checkpoint_fn(fn, *args, use_reentrant=self.use_reentrant)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         if not self.training or not torch.is_grad_enabled():
@@ -216,11 +359,10 @@ class CheckpointedCausalLM(torch.nn.Module):
                 )
                 return out.logits
 
-            logits = checkpoint(
+            logits = self._checkpoint_call(
                 _run_logits,
                 inputs_embeds,
                 attention_mask,
-                use_reentrant=self.use_reentrant,
             )
             return {"loss": None, "logits": logits}
 
@@ -234,12 +376,11 @@ class CheckpointedCausalLM(torch.nn.Module):
             )
             return out.loss, out.logits
 
-        loss, logits = checkpoint(
+        loss, logits = self._checkpoint_call(
             _run,
             inputs_embeds,
             attention_mask,
             labels,
-            use_reentrant=self.use_reentrant,
         )
         return {"loss": loss, "logits": logits}
 
@@ -502,6 +643,44 @@ def _zero_offload_enabled(ds_config: object) -> bool:
     if isinstance(offload, str):
         return offload.lower() not in {"none", "false", "off"}
     return True
+
+
+def _resolve_zero_stage(config: object) -> Optional[int]:
+    if not isinstance(config, dict):
+        return None
+    zero_opt = config.get("zero_optimization")
+    if isinstance(zero_opt, dict):
+        stage = zero_opt.get("stage")
+    elif isinstance(zero_opt, int):
+        stage = zero_opt
+    else:
+        return None
+    try:
+        return int(stage)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_zero_offload(config: object) -> bool:
+    if not isinstance(config, dict):
+        return False
+    zero_opt = config.get("zero_optimization")
+    if not isinstance(zero_opt, dict):
+        return False
+    for key in ("offload_optimizer", "offload_param"):
+        offload = zero_opt.get(key)
+        if not offload:
+            continue
+        if isinstance(offload, dict):
+            device = str(offload.get("device", "")).lower()
+            if device and device not in {"none", "false", "off"}:
+                return True
+        elif isinstance(offload, str):
+            if offload.lower() not in {"none", "false", "off"}:
+                return True
+        else:
+            return True
+    return False
 
 
 def _warmup_steps_from_ratio(total_steps: int, ratio: Optional[float], warmup_steps: int) -> int:
@@ -881,11 +1060,31 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
     )
 
+    ds_config = _load_ds_config(args.deepspeed_config)
+    zero_stage = _resolve_zero_stage(ds_config)
+    use_zero3 = zero_stage == 3
+    if not args.gradient_checkpointing and isinstance(ds_config, dict):
+        if ds_config.get("activation_checkpointing"):
+            args.gradient_checkpointing = True
+            _rank0_print(
+                rank,
+                "[stage done] enabling gradient checkpointing from deepspeed activation_checkpointing",
+            )
+    if use_zero3:
+        _rank0_print(
+            rank,
+            "[stage done] ZeRO-3 detected; keeping model on CPU before DeepSpeed init",
+        )
+
     load_dtype = _resolve_torch_dtype(args.torch_dtype)
     model = _load_causal_lm(
         args.lm, args.attn_implementation, torch_dtype=load_dtype
     )
-    if args.attn_implementation == "flash_attention_2" and device.type == "cuda":
+    if (
+        args.attn_implementation == "flash_attention_2"
+        and device.type == "cuda"
+        and not use_zero3
+    ):
         model = model.to(device)
     _maybe_resize_embeddings(model, tokenizer, "lm", rank)
     model = _maybe_apply_lora(model, args, rank)
@@ -908,17 +1107,16 @@ def main() -> None:
     steps_per_epoch = math.ceil(len(dataset) / max(1, args.per_device_train_batch_size))
     if world_size > 1:
         samples_per_rank = math.ceil(len(dataset) / max(1, world_size))
-        steps_per_epoch = math.ceil(samples_per_rank / max(1, args.per_device_train_batch_size))
+        steps_per_epoch = math.ceil(
+            samples_per_rank / max(1, args.per_device_train_batch_size)
+        )
     update_steps_per_epoch = math.ceil(steps_per_epoch / max(1, args.grad_accum_steps))
     total_update_steps = max(1, update_steps_per_epoch * max(1, args.epochs))
     warmup_steps = _warmup_steps_from_ratio(
         total_update_steps, args.warmup_ratio, args.warmup_steps
     )
 
-    ds_config = args.deepspeed_config
-    if isinstance(ds_config, str) and os.path.isfile(ds_config):
-        with open(ds_config, "r", encoding="utf-8") as handle:
-            ds_config = json.load(handle)
+    ds_config = _load_ds_config(args.deepspeed_config)
     if isinstance(ds_config, dict):
         ds_config["gradient_accumulation_steps"] = args.grad_accum_steps
         ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
@@ -972,6 +1170,15 @@ def main() -> None:
         ds_kwargs["lr_scheduler"] = scheduler
     engine, optimizer, _, _ = deepspeed.initialize(**ds_kwargs)
     _rank0_print(rank, "[stage done] deepspeed initialized")
+    _warn_if_zero3_offload_inactive(engine, ds_config, rank)
+    ckpt_fn, ckpt_reentrant = _configure_deepspeed_activation_checkpointing(
+        ds_config, rank
+    )
+    if ckpt_fn is not None and hasattr(engine.module, "set_activation_checkpointing"):
+        engine.module.set_activation_checkpointing(
+            ckpt_fn, supports_reentrant=ckpt_reentrant
+        )
+    device = next(engine.module.parameters()).device
 
     use_amp = args.torch_autocast
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -1023,10 +1230,11 @@ def main() -> None:
             "lm_drop_maxlen": 0.0,
             "lm_drop_min_target": 0.0,
         }
+        gpu_batch_keys = {"input_ids", "attention_mask", "labels"}
         for batch in epoch_loader:
             step_start = time.perf_counter()
             step += 1
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            batch = _move_batch_to_device(batch, device, keys=gpu_batch_keys)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = engine(**batch)
                 loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]

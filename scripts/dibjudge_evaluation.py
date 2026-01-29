@@ -11,6 +11,11 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.multiprocessing as mp
+try:
+    import torch.distributed as dist
+except ImportError:  # pragma: no cover - torch distributed not available
+    dist = None
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import EmbedsPrompt
@@ -22,10 +27,10 @@ if __package__ is None:
 from dibjudge.data import _find_response_span
 from dibjudge.modeling import (
     DIBJudgeModel,
-    LatentHead,
+    RMSNorm,
     TokenMLP,
 )
-from dibjudge.vq import VectorQuantizerEMA
+from dibjudge.bottlenecks import GaussianVIB
 import vanilla_evaluation as ve
 
 
@@ -192,23 +197,107 @@ def _append_prompt_log(path: str, prompts: List[object], start_idx: int) -> int:
     return next_idx
 
 
+def _normalize_embed_distributed(value: object) -> str:
+    if value is None:
+        return "false"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return "true"
+    if text in {"0", "false", "no", "n", "off"}:
+        return "false"
+    if text == "auto":
+        return "auto"
+    raise ValueError("embed-distributed must be one of: true, false, auto")
+
+
+def _init_embed_distributed(enabled: bool) -> Optional[Dict[str, int]]:
+    if not enabled or dist is None or not dist.is_available():
+        return None
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return None
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return {
+        "rank": rank,
+        "world_size": dist.get_world_size(),
+        "local_rank": local_rank,
+    }
+
+
+def _embed_spawn_worker(local_rank: int, world_size: int) -> None:
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    main()
+
+
+def _maybe_spawn_embed_distributed(args: argparse.Namespace) -> bool:
+    mode = _normalize_embed_distributed(args.embed_distributed)
+    args.embed_distributed = mode
+    if mode != "auto":
+        return False
+    if os.environ.get("DIBJUDGE_EMBED_SPAWNED") == "1":
+        return False
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size_env > 1:
+        args.embed_distributed = "true"
+        return False
+    world_size = int(getattr(args, "embed_world_size", 0) or 0)
+    if world_size <= 0:
+        world_size = torch.cuda.device_count()
+    if world_size <= 1:
+        print(
+            "[warn] embed-distributed=auto requested but only one GPU detected; "
+            "falling back to single-process prompt embedding.",
+        )
+        args.embed_distributed = "false"
+        return False
+    os.environ["DIBJUDGE_EMBED_SPAWNED"] = "1"
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29501")
+    mp.spawn(_embed_spawn_worker, nprocs=world_size, args=(world_size,), join=True)
+    return True
+
+
 def _infer_branch_mlp_config(
     state: Dict[str, torch.Tensor], prefix: str
 ) -> Tuple[int, int, int, float]:
-    linear_indices = []
+    linear_indices: List[int] = []
+    weight_keys: Dict[int, str] = {}
     for key in state:
-        if key.startswith(f"{prefix}mlp.") and key.endswith(".weight"):
-            parts = key.split(".")
-            if len(parts) > 2:
-                linear_indices.append(int(parts[2]))
+        if not (key.startswith(f"{prefix}mlp.") and key.endswith(".weight")):
+            continue
+        parts = key.split(".")
+        if len(parts) < 3:
+            continue
+        idx_str = parts[2]
+        if not idx_str.isdigit():
+            continue
+        idx = int(idx_str)
+        # Accept direct Linear weights or SwiGLU projection weights.
+        if len(parts) == 4 or (len(parts) == 5 and parts[3] == "proj"):
+            linear_indices.append(idx)
+            weight_keys.setdefault(idx, key)
     linear_indices = sorted(set(linear_indices))
     if not linear_indices:
         return 0, 0, 0, 0.0
-    hidden_dim = state[f"{prefix}mlp.{linear_indices[0]}.weight"].shape[0]
+    first_key = weight_keys[linear_indices[0]]
+    hidden_weight = state[first_key]
+    # SwiGLU projection doubles the output dimension.
+    hidden_dim = (
+        hidden_weight.shape[0] // 2
+        if first_key.endswith(".proj.weight")
+        else hidden_weight.shape[0]
+    )
     layers = len(linear_indices)
     dropout = 0.0
-    if len(linear_indices) > 1 and (linear_indices[1] - linear_indices[0]) == 3:
-        dropout = 0.1
     return layers, hidden_dim, linear_indices[0], dropout
 
 
@@ -268,11 +357,11 @@ class DIBJudgePromptBundle(torch.nn.Module):
             raise ValueError("Unable to resolve encoder hidden size.")
 
         latent_dim = enc_hidden
-        proj_weight = state.get("task_latent_to_lm.weight")
-        if proj_weight is not None:
-            lm_hidden = proj_weight.shape[0]
-            if proj_weight.shape[1] != latent_dim:
-                raise ValueError("task_latent_to_lm input dim does not match encoder latents.")
+        vib_proj_weight = state.get("vib_to_lm.weight")
+        if vib_proj_weight is not None:
+            lm_hidden = vib_proj_weight.shape[0]
+            if vib_proj_weight.shape[1] != latent_dim:
+                raise ValueError("vib_to_lm input dim does not match encoder latents.")
         else:
             lm_hidden = latent_dim
         norm_type = "rms" if bool(self.config.get("use_rms_norm", False)) else "layernorm"
@@ -284,6 +373,12 @@ class DIBJudgePromptBundle(torch.nn.Module):
         task_hidden = int(self.config.get("task_mlp_hidden", task_hidden or 0))
         task_layers = int(self.config.get("task_mlp_layers", task_layers or 0))
         task_dropout = float(self.config.get("task_mlp_dropout", task_dropout))
+        use_vib_cfg = self.config.get("use_vib")
+        if use_vib_cfg is None:
+            use_vib_cfg = any(k.startswith("vib_task.") for k in state) or (
+                "vib_to_lm.weight" in state
+            )
+        self.use_vib = bool(use_vib_cfg)
         self.task_mlp = TokenMLP(
             enc_hidden,
             enc_hidden,
@@ -294,104 +389,55 @@ class DIBJudgePromptBundle(torch.nn.Module):
             norm_eps=norm_eps,
             use_swiglu=use_swiglu,
         )
-        self.vq_task = VectorQuantizerEMA(
-            num_codes=int(self.config.get("task_codebook_size", 1024)),
-            dim=latent_dim,
-            num_codebooks=int(self.config.get("vq_num_codebooks", 4)),
-            commitment_cost=float(self.config.get("vq_commitment_gamma", 0.05)),
-            decay=float(self.config.get("vq_ema_decay", 0.99)),
-            use_ema=bool(self.config.get("vq_use_ema", True)),
-            codebook_trainable=bool(self.config.get("vq_codebook_trainable", False)),
-            dead_code_threshold=float(self.config.get("vq_dead_code_threshold", 0.1)),
-            reset_dead_codes=bool(self.config.get("vq_reset_dead_codes", True)),
-            normalize_inputs=bool(self.config.get("vq_normalize_inputs", True)),
-        )
-        if proj_weight is None:
-            self.task_latent_to_lm = torch.nn.Identity()
-        else:
-            self.task_latent_to_lm = torch.nn.Linear(latent_dim, lm_hidden)
-        gate_layers, gate_hidden, _first_idx, gate_dropout = _infer_branch_mlp_config(
-            state, "task_lm_gate."
-        )
-        gate_hidden = int(self.config.get("task_lm_gate_hidden", gate_hidden or 0))
-        gate_layers = int(self.config.get("task_lm_gate_layers", gate_layers or 1))
-        gate_dropout = float(self.config.get("task_lm_gate_dropout", gate_dropout))
-        self.task_lm_gate = TokenMLP(
-            2 * lm_hidden,
-            lm_hidden,
-            hidden_dim=gate_hidden,
-            layers=gate_layers,
-            dropout=gate_dropout,
-            norm_type=norm_type,
-            norm_eps=norm_eps,
-            use_swiglu=use_swiglu,
-        )
-        compact_state = {
-            k.replace("compact_head.", ""): v
-            for k, v in state.items()
-            if k.startswith("compact_head.")
-        }
-        self.compact_head = None
-        if compact_state:
-            compact_layers, compact_hidden, _first_idx, compact_dropout = (
-                _infer_branch_mlp_config(state, "compact_head.")
-            )
-            compact_hidden = int(
-                self.config.get("compact_head_hidden", compact_hidden or 0)
-            )
-            compact_layers = int(
-                self.config.get("compact_head_layers", compact_layers or 0)
-            )
-            compact_dropout = float(
-                self.config.get("compact_head_dropout", compact_dropout)
-            )
-            self.compact_head = LatentHead(
+        self.task_post_norm = RMSNorm(enc_hidden, eps=norm_eps)
+        if self.use_vib:
+            vib_hidden = int(self.config.get("vib_hidden", 0))
+            vib_layers = int(self.config.get("vib_layers", 2))
+            vib_dropout = float(self.config.get("vib_dropout", 0.0))
+            self.vib_task = GaussianVIB(
                 enc_hidden,
-                1,
-                latent_clip=0.0,
-                hidden_dim=compact_hidden,
-                layers=compact_layers,
-                dropout=compact_dropout,
-                norm_type=norm_type,
+                hidden_dim=vib_hidden,
+                layers=vib_layers,
+                dropout=vib_dropout,
                 norm_eps=norm_eps,
                 use_swiglu=use_swiglu,
+                logvar_min=float(self.config.get("vib_logvar_min", -10.0)),
+                logvar_max=float(self.config.get("vib_logvar_max", 10.0)),
             )
-
+            self.vib_to_lm = torch.nn.Linear(enc_hidden, lm_hidden)
+        else:
+            self.vib_task = None
+            self.vib_to_lm = None
         shared_state = {
             k.replace("shared_encoder.", ""): v
             for k, v in state.items()
             if k.startswith("shared_encoder.")
-        }
-        proj_state = {
-            k.replace("task_latent_to_lm.", ""): v
-            for k, v in state.items()
-            if k.startswith("task_latent_to_lm.")
         }
         task_mlp_state = {
             k.replace("task_mlp.", ""): v
             for k, v in state.items()
             if k.startswith("task_mlp.")
         }
-        vq_state = {k.replace("vq_task.", ""): v for k, v in state.items() if k.startswith("vq_task.")}
+        vib_state = {k.replace("vib_task.", ""): v for k, v in state.items() if k.startswith("vib_task.")}
+        vib_proj_state = {
+            k.replace("vib_to_lm.", ""): v for k, v in state.items() if k.startswith("vib_to_lm.")
+        }
         self.shared_encoder.load_state_dict(shared_state, strict=False)
         if task_mlp_state:
             self.task_mlp.load_state_dict(task_mlp_state, strict=False)
-        if vq_state:
-            self.vq_task.load_state_dict(vq_state, strict=False)
-        if proj_state:
-            self.task_latent_to_lm.load_state_dict(proj_state, strict=False)
-        gate_state = {
-            k.replace("task_lm_gate.", ""): v
+        task_norm_state = {
+            k.replace("task_post_norm.", ""): v
             for k, v in state.items()
-            if k.startswith("task_lm_gate.")
+            if k.startswith("task_post_norm.")
         }
-        if gate_state:
-            self.task_lm_gate.load_state_dict(gate_state, strict=False)
-        if self.compact_head is not None:
-            self.compact_head.load_state_dict(compact_state, strict=False)
+        if task_norm_state:
+            self.task_post_norm.load_state_dict(task_norm_state, strict=False)
+        if self.vib_task is not None and vib_state:
+            self.vib_task.load_state_dict(vib_state, strict=False)
+        if self.vib_to_lm is not None and vib_proj_state:
+            self.vib_to_lm.load_state_dict(vib_proj_state, strict=False)
+        self.compact_head = None
         self.compact_mu_id = None
-        if "compact_mu_token_id" in self.config:
-            self.compact_mu_id = int(self.config["compact_mu_token_id"])
 
         self.to(device=device, dtype=dtype)
         self.eval()
@@ -399,7 +445,7 @@ class DIBJudgePromptBundle(torch.nn.Module):
     @torch.no_grad()
     def build_prompt_features(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Optional[torch.Tensor]:
         outputs = self.shared_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -408,13 +454,12 @@ class DIBJudgePromptBundle(torch.nn.Module):
             return_dict=True,
         )
         hidden = outputs.last_hidden_state
-        task_tokens = self.task_mlp(hidden)
-        z_task = self.vq_task(task_tokens).quantized
-        z_prompt = self.task_latent_to_lm(z_task)
-        compact_logits = None
-        if self.compact_head is not None:
-            compact_logits = self.compact_head(hidden).squeeze(-1)
-        return z_prompt, compact_logits
+        if self.vib_task is None or self.vib_to_lm is None:
+            return None
+        task_tokens = self.task_post_norm(self.task_mlp(hidden))
+        vib_out = self.vib_task(task_tokens, sample=False)
+        robust = self.vib_to_lm(vib_out.embeds)
+        return robust
 
 
 def _tokenize_response(
@@ -497,37 +542,35 @@ def _apply_z_task_addition(
     z_b: Optional[torch.Tensor],
     a_mask: Optional[torch.Tensor],
     b_mask: Optional[torch.Tensor],
-    gate_mlp: Optional[torch.nn.Module],
 ) -> torch.Tensor:
     if z_a is None and z_b is None:
         return embeds
-    addition = embeds.new_zeros(embeds.size())
-
-    def _select_tokens(z_tokens: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        if mask is None:
-            return z_tokens
-        mask_flat = mask.bool().view(-1)
-        tokens = z_tokens.view(-1, z_tokens.size(-1))
-        return tokens[mask_flat]
-
-    for label, z_tokens, mask in ((1, z_a, a_mask), (2, z_b, b_mask)):
-        if z_tokens is None:
-            continue
-        selected = _select_tokens(z_tokens, mask)
-        if selected.numel() == 0:
-            continue
-        positions = (response_types == label).nonzero(as_tuple=False).view(-1)
-        if positions.numel() == 0:
-            continue
-        count = min(positions.numel(), selected.size(0))
-        addition[positions[:count]] = selected[:count]
-
-    if gate_mlp is not None:
-        gate_inputs = torch.cat([embeds, addition], dim=-1)
-        gate_scale = torch.sigmoid(gate_mlp(gate_inputs)).to(
-            device=embeds.device, dtype=embeds.dtype
-        )
-        addition = addition * gate_scale
+    if response_types.dim() == 1:
+        response_types = response_types.unsqueeze(0)
+    latents: List[torch.Tensor] = []
+    masks: List[torch.Tensor] = []
+    if z_a is not None:
+        latents.append(z_a)
+        if a_mask is not None:
+            masks.append(a_mask)
+    if z_b is not None:
+        latents.append(z_b)
+        if b_mask is not None:
+            masks.append(b_mask)
+    pairs = max(1, len(latents))
+    latents_tensor = torch.stack(latents, dim=0)
+    mask_tensor = None
+    if masks and len(masks) == len(latents):
+        mask_tensor = torch.stack(masks, dim=0)
+    addition = DIBJudgeModel._scatter_response_latents(
+        response_types,
+        latents_tensor,
+        mask_tensor,
+        pairs,
+    )
+    addition = addition.to(dtype=embeds.dtype, device=embeds.device)
+    if addition.dim() == 3:
+        addition = addition.squeeze(0)
     return embeds + addition
 
 
@@ -535,6 +578,7 @@ def _build_prompt_embeds(
     bundle: Optional[DIBJudgePromptBundle],
     lm_embed,
     lm_tokenizer,
+    encoder_tokenizer,
     prompt: str,
     user_prompt: str,
     response_a: str,
@@ -559,30 +603,39 @@ def _build_prompt_embeds(
     offsets = enc.get("offset_mapping")
     if offsets is not None:
         offsets = offsets[0]
-    inputs_embeds = lm_embed(input_ids).to(device=device, dtype=dtype)
+    embed_device = lm_embed.weight.device
+    input_ids = input_ids.to(embed_device)
+    inputs_embeds = lm_embed(input_ids)
+    if inputs_embeds.device != device or inputs_embeds.dtype != dtype:
+        inputs_embeds = inputs_embeds.to(device=device, dtype=dtype)
     embeds = inputs_embeds.squeeze(0)
     attn = enc["attention_mask"].to(device=device).squeeze(0)
 
     response_types = _build_response_token_types(
         prompt, response_a, response_b, offsets, embeds.size(0)
     ).to(device=device)
-    pi_logits = embeds.new_zeros(embeds.size(0))
     z_a = None
     z_b = None
+    z_vib = None
     a_mask = None
     b_mask = None
-    gate_mlp = None
     if bundle is not None:
+        tok = encoder_tokenizer or lm_tokenizer
+        if encoder_tokenizer is None:
+            warnings.warn(
+                "Encoder tokenizer unavailable; falling back to LM tokenizer for VIB features.",
+                RuntimeWarning,
+            )
         a_ids, a_mask = _tokenize_response(
-            lm_tokenizer, _combine(user_prompt, response_a), max_response_len
+            tok, _combine(user_prompt, response_a), max_response_len
         )
         b_ids, b_mask = _tokenize_response(
-            lm_tokenizer, _combine(user_prompt, response_b), max_response_len
+            tok, _combine(user_prompt, response_b), max_response_len
         )
-        pad_id = lm_tokenizer.pad_token_id
+        pad_id = tok.pad_token_id
         if pad_id is None:
-            pad_id = lm_tokenizer.eos_token_id or 0
-        pad_side = getattr(lm_tokenizer, "padding_side", "right")
+            pad_id = tok.eos_token_id or 0
+        pad_side = getattr(tok, "padding_side", "right")
         a_ids, a_mask, b_ids, b_mask = _pad_pair(
             a_ids, a_mask, b_ids, b_mask, pad_id, pad_side=pad_side
         )
@@ -591,70 +644,30 @@ def _build_prompt_embeds(
         b_ids = b_ids.to(device)
         b_mask = b_mask.to(device)
 
-        z_tokens, compact_logits = bundle.build_prompt_features(
+        z_vib = bundle.build_prompt_features(
             torch.cat([a_ids, b_ids], dim=0),
             torch.cat([a_mask, b_mask], dim=0),
         )
-        z_a = z_tokens[0]
-        z_b = z_tokens[1] if z_tokens.size(0) > 1 else None
-        gate_mlp = bundle.task_lm_gate
-        if use_compactor and compact_logits is not None:
-            pi_a = compact_logits[0]
-            pi_b = compact_logits[1] if compact_logits.size(0) > 1 else None
-            pi_logits = DIBJudgeModel._scatter_compact_logits(
-                response_types.unsqueeze(0),
-                pi_a.unsqueeze(0),
-                pi_b.unsqueeze(0) if pi_b is not None else None,
-            ).squeeze(0)
-    elif use_compactor:
-        raise ValueError("Compactor is enabled but no prompt bundle was provided.")
 
-    embeds = _apply_z_task_addition(
-        embeds,
-        response_types,
-        z_a,
-        z_b,
-        a_mask.squeeze(0) if torch.is_tensor(a_mask) else None,
-        b_mask.squeeze(0) if torch.is_tensor(b_mask) else None,
-        gate_mlp,
-    )
-
-    if bundle is None or not use_compactor:
-        return embeds
-
-    prompt_mask = attn.bool()
-    response_mask = response_types > 0
-    pi = torch.sigmoid(pi_logits)
-    response_mask = response_mask & prompt_mask
-    if not response_mask.any():
-        warnings.warn(
-            "lm_response_types has no response spans for this prompt; "
-            "compact masking is skipped.",
-            RuntimeWarning,
+    if z_vib is not None:
+        z_a_vib = z_vib[0]
+        z_b_vib = z_vib[1] if z_vib.size(0) > 1 else None
+        embeds = _apply_z_task_addition(
+            embeds,
+            response_types,
+            z_a_vib,
+            z_b_vib,
+            a_mask.squeeze(0) if torch.is_tensor(a_mask) else None,
+            b_mask.squeeze(0) if torch.is_tensor(b_mask) else None,
         )
-    response_mask_f = response_mask.to(pi.dtype)
-    pi = pi * response_mask_f + (1.0 - response_mask_f)
-    prompt_mask_f = prompt_mask.to(pi.dtype)
-    pi = pi * prompt_mask_f + (1.0 - prompt_mask_f)
-    m = torch.bernoulli(pi)
-    m = (m - pi).detach() + pi
-    prompt_mask_m = prompt_mask.to(m.dtype)
-    m = m * prompt_mask_m + (1.0 - prompt_mask_m)
-    mu_id = bundle.compact_mu_id
-    if mu_id is None:
-        mu_id = lm_tokenizer.pad_token_id
-        if mu_id is None:
-            mu_id = lm_tokenizer.eos_token_id or 0
-    mu_ids = torch.tensor([mu_id], device=lm_embed.weight.device)
-    mu_embed = lm_embed(mu_ids).to(device=embeds.device, dtype=embeds.dtype).view(1, -1)
-    masked_embeds = m.unsqueeze(-1) * embeds + (1.0 - m).unsqueeze(-1) * mu_embed
-    return masked_embeds
+    return embeds
 
 
 def _build_prompt_embeds_batch(
     bundle: Optional[DIBJudgePromptBundle],
     lm_embed,
     lm_tokenizer,
+    encoder_tokenizer,
     prompts: List[str],
     user_prompts: List[str],
     responses_a: List[str],
@@ -692,17 +705,25 @@ def _build_prompt_embeds_batch(
     pad_side = getattr(lm_tokenizer, "padding_side", "right")
     left_padding = pad_side == "left"
 
-    inputs_embeds = lm_embed(input_ids).to(device=device, dtype=dtype)
+    embed_device = lm_embed.weight.device
+    input_ids = input_ids.to(embed_device)
+    inputs_embeds = lm_embed(input_ids)
+    if inputs_embeds.device != device or inputs_embeds.dtype != dtype:
+        inputs_embeds = inputs_embeds.to(device=device, dtype=dtype)
 
-    z_tokens = None
-    compact_logits = None
+    z_vib = None
     resp_mask = None
-    gate_mlp = None
     if bundle is not None:
         response_texts: List[str] = []
         for user_prompt, resp_a, resp_b in zip(user_prompts, responses_a, responses_b):
             response_texts.append(_combine(user_prompt, resp_a))
             response_texts.append(_combine(user_prompt, resp_b))
+        tok = encoder_tokenizer or lm_tokenizer
+        if encoder_tokenizer is None:
+            warnings.warn(
+                "Encoder tokenizer unavailable; falling back to LM tokenizer for VIB features.",
+                RuntimeWarning,
+            )
         resp_kwargs = {
             "add_special_tokens": False,
             "truncation": True,
@@ -711,13 +732,10 @@ def _build_prompt_embeds_batch(
         }
         if max_response_len is not None:
             resp_kwargs["max_length"] = max_response_len
-        resp_enc = lm_tokenizer(response_texts, **resp_kwargs)
+        resp_enc = tok(response_texts, **resp_kwargs)
         resp_ids = resp_enc["input_ids"].to(device)
         resp_mask = resp_enc["attention_mask"].to(device)
-        z_tokens, compact_logits = bundle.build_prompt_features(resp_ids, resp_mask)
-        gate_mlp = bundle.task_lm_gate
-    elif use_compactor:
-        raise ValueError("Compactor is enabled but no prompt bundle was provided.")
+        z_vib = bundle.build_prompt_features(resp_ids, resp_mask)
 
     embeds_list: List[torch.Tensor] = []
     for i, prompt in enumerate(prompts):
@@ -737,30 +755,18 @@ def _build_prompt_embeds_batch(
         response_types = _build_response_token_types(
             prompt, responses_a[i], responses_b[i], offsets_i, embeds.size(0)
         ).to(device=device)
-        pi_logits = embeds.new_zeros(embeds.size(0))
-        if bundle is not None and use_compactor and compact_logits is not None:
-            pi_a = compact_logits[2 * i]
-            pi_b = None
-            if compact_logits.size(0) > (2 * i + 1):
-                pi_b = compact_logits[2 * i + 1]
-            pi_logits = DIBJudgeModel._scatter_compact_logits(
-                response_types.unsqueeze(0),
-                pi_a.unsqueeze(0),
-                pi_b.unsqueeze(0) if pi_b is not None else None,
-            ).squeeze(0)
 
         z_a = None
         z_b = None
         a_mask = None
         b_mask = None
-        if z_tokens is not None:
-            z_a = z_tokens[2 * i]
-            if z_tokens.size(0) > (2 * i + 1):
-                z_b = z_tokens[2 * i + 1]
-            if resp_mask is not None:
-                a_mask = resp_mask[2 * i]
-                if resp_mask.size(0) > (2 * i + 1):
-                    b_mask = resp_mask[2 * i + 1]
+        if resp_mask is not None:
+            a_mask = resp_mask[2 * i]
+            if resp_mask.size(0) > (2 * i + 1):
+                b_mask = resp_mask[2 * i + 1]
+        if z_vib is not None:
+            z_a = z_vib[2 * i]
+            z_b = z_vib[2 * i + 1] if z_vib.size(0) > (2 * i + 1) else None
         embeds = _apply_z_task_addition(
             embeds,
             response_types,
@@ -768,40 +774,8 @@ def _build_prompt_embeds_batch(
             z_b,
             a_mask,
             b_mask,
-            gate_mlp,
         )
-
-        if bundle is None or not use_compactor:
-            embeds_list.append(embeds.detach().cpu())
-            continue
-
-        prompt_mask = attn.bool()
-        response_mask = response_types > 0
-        pi = torch.sigmoid(pi_logits)
-        response_mask = response_mask & prompt_mask
-        if not response_mask.any():
-            warnings.warn(
-                "lm_response_types has no response spans for this prompt; "
-                "compact masking is skipped.",
-                RuntimeWarning,
-            )
-        response_mask_f = response_mask.to(pi.dtype)
-        pi = pi * response_mask_f + (1.0 - response_mask_f)
-        prompt_mask_f = prompt_mask.to(pi.dtype)
-        pi = pi * prompt_mask_f + (1.0 - prompt_mask_f)
-        m = torch.bernoulli(pi)
-        m = (m - pi).detach() + pi
-        prompt_mask_m = prompt_mask.to(m.dtype)
-        m = m * prompt_mask_m + (1.0 - prompt_mask_m)
-        mu_id = bundle.compact_mu_id
-        if mu_id is None:
-            mu_id = lm_tokenizer.pad_token_id
-            if mu_id is None:
-                mu_id = lm_tokenizer.eos_token_id or 0
-        mu_ids = torch.tensor([mu_id], device=lm_embed.weight.device)
-        mu_embed = lm_embed(mu_ids).to(device=embeds.device, dtype=embeds.dtype).view(1, -1)
-        masked_embeds = m.unsqueeze(-1) * embeds + (1.0 - m).unsqueeze(-1) * mu_embed
-        embeds_list.append(masked_embeds.detach().cpu())
+        embeds_list.append(embeds.detach().cpu())
     return embeds_list
 
 
@@ -817,6 +791,7 @@ def _prepare_seed_inputs(
     expected_groups: List[Tuple[str, str]],
     use_compactor: bool,
     embed_resources: Optional[Dict[str, object]],
+    dist_ctx: Optional[Dict[str, int]],
 ) -> Dict[str, object]:
     eval_stats.seed_everything(seed)
     seed_output_dir = os.path.join(args.output_dir, f"seed_{seed}")
@@ -910,31 +885,44 @@ def _prepare_seed_inputs(
             device = embed_resources["device"]
             bundle = embed_resources.get("bundle")
             lm_embed = embed_resources.get("lm_embed")
+            encoder_tokenizer = embed_resources.get("encoder_tokenizer")
             if lm_embed is None:
                 raise ValueError("Prompt embeds enabled but lm_embed is missing.")
 
             embed_batch_size = max(1, int(args.embed_batch_size))
+            rank = dist_ctx["rank"] if dist_ctx is not None else 0
+            world_size = dist_ctx["world_size"] if dist_ctx is not None else 1
+            indices = list(range(len(prompts)))
+            if world_size > 1:
+                indices = [idx for idx in indices if idx % world_size == rank]
             try:
                 from tqdm.auto import tqdm
 
                 iterator = tqdm(
-                    range(0, len(prompts), embed_batch_size),
+                    range(0, len(indices), embed_batch_size),
                     desc="build_prompt_embeds",
                     dynamic_ncols=True,
+                    disable=world_size > 1 and rank != 0,
                 )
             except ImportError:
-                iterator = range(0, len(prompts), embed_batch_size)
+                iterator = range(0, len(indices), embed_batch_size)
+            local_pairs: List[Tuple[int, EmbedsPrompt]] = []
             with torch.inference_mode():
                 for start in iterator:
-                    chunk = list(range(start, min(start + embed_batch_size, len(prompts))))
-                    chunk_prompts = [prompts[idx] for idx in chunk]
-                    chunk_user_prompts = [str(tasks[idx].get("prompt", "")) for idx in chunk]
-                    chunk_a = [str(tasks[idx]["answer_a"]) for idx in chunk]
-                    chunk_b = [str(tasks[idx]["answer_b"]) for idx in chunk]
+                    chunk_idx = indices[start : start + embed_batch_size]
+                    if not chunk_idx:
+                        continue
+                    chunk_prompts = [prompts[idx] for idx in chunk_idx]
+                    chunk_user_prompts = [
+                        str(tasks[idx].get("prompt", "")) for idx in chunk_idx
+                    ]
+                    chunk_a = [str(tasks[idx]["answer_a"]) for idx in chunk_idx]
+                    chunk_b = [str(tasks[idx]["answer_b"]) for idx in chunk_idx]
                     embeds_list = _build_prompt_embeds_batch(
                         bundle,
                         lm_embed,
                         lm_tokenizer,
+                        encoder_tokenizer,
                         chunk_prompts,
                         chunk_user_prompts,
                         chunk_a,
@@ -944,10 +932,26 @@ def _prepare_seed_inputs(
                         dtype,
                         use_compactor,
                     )
-                    embed_prompts.extend(
-                        EmbedsPrompt(prompt_embeds=embeds.detach().cpu())
-                        for embeds in embeds_list
-                    )
+                    for idx, embeds in zip(chunk_idx, embeds_list):
+                        local_pairs.append(
+                            (idx, EmbedsPrompt(prompt_embeds=embeds.detach().cpu()))
+                        )
+            if world_size > 1 and dist is not None and dist.is_initialized():
+                gathered: Optional[List[List[Tuple[int, EmbedsPrompt]]]] = None
+                if rank == 0:
+                    gathered = [None for _ in range(world_size)]
+                dist.gather_object(local_pairs, gathered, dst=0)
+                if rank == 0 and gathered is not None:
+                    flat: List[Tuple[int, EmbedsPrompt]] = []
+                    for shard in gathered:
+                        if shard:
+                            flat.extend(shard)
+                    flat.sort(key=lambda item: item[0])
+                    embed_prompts = [prompt for _, prompt in flat]
+                else:
+                    embed_prompts = []
+            else:
+                embed_prompts = [prompt for _, prompt in local_pairs]
         else:
             embed_prompts = prompts
 
@@ -1348,10 +1352,24 @@ def main() -> None:
         help="Enable prompt embeddings in vLLM.",
     )
     parser.add_argument(
-        "--use-compactor",
+        "--embed-distributed",
+        nargs="?",
+        const="true",
+        default="false",
+        choices=["true", "false", "auto"],
+        help="Build prompt embeddings across multiple GPUs (true|false|auto).",
+    )
+    parser.add_argument(
+        "--embed-world-size",
+        type=int,
+        default=0,
+        help="Number of GPU worker processes for embed-distributed=auto (0=all visible).",
+    )
+    parser.add_argument(
+        "--embed-lm-on-gpu",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable compact masking using predicted pi logits.",
+        default=True,
+        help="Move the LM input embedding layer to GPU during prompt embed building.",
     )
     parser.add_argument(
         "--debug-prompt-only",
@@ -1370,13 +1388,13 @@ def main() -> None:
         help="Reuse existing raw/parsed results in output_dir when available.",
     )
     args = parser.parse_args()
+    if _maybe_spawn_embed_distributed(args):
+        return
 
     ckpt_config = _load_checkpoint_config(args.checkpoint)
     attn_impl = _resolve_attn_impl(ckpt_config, args.attn_implementation)
     padding_side = _resolve_padding_side(ckpt_config, args.padding_side, attn_impl)
-    use_compactor = bool(args.use_compactor)
-    if use_compactor and not args.enable_prompt_embeds and not args.debug_prompt_only:
-        raise ValueError("compactor requires --enable-prompt-embeds.")
+    use_compactor = False
 
     template, verdict_a, verdict_b = ve._load_template(
         args.template_path,
@@ -1515,12 +1533,23 @@ def main() -> None:
                 break
 
     embed_resources: Optional[Dict[str, object]] = None
+    dist_ctx = _init_embed_distributed(
+        args.embed_distributed == "true" and bool(args.enable_prompt_embeds)
+    )
+    if args.embed_distributed == "true" and dist_ctx is None:
+        print(
+            "[warn] embed-distributed requested but WORLD_SIZE<=1; "
+            "launch with torchrun --nproc_per_node=N to use multiple GPUs."
+        )
     prepared_by_seed: Dict[int, Dict[str, object]] = {}
     if any_missing:
         if not args.use_vllm:
             raise ValueError("DIBJudge evaluation requires --use_vllm for inference.")
         dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-        device = torch.device(args.device)
+        if dist_ctx is not None:
+            device = torch.device("cuda", dist_ctx["local_rank"])
+        else:
+            device = torch.device(args.device)
         lm_tokenizer = AutoTokenizer.from_pretrained(
             args.model, use_fast=True, trust_remote_code=args.trust_remote_code
         )
@@ -1531,6 +1560,7 @@ def main() -> None:
         bundle: Optional[DIBJudgePromptBundle] = None
         lm_embed = None
         lm_for_embed = None
+        encoder_tokenizer = None
         if args.enable_prompt_embeds:
             bundle = _load_dibjudge_bundle(
                 args.checkpoint,
@@ -1540,6 +1570,23 @@ def main() -> None:
                 args.trust_remote_code,
                 attn_implementation=attn_impl,
             )
+            encoder_name = _resolve_encoder_name(ckpt_config, args.judge_encoder, args.checkpoint)
+            try:
+                encoder_tokenizer = AutoTokenizer.from_pretrained(
+                    encoder_name,
+                    use_fast=False,
+                    legacy=True,
+                    trust_remote_code=args.trust_remote_code,
+                )
+            except TypeError:
+                encoder_tokenizer = AutoTokenizer.from_pretrained(
+                    encoder_name,
+                    use_fast=False,
+                    trust_remote_code=args.trust_remote_code,
+                )
+            if encoder_tokenizer.pad_token_id is None:
+                encoder_tokenizer.pad_token = encoder_tokenizer.eos_token
+            encoder_tokenizer.padding_side = padding_side
             lm_for_embed = AutoModelForCausalLM.from_pretrained(
                 args.model,
                 dtype=dtype,
@@ -1547,12 +1594,15 @@ def main() -> None:
                 trust_remote_code=args.trust_remote_code,
             )
             lm_embed = lm_for_embed.get_input_embeddings()
+            if bool(args.embed_lm_on_gpu):
+                lm_embed = lm_embed.to(device=device, dtype=dtype)
             lm_embed.eval()
 
         embed_resources = {
             "dtype": dtype,
             "device": device,
             "tokenizer": lm_tokenizer,
+            "encoder_tokenizer": encoder_tokenizer,
             "bundle": bundle,
             "lm_embed": lm_embed,
             "lm_for_embed": lm_for_embed,
@@ -1571,7 +1621,13 @@ def main() -> None:
             expected_groups,
             use_compactor,
             embed_resources,
+            dist_ctx,
         )
+
+    if dist_ctx is not None and dist is not None and dist.is_initialized():
+        dist.barrier()
+        if dist_ctx["rank"] != 0:
+            return
 
     if embed_resources is not None:
         bundle = embed_resources.get("bundle")
