@@ -250,27 +250,6 @@ python scripts/preprocess_data.py \
   --sample-size 50000
 ```
 
-## Privacy-Safe Release Notes
-
-This repository avoids committing local user paths, proxy files, credentials, datasets, checkpoints, and experiment outputs. Use environment variables or an untracked `.env` file for private paths:
-
-```bash
-export DIBJUDGE_ROOT=/path/to/DIBJudge
-export DIBJUDGE_CONDA_ENV=dibjudge
-export DIBJUDGE_ENV_FILE=/path/to/private_env.sh
-export DIBJUDGE_JUDGMENT_REQUEST_DIR=data/eval_data/judgment_requests
-```
-
-Before publishing, run:
-
-```bash
-rg -n --hidden \
-  -e '/home/' -e '/Users/' -e 'BEGIN .*PRIVATE KEY' -e 'api[_-]?key\\s*[:=]' \
-  . --glob '!.git/**' --glob '!.omx/**'
-```
-
-If sensitive values were ever committed to history, rewrite history or create a fresh public repository before release.
-
 ## Citation
 
 ```bibtex
