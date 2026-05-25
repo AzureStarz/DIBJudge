@@ -12,3 +12,4 @@ model/*
 *.jsonl
 scripts/mr3_dataset/*
 scripts/data
+*/__pycache__/*

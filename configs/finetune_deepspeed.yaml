@@ -51,8 +51,8 @@ proxy_soft_labels: true # use soft labels for proxy bin losses
 # runtime config
 epochs: 3 # number of training epochs
 deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
-output_dir: outputs/100k_e2_vib_default_4B # checkpoint output directory
-log_dir: logs/100k_e2_vib_default_4B # log output directory
+output_dir: outputs/100k_e3_vib_default_4B # checkpoint output directory
+log_dir: logs/100k_e3_vib_default_4B # log output directory
 save_every_steps: 50000 # checkpoint save interval (0 = disabled)
 save_at_end: true # save a checkpoint at end of training
 bf16: true # enable bfloat16 training
@@ -90,7 +90,7 @@ lora_targets: q_proj,k_proj,v_proj,o_proj # comma-separated module names for LoR
 encoder_lr: 1.0e-5 # learning rate for shared encoder
 lm_lr: 1.0e-5 # learning rate for judge LM (if unfrozen)
 lora_lr: 2.0e-4 # learning rate for LoRA params
-head_lr: 1.0e-4 # learning rate for heads (task/bias/resampler/prompt)
+head_lr: 2.0e-4 # learning rate for heads (task/bias/resampler/prompt)
 weight_decay: 0.01 # weight decay for main params
 head_weight_decay: 0.01 # weight decay for head params
 max_grad_norm: 1.0 # gradient clipping norm

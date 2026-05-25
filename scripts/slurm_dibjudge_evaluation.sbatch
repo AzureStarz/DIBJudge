@@ -126,6 +126,7 @@ singularity exec --nv \
     # NCCL configs
     export VLLM_WORKER_MULTIPROC_METHOD=spawn
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+    export OMP_NUM_THREADS=8
 
     # CUDA configs
     # export PATH=/online1/public/support/amd/cuda/11.8/bin:$PATH
@@ -143,11 +144,33 @@ singularity exec --nv \
 
     IFS=',' read -r -a languages_arr <<< \"\${DIBJUDGE_LANGUAGES}\"
 
-    python scripts/dibjudge_evaluation.py --model \"\${DIBJUDGE_MODEL}\" \
-        --checkpoint \"\${DIBJUDGE_CHECKPOINT}\" \
-        --tensor_parallel_size \"\${tensor_parallel_size}\" \
-        --output_dir \"\${DIBJUDGE_OUTPUT_DIR}\" \
-        --languages \"\${languages_arr[@]}\" \
-        --template \"\${DIBJUDGE_TEMPLATE}\" \
+    base_args=(
+      --model \"\${DIBJUDGE_MODEL}\"
+      --checkpoint \"\${DIBJUDGE_CHECKPOINT}\"
+      --tensor_parallel_size \"\${tensor_parallel_size}\"
+      --output_dir \"\${DIBJUDGE_OUTPUT_DIR}\"
+      --languages \"\${languages_arr[@]}\"
+      --template \"\${DIBJUDGE_TEMPLATE}\"
+    )
+
+    if [[ \"\${num_gpus}\" -gt 1 ]]; then
+      echo \"Phase 1: distributed prompt embedding (torchrun)\"
+      torchrun --nproc_per_node=\"\${num_gpus}\" scripts/dibjudge_evaluation.py \
+        --embed-distributed \
+        --embed-on-gpu \
+        --embed-only \
+        \"\${base_args[@]}\" \
         \"\$@\"
+
+      echo \"Phase 2: vLLM evaluation (single process, reuse embeds)\"
+      python scripts/dibjudge_evaluation.py \
+        --load-embed-shards \
+        \"\${base_args[@]}\" \
+        \"\$@\"
+    else
+      python scripts/dibjudge_evaluation.py \
+        --embed-on-gpu \
+        \"\${base_args[@]}\" \
+        \"\$@\"
+    fi
   " -- "$@"

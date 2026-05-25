@@ -7,19 +7,19 @@ use_rms_norm: true # use RMSNorm in custom heads
 rms_norm_eps: 1.0e-6 # RMSNorm epsilon
 use_swiglu: true # use SwiGLU activations in custom heads
 bias_mlp_hidden: 0 # hidden width for bias prompt MLP heads (0 = 2x encoder dim)
-bias_mlp_layers: 1 # number of hidden layers in bias prompt MLP heads
-bias_mlp_dropout: 0.0 # dropout rate for bias prompt MLP heads
+bias_mlp_layers: 3 # number of hidden layers in bias prompt MLP heads
+bias_mlp_dropout: 0.05 # dropout rate for bias prompt MLP heads
 task_mlp_hidden: 0 # hidden width for task MLP (0 = identity)
-task_mlp_layers: 1 # number of task MLP layers (0 = identity)
-task_mlp_dropout: 0.0 # dropout rate for task MLP
+task_mlp_layers: 3 # number of task MLP layers (0 = identity)
+task_mlp_dropout: 0.05 # dropout rate for task MLP
 use_vib: true # enable VIB branch
 vib_hidden: 0 # hidden width for VIB MLP (0 = encoder dim)
-vib_layers: 1 # number of VIB MLP layers
-vib_dropout: 0.0 # dropout rate for VIB MLP
+vib_layers: 3 # number of VIB MLP layers
+vib_dropout: 0.05 # dropout rate for VIB MLP
 encoder_trainable: last # which encoder layers to train (all|last|none)
 bias_proxy_hidden: 0 # hidden width for bias proxy heads (0 = auto)
 bias_proxy_layers: 0 # number of hidden layers for bias proxy heads
-bias_proxy_dropout: 0.0 # dropout for bias proxy heads
+bias_proxy_dropout: 0.05 # dropout for bias proxy heads
 low_recon_layer: 2 # encoder hidden layer index for low-level reconstruction
 
 # data config
@@ -47,7 +47,7 @@ proxy_length_quantiles: true # build length bins from quantiles
 proxy_soft_labels: true # use soft labels for proxy bin losses
 
 # runtime config
-epochs: 3 # number of training epochs
+epochs: 5 # number of training epochs
 deepspeed_config: configs/deepspeed/ds_z0_config.json # DeepSpeed json config path
 output_dir: outputs/100k_e3_vib_default_8B # checkpoint output directory
 log_dir: logs/100k_e3_vib_default_8B # log output directory
@@ -82,13 +82,13 @@ freeze_lm_when_no_lora: true # freeze LM if LoRA is disabled
 lora_r: 16 # LoRA rank
 lora_alpha: 32 # LoRA scaling alpha
 lora_dropout: 0.05 # LoRA dropout
-lora_targets: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj # comma-separated module names for LoRA
+lora_targets: q_proj,k_proj,v_proj,o_proj # comma-separated module names for LoRA
 
 # optimizer config
 encoder_lr: 1.0e-5 # learning rate for shared encoder
 lm_lr: 1.0e-5 # learning rate for judge LM (if unfrozen)
-lora_lr: 1.0e-4 # learning rate for LoRA params
-head_lr: 1.0e-4 # learning rate for heads (task/bias/resampler/prompt)
+lora_lr: 2.0e-4 # learning rate for LoRA params
+head_lr: 2.0e-4 # learning rate for heads (task/bias/resampler/prompt)
 weight_decay: 0.01 # weight decay for main params
 head_weight_decay: 0 # weight decay for head params
 max_grad_norm: 1.0 # gradient clipping norm
@@ -103,7 +103,7 @@ scheduler_type: cosine # scheduler type for HF scheduler
 disable_z_prompt_insertion: false # disable task latent injection into LM input
 
 # loss config
-lambda_compression: 0.5 # schedule peak for VIB compression loss
+lambda_compression: 1.0 # schedule peak for VIB compression loss
 lambda_bias: 0.5 # schedule peak for bias losses
 low_recon_weight: 0.5 # weight for low-level reconstruction loss
 low_recon_mean_weight: 1.0 # weight for mean reconstruction term
