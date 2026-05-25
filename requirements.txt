@@ -1,0 +1,13 @@
+# Install a CUDA-compatible torch build first if your platform requires a custom wheel.
+torch
+transformers
+datasets
+deepspeed
+peft
+vllm
+sglang
+langid
+aiohttp
+pyyaml
+safetensors
+swanlab

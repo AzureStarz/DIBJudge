@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dibjudge_deepspeed_lora
+#SBATCH --job-name=dibjudge_eval
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
@@ -11,166 +11,100 @@
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 Usage:
-  sbatch slurm_dibjudge_evaluation.sbatch -- [options] [-- dibjudge_evaluation.py args...]
+  sbatch scripts/slurm_dibjudge_evaluation.sbatch -- [options] [-- dibjudge_evaluation.py args...]
 
 Options:
-  -m, --model PATH                 Model path (env: DIBJUDGE_MODEL)
-  -c, --checkpoint PATH            Checkpoint path (env: DIBJUDGE_CHECKPOINT)
+  -m, --model PATH                 Model path or HF id (env: DIBJUDGE_MODEL)
+  -c, --checkpoint PATH            DIBJudge checkpoint path (env: DIBJUDGE_CHECKPOINT)
   -o, --output-dir PATH            Output dir (env: DIBJUDGE_OUTPUT_DIR)
-  -l, --languages CSV              Comma-separated list (env: DIBJUDGE_LANGUAGES)
+  -l, --languages CSV              Comma-separated language list (env: DIBJUDGE_LANGUAGES)
   -t, --template NAME              Prompt template (env: DIBJUDGE_TEMPLATE)
   -p, --tensor-parallel-size NUM   Tensor parallel size (env: DIBJUDGE_TENSOR_PARALLEL_SIZE)
   -h, --help                       Show this help
 
-Examples:
-  sbatch slurm_dibjudge_evaluation.sbatch -- -m /path/to/model -l zh,en
-  DIBJUDGE_MODEL=/path/to/model sbatch slurm_dibjudge_evaluation.sbatch --
-EOF
+Environment:
+  DIBJUDGE_ROOT=/path/to/DIBJudge
+  DIBJUDGE_CONDA_ENV=dibjudge
+  DIBJUDGE_ENV_FILE=/path/to/private_env.sh
+  DIBJUDGE_MODULES="cuda/12 gcc/11"
+USAGE
 }
 
-# Defaults (can be overridden by env or flags)
-MODEL="${DIBJUDGE_MODEL:-outputs/deepspeed/debug/hf-epoch-1/lm}"
-CHECKPOINT="${DIBJUDGE_CHECKPOINT:-outputs/deepspeed/debug/hf-epoch-1/dibjudge}"
-OUTPUT_DIR="${DIBJUDGE_OUTPUT_DIR:-results/Qwen3-4B-Base/DIBJudge}"
+MODEL="${DIBJUDGE_MODEL:-outputs/quickstart/hf-epoch-1/lm}"
+CHECKPOINT="${DIBJUDGE_CHECKPOINT:-outputs/quickstart/hf-epoch-1/dibjudge}"
+OUTPUT_DIR="${DIBJUDGE_OUTPUT_DIR:-results/quickstart/dibjudge}"
 LANGUAGES="${DIBJUDGE_LANGUAGES:-zh}"
-TEMPLATE="${DIBJUDGE_TEMPLATE:-prometheus}"
+TEMPLATE="${DIBJUDGE_TEMPLATE:-mr3_templates}"
 TENSOR_PARALLEL_SIZE="${DIBJUDGE_TENSOR_PARALLEL_SIZE:-}"
+EXTRA_ARGS=()
 
-while getopts ":m:c:o:l:t:p:h-:" opt; do
-  case "${opt}" in
-    m) MODEL="${OPTARG}" ;;
-    c) CHECKPOINT="${OPTARG}" ;;
-    o) OUTPUT_DIR="${OPTARG}" ;;
-    l) LANGUAGES="${OPTARG}" ;;
-    t) TEMPLATE="${OPTARG}" ;;
-    p) TENSOR_PARALLEL_SIZE="${OPTARG}" ;;
-    h)
-      usage
-      exit 0
-      ;;
-    -)
-      case "${OPTARG}" in
-        model) MODEL="${!OPTIND}"; OPTIND=$((OPTIND + 1)) ;;
-        model=*) MODEL="${OPTARG#*=}" ;;
-        checkpoint) CHECKPOINT="${!OPTIND}"; OPTIND=$((OPTIND + 1)) ;;
-        checkpoint=*) CHECKPOINT="${OPTARG#*=}" ;;
-        output-dir) OUTPUT_DIR="${!OPTIND}"; OPTIND=$((OPTIND + 1)) ;;
-        output-dir=*) OUTPUT_DIR="${OPTARG#*=}" ;;
-        languages) LANGUAGES="${!OPTIND}"; OPTIND=$((OPTIND + 1)) ;;
-        languages=*) LANGUAGES="${OPTARG#*=}" ;;
-        template) TEMPLATE="${!OPTIND}"; OPTIND=$((OPTIND + 1)) ;;
-        template=*) TEMPLATE="${OPTARG#*=}" ;;
-        tensor-parallel-size) TENSOR_PARALLEL_SIZE="${!OPTIND}"; OPTIND=$((OPTIND + 1)) ;;
-        tensor-parallel-size=*) TENSOR_PARALLEL_SIZE="${OPTARG#*=}" ;;
-        help)
-          usage
-          exit 0
-          ;;
-        *)
-          echo "Unknown option --${OPTARG}" >&2
-          usage >&2
-          exit 2
-          ;;
-      esac
-      ;;
-    \?)
-      echo "Unknown option -${OPTARG}" >&2
-      usage >&2
-      exit 2
-      ;;
-    :)
-      echo "Option -${OPTARG} requires an argument." >&2
-      usage >&2
-      exit 2
-      ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model) MODEL="$2"; shift 2 ;;
+    --model=*) MODEL="${1#*=}"; shift ;;
+    -c|--checkpoint) CHECKPOINT="$2"; shift 2 ;;
+    --checkpoint=*) CHECKPOINT="${1#*=}"; shift ;;
+    -o|--output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --output-dir=*) OUTPUT_DIR="${1#*=}"; shift ;;
+    -l|--languages) LANGUAGES="$2"; shift 2 ;;
+    --languages=*) LANGUAGES="${1#*=}"; shift ;;
+    -t|--template) TEMPLATE="$2"; shift 2 ;;
+    --template=*) TEMPLATE="${1#*=}"; shift ;;
+    -p|--tensor-parallel-size) TENSOR_PARALLEL_SIZE="$2"; shift 2 ;;
+    --tensor-parallel-size=*) TENSOR_PARALLEL_SIZE="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; EXTRA_ARGS+=("$@"); break ;;
+    *) EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
-shift $((OPTIND - 1))
 
-# ---------------------------
-# Host-side setup (outside container)
-# ---------------------------
-cd DIBJUDGE_ROOT
-source DIBJUDGE_ENV_FILE
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
-module load amd/singularity/3.10.4 amd/cuda/11.8.89
+mkdir -p "${OUTPUT_DIR}" logs
+unset CUDA_LAUNCH_BLOCKING NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_NVLS_DISABLE NCCL_IB_DISABLE
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-8}}"
 
-# Paths
-SIF=/online1/hpc_containers/base_hpc_glibc_235.sif
-CONDA_ENV=/path/to/workspace/.conda/envs/vllm_0112_new01/
-BIND1=/online1/hpc_containers/conda/
-BIND2=/path/to/bind/
+if command -v nvidia-smi >/dev/null 2>&1; then
+  NUM_GPUS="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')"
+else
+  NUM_GPUS="${SLURM_GPUS_ON_NODE:-1}"
+fi
+if [[ -z "${TENSOR_PARALLEL_SIZE}" ]]; then
+  TENSOR_PARALLEL_SIZE="${NUM_GPUS}"
+fi
+IFS=',' read -r -a LANG_ARRAY <<< "${LANGUAGES}"
 
-# ---------------------------
-# Run everything INSIDE the container
-# ---------------------------
-DIBJUDGE_MODEL="${MODEL}" \
-DIBJUDGE_CHECKPOINT="${CHECKPOINT}" \
-DIBJUDGE_OUTPUT_DIR="${OUTPUT_DIR}" \
-DIBJUDGE_LANGUAGES="${LANGUAGES}" \
-DIBJUDGE_TEMPLATE="${TEMPLATE}" \
-DIBJUDGE_TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE}" \
-singularity exec --nv \
-  -B "${BIND1}" \
-  -B "${BIND2}" \
-  "${SIF}" \
-  bash -lc "
-    set -euo pipefail
+BASE_ARGS=(
+  --model "${MODEL}"
+  --checkpoint "${CHECKPOINT}"
+  --tensor_parallel_size "${TENSOR_PARALLEL_SIZE}"
+  --output_dir "${OUTPUT_DIR}"
+  --languages "${LANG_ARRAY[@]}"
+  --template "${TEMPLATE}"
+)
 
-    # Make conda available and activate env
-    source ~/.bashrc
-    conda activate ${CONDA_ENV}
+if [[ "${NUM_GPUS}" -gt 1 ]]; then
+  echo "Phase 1: distributed prompt embedding with ${NUM_GPUS} GPUs"
+  torchrun --nproc_per_node="${NUM_GPUS}" scripts/dibjudge_evaluation.py \
+    --embed-distributed \
+    --embed-on-gpu \
+    --embed-only \
+    "${BASE_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}"
 
-    # NCCL configs
-    export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
-    export OMP_NUM_THREADS=8
-
-    # CUDA configs
-    # export PATH=/online1/public/support/amd/cuda/11.8/bin:$PATH
-    # export LD_LIBRARY_PATH=/online1/public/support/amd/cuda/11.8/lib64:$LD_LIBRARY_PATH
-
-    num_gpus=\$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    echo \"Detected \${num_gpus} GPUs\"
-
-    cd DIBJUDGE_ROOT
-
-    tensor_parallel_size=\"\${DIBJUDGE_TENSOR_PARALLEL_SIZE:-}\"
-    if [[ -z \"\${tensor_parallel_size}\" ]]; then
-      tensor_parallel_size=\"\${num_gpus}\"
-    fi
-
-    IFS=',' read -r -a languages_arr <<< \"\${DIBJUDGE_LANGUAGES}\"
-
-    base_args=(
-      --model \"\${DIBJUDGE_MODEL}\"
-      --checkpoint \"\${DIBJUDGE_CHECKPOINT}\"
-      --tensor_parallel_size \"\${tensor_parallel_size}\"
-      --output_dir \"\${DIBJUDGE_OUTPUT_DIR}\"
-      --languages \"\${languages_arr[@]}\"
-      --template \"\${DIBJUDGE_TEMPLATE}\"
-    )
-
-    if [[ \"\${num_gpus}\" -gt 1 ]]; then
-      echo \"Phase 1: distributed prompt embedding (torchrun)\"
-      torchrun --nproc_per_node=\"\${num_gpus}\" scripts/dibjudge_evaluation.py \
-        --embed-distributed \
-        --embed-on-gpu \
-        --embed-only \
-        \"\${base_args[@]}\" \
-        \"\$@\"
-
-      echo \"Phase 2: vLLM evaluation (single process, reuse embeds)\"
-      python scripts/dibjudge_evaluation.py \
-        --load-embed-shards \
-        \"\${base_args[@]}\" \
-        \"\$@\"
-    else
-      python scripts/dibjudge_evaluation.py \
-        --embed-on-gpu \
-        \"\${base_args[@]}\" \
-        \"\$@\"
-    fi
-  " -- "$@"
+  echo "Phase 2: vLLM generation from cached embeddings"
+  python scripts/dibjudge_evaluation.py \
+    --load-embed-shards \
+    "${BASE_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}"
+else
+  python scripts/dibjudge_evaluation.py \
+    --embed-on-gpu \
+    "${BASE_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}"
+fi

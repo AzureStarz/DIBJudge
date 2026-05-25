@@ -1,14 +1,43 @@
+# Local/private environment
+.env
+.env.*
+!.env.example
+*.local
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Experiment artifacts and private data
 data/*
 logs/*
 outputs/*
 results/*
 bias_results/*
 swanlog/*
+wandb/*
 vibe/*
-scripts/rm_r1_dataset/*
-scripts/__pycache__/*
-dibjudge/__pycache__/*
 model/*
+models/*
+checkpoints/*
 *.jsonl
+*.parquet
+*.arrow
+
+# Model/checkpoint weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+
+# Existing local scratch folders
+scripts/rm_r1_dataset/*
 scripts/mr3_dataset/*
 scripts/data

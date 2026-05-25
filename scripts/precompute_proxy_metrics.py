@@ -8,8 +8,9 @@ import warnings
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+torch = None
+AutoModelForCausalLM = None
+AutoTokenizer = None
 
 
 def _is_null(value: Optional[object]) -> bool:
@@ -69,6 +70,19 @@ def _maybe_tqdm(iterable, total: Optional[int], desc: str):
     except ImportError:
         return iterable
     return tqdm(iterable, total=total, desc=desc, unit="ex", dynamic_ncols=True)
+
+
+def _load_runtime_dependencies() -> None:
+    global torch, AutoModelForCausalLM, AutoTokenizer
+    if torch is not None and AutoModelForCausalLM is not None and AutoTokenizer is not None:
+        return
+    import torch as torch_module
+    from transformers import AutoModelForCausalLM as causal_lm_cls
+    from transformers import AutoTokenizer as tokenizer_cls
+
+    torch = torch_module
+    AutoModelForCausalLM = causal_lm_cls
+    AutoTokenizer = tokenizer_cls
 
 
 def _compute_nll(
@@ -254,6 +268,7 @@ def main() -> None:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--max-samples", type=int, default=0)
     args = parser.parse_args()
+    _load_runtime_dependencies()
 
     output_path = _resolve_output_path(args.input, args.output)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)

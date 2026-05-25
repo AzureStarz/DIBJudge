@@ -14,10 +14,7 @@ set -euo pipefail
 # export NCCL_DEBUG=warn
 # export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-3}
 
-cd DIBJUDGE_ROOT
-
-source /path/to/workspace/online1/miniconda3/bin/activate sglang
-source DIBJUDGE_ENV_FILE
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
@@ -25,8 +22,14 @@ export NCCL_NVLS_DISABLE=1
 export NCCL_SHM_DISABLE=1
 export NCCL_P2P_LEVEL=NVL
 
-module load amd/gcc_compiler/11.3.0
-num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+if command -v module >/dev/null 2>&1; then
+  module load "${DIBJUDGE_GCC_MODULE:-amd/gcc_compiler/11.3.0}"
+fi
+if command -v nvidia-smi >/dev/null 2>&1; then
+  num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
+else
+  num_gpus="${SLURM_GPUS_ON_NODE:-${NUM_GPUS:-1}}"
+fi
 echo "Detected ${num_gpus} GPUs"
 
 deepspeed --num_gpus=${num_gpus} --module dibjudge.finetune_deepspeed_sft \

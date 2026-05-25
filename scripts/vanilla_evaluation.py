@@ -37,9 +37,9 @@ DEFAULT_USER_PROMPT = (
 )
 
 JUDGMENT_BENCHMARK = "judgment-requests"
-DEFAULT_JUDGMENT_REQUEST_DIR = (
-    "/path/to/workspace/online1/"
-    "llm-as-judge-cultural-evaluation/preliminary_exp/judgment_requests"
+DEFAULT_JUDGMENT_REQUEST_DIR = os.environ.get(
+    "DIBJUDGE_JUDGMENT_REQUEST_DIR",
+    os.path.join("data", "eval_data", "judgment_requests"),
 )
 
 DEFAULT_VERDICT_A = "[[A]]"

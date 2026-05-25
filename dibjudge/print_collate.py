@@ -22,7 +22,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Print collated batch from data/test.jsonl.")
     parser.add_argument("--data-path", default="data/test.jsonl")
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--lm", default="Qwen/Qwen3-4B")
+    parser.add_argument(
+        "--lm",
+        default="Qwen/Qwen3-4B",
+        help="Tokenizer/model name or local path used to collate LM inputs.",
+    )
     args = parser.parse_args()
 
     lm_tok = AutoTokenizer.from_pretrained(args.lm, use_fast=True)

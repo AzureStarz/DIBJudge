@@ -10,10 +10,7 @@ set -euo pipefail
 #     /path/to/causal-lm \
 #     data/m_preference_collection_50k_qwen3-4b.proxy.jsonl
 
-cd DIBJUDGE_ROOT
-
-source ~/online1/miniconda3/bin/activate sglang
-source DIBJUDGE_ENV_FILE
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
 unset CUDA_LAUNCH_BLOCKING
 unset NCCL_P2P_DISABLE
@@ -27,8 +24,14 @@ PADDING_SIDE="${PADDING_SIDE:-left}"
 DTYPE="${DTYPE:-bfloat16}"
 ALLOW_TF32="${ALLOW_TF32:-1}"
 
-module load amd/gcc_compiler/11.3.0
-num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+if command -v module >/dev/null 2>&1; then
+  module load "${DIBJUDGE_GCC_MODULE:-amd/gcc_compiler/11.3.0}"
+fi
+if command -v nvidia-smi >/dev/null 2>&1; then
+  num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
+else
+  num_gpus="${SLURM_GPUS_ON_NODE:-${NUM_GPUS:-1}}"
+fi
 echo "Detected ${num_gpus} GPUs"
 
 

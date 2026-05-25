@@ -1,0 +1,61 @@
+# Minimal public smoke-run config for DIBJudge.
+# Replace model ids with local paths if your cluster does not have internet access.
+
+# Backbones
+judge_encoder: Qwen/Qwen3-Embedding-0.6B
+lm: Qwen/Qwen3-4B
+attn_implementation: sdpa
+padding_side: left
+
+# Data
+data_path: data/train_data/mr3_preprocessed.jsonl
+proxy_cache_path: data/train_data/mr3_preprocessed.Qwen3-4B.proxy.jsonl
+require_both_responses: true
+max_training_samples: 128
+per_device_train_batch_size: 1
+num_workers: 0
+max_response_len: 4096
+max_lm_len: 4096
+prefilter_long_prompts: true
+
+# Runtime
+epochs: 1
+deepspeed_config: configs/deepspeed/ds_z0_config.json
+output_dir: outputs/quickstart
+log_dir: logs/quickstart
+save_every_steps: 0
+save_at_end: true
+bf16: true
+allow_tf32: true
+gradient_checkpointing: false
+lm_loss_chunk_size: 512
+use_swanlab: false
+
+# DIBJudge components
+use_vib: true
+z_latent_dim: 256
+encoder_trainable: last
+use_lora: true
+freeze_lm_when_no_lora: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_targets: q_proj,k_proj,v_proj,o_proj
+
+# Optimization/losses
+encoder_lr: 1.0e-5
+lm_lr: 1.0e-5
+lora_lr: 2.0e-4
+head_lr: 2.0e-4
+weight_decay: 0.01
+head_weight_decay: 0.01
+max_grad_norm: 1.0
+grad_accum_steps: 4
+warmup_ratio: 0.03
+scheduler_type: cosine
+lambda_compression: 0.5
+lambda_bias: 0.5
+disentangle_weight: 0.5
+disentangle_cos_weight: 1.0
+disentangle_cov_weight: 0.5
+disentangle_cov_queue_size: 512
